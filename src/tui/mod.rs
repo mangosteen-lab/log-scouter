@@ -1868,6 +1868,7 @@ impl AppState {
             Mode::Normal => 0,
             Mode::Search(_)
             | Mode::AddFile(_)
+            | Mode::OpenFolder(_)
             | Mode::Filter(_)
             | Mode::ExportFilters(_)
             | Mode::LoadFilters(_)
