@@ -1,12 +1,12 @@
 [package]
 name = "log-scouter"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 description = "A keyboard-driven Rust TUI for browsing, filtering, extracting, and searching large server logs."
 license = "MIT"
 
 [[bin]]
-name = "scout"
+name = "logscout"
 path = "src/main.rs"
 
 [dependencies]

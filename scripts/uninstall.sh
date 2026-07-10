@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Remove the `scout` command installed by scripts/install.sh.
+# Remove the `logscout` command installed by scripts/install.sh.
 set -euo pipefail
 
-BIN_NAME="scout"
+BIN_NAME="logscout"
+LEGACY_BIN_NAME="scout"
 INSTALL_DIR="${LOG_SCOUTER_INSTALL_DIR:-$HOME/.local/bin}"
 PURGE=0
 
@@ -13,7 +14,7 @@ Uninstall Log Scouter.
 Usage:
   uninstall.sh [--install-dir <dir>] [--purge]
 
-By default this removes only the installed scout binary. --purge also removes
+By default this removes only the installed logscout binary. --purge also removes
 the user-level reusable filter/schema library at ~/.log-scouter. Project-local
 state in <project>/.logscouter is never removed.
 EOF
@@ -61,6 +62,12 @@ if [ -e "$BINARY" ]; then
     echo "Removed $BINARY"
 else
     echo "$BINARY was not installed"
+fi
+
+LEGACY_BINARY="$INSTALL_DIR/$LEGACY_BIN_NAME"
+if [ -e "$LEGACY_BINARY" ]; then
+    rm -f "$LEGACY_BINARY"
+    echo "Removed legacy $LEGACY_BINARY"
 fi
 
 if [ "$PURGE" -eq 1 ]; then

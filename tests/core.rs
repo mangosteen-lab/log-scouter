@@ -8,7 +8,7 @@ use log_scouter::core::filters::{
     load_filters_from_folder, user_filter_dir, FilterFile, FilterRule, FilterSet,
 };
 use log_scouter::core::models::{merge_files, LogFileModel, ViewModel, VisibleIndices};
-use log_scouter::core::project::Project;
+use log_scouter::core::project::{text_files_in_dir, Project};
 use log_scouter::core::search::{compile_query, parse_datetime};
 use std::path::PathBuf;
 
@@ -1224,6 +1224,33 @@ fn adding_a_file_detects_its_schema_instead_of_guessing() {
             .extractor_name,
         "compact"
     );
+}
+
+#[test]
+fn adding_a_folder_loads_direct_text_files_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("b.log"), "plain text\n").unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "more text\n").unwrap();
+    std::fs::write(tmp.path().join("bin.dat"), b"text\0binary").unwrap();
+    std::fs::create_dir(tmp.path().join("nested")).unwrap();
+    std::fs::write(tmp.path().join("nested").join("c.log"), "nested\n").unwrap();
+
+    let paths = text_files_in_dir(tmp.path()).unwrap();
+    let names: Vec<String> = paths
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, ["a.txt", "b.log"]);
+
+    let mut project = Project::new(tmp.path());
+    let added = project.add_text_files_from_dir(tmp.path()).unwrap();
+    assert_eq!(added, 2);
+    let names: Vec<&str> = project
+        .files
+        .iter()
+        .map(|file| file.display_name.as_str())
+        .collect();
+    assert_eq!(names, ["a.txt", "b.log"]);
 }
 
 /// An explicit schema name still wins over detection.

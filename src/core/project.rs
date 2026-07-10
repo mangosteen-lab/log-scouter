@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub const CONFIG_DIR: &str = ".logscouter";
@@ -217,6 +218,20 @@ impl Project {
             .retain(|file| !file.merged_from.iter().any(|id| id == file_id));
     }
 
+    /// Add every regular text file directly inside `folder`, sorted by path.
+    /// Text detection is intentionally conservative: a file is text when the first
+    /// chunk contains no NUL byte. That accepts extensionless logs while skipping
+    /// obvious binaries.
+    pub fn add_text_files_from_dir(&mut self, folder: impl AsRef<Path>) -> io::Result<usize> {
+        let paths = text_files_in_dir(folder.as_ref())?;
+        let before = self.files.iter().filter(|file| !file.is_merged()).count();
+        for path in paths {
+            self.add_file(path, None);
+        }
+        let after = self.files.iter().filter(|file| !file.is_merged()).count();
+        Ok(after.saturating_sub(before))
+    }
+
     /// Build a timestamp-ordered merge of `file_ids` and add it as a virtual file.
     /// Returns its id, or an error naming what is not ready yet.
     pub fn add_merged(&mut self, file_ids: &[String]) -> Result<String, String> {
@@ -414,6 +429,30 @@ fn absolute_path(path: impl AsRef<Path>) -> PathBuf {
                 .join(path)
         }
     })
+}
+
+pub fn text_files_in_dir(folder: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && is_text_file(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn is_text_file(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut buffer = [0_u8; 8192];
+    match file.read(&mut buffer) {
+        Ok(n) => !buffer[..n].contains(&0),
+        Err(_) => false,
+    }
 }
 
 fn project_version() -> u32 {

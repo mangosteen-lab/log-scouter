@@ -1,4 +1,4 @@
-# Log Scouter (`scout`)
+# Log Scouter (`logscout`)
 
 A keyboard-driven **Rust terminal UI** for browsing large server logs. Open a
 folder as a project, extract structured fields into columns, hide noise, search
@@ -70,12 +70,16 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 
 ## Quick Start
 
-Install the `scout` command from GitHub Releases:
+Install the `logscout` command from GitHub Releases:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install.sh | bash
-scout /path/to/logs
+logscout /path/to/logs
 ```
+
+Run `logscout .` inside a log folder to add every direct text file in that folder as
+a log source. Run `logscout` with no arguments to start an empty project, then press
+`o` to open a folder and add its text files.
 
 Upgrade or uninstall with the matching scripts:
 
@@ -103,7 +107,7 @@ To install a specific release or custom location:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install.sh \
-  | LOG_SCOUTER_VERSION=v0.0.2 LOG_SCOUTER_INSTALL_DIR="$HOME/bin" bash
+  | LOG_SCOUTER_VERSION=v0.0.3 LOG_SCOUTER_INSTALL_DIR="$HOME/bin" bash
 ```
 
 GitHub release packages are built when a version tag is pushed. After the
@@ -133,7 +137,7 @@ cargo run --release -- /path/to/logs
 
 The app currently uses these persisted concepts:
 
-- **Project**: the folder opened by `scout`. Project state is saved in
+- **Project**: the folder opened by `logscout`. Project state is saved in
   `<project>/.logscouter/project.json`.
 - **Log source**: one concrete log file added to the project. A source can live
   anywhere on disk; paths are saved relative to the project when possible. A
@@ -177,7 +181,7 @@ User-level saved searches are not implemented yet.
 
 | Key | Action |
 |---|---|
-| `a` / `d` | add file / remove focused file from project |
+| `a` / `o` / `d` | add file / open folder text files / remove focused file from project |
 | `j k` or arrows | move selection |
 | `gg` / `G` / `[count]G` | top / bottom / go to visible row |
 | `Ctrl+d` / `Ctrl+u` | half page down/up |

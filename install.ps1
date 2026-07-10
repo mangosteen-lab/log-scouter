@@ -15,7 +15,8 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\log-scouter\bin"
 }
 
-$BinName = "scout.exe"
+$BinName = "logscout.exe"
+$LegacyBinName = "scout.exe"
 $AppName = "log-scouter"
 
 function Invoke-LogScouterDownload {
@@ -79,7 +80,7 @@ function Add-InstallDirToPath {
         if (($env:Path -split ';') -notcontains $Dir) {
             $env:Path = "$env:Path;$Dir"
         }
-        Write-Host "Added $Dir to the user PATH. Open a new terminal if scout is not found."
+        Write-Host "Added $Dir to the user PATH. Open a new terminal if logscout is not found."
     }
 }
 
@@ -89,8 +90,12 @@ function Install-Binary {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $destination = Join-Path $InstallDir $BinName
     Copy-Item -Force -Path $Source -Destination $destination
+    $legacy = Join-Path $InstallDir $LegacyBinName
+    if (Test-Path $legacy) {
+        Remove-Item -Force $legacy
+    }
     Add-InstallDirToPath -Dir $InstallDir
-    Write-Host "Installed scout to $destination"
+    Write-Host "Installed logscout to $destination"
 }
 
 function Install-FromRelease {
@@ -139,7 +144,7 @@ function Install-FromSource {
         $args = @(
             "install",
             "--git", "https://github.com/$Repo.git",
-            "--bin", "scout",
+            "--bin", "logscout",
             "--root", $cargoRoot,
             "--locked",
             "--force"
@@ -149,7 +154,7 @@ function Install-FromSource {
                 "install",
                 "--git", "https://github.com/$Repo.git",
                 "--tag", $Version,
-                "--bin", "scout",
+                "--bin", "logscout",
                 "--root", $cargoRoot,
                 "--locked",
                 "--force"
@@ -162,7 +167,7 @@ function Install-FromSource {
             throw "cargo install failed"
         }
 
-        $source = Join-Path $cargoRoot "bin\scout.exe"
+        $source = Join-Path $cargoRoot "bin\logscout.exe"
         if (-not (Test-Path $source)) {
             throw "cargo install did not produce $source"
         }

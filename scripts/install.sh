@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Install the latest Log Scouter release as the `scout` command.
+# Install the latest Log Scouter release as the `logscout` command.
 set -euo pipefail
 
 APP_NAME="log-scouter"
-BIN_NAME="scout"
+BIN_NAME="logscout"
+LEGACY_BIN_NAME="scout"
 DEFAULT_REPO="mangosteen-lab/log-scouter"
 
 REPO="${LOG_SCOUTER_REPO:-$DEFAULT_REPO}"
@@ -125,6 +126,9 @@ install_binary() {
     local src="$1"
     mkdir -p "$INSTALL_DIR" || die "could not create $INSTALL_DIR"
     install -m 0755 "$src" "$INSTALL_DIR/$BIN_NAME" || die "could not install $BIN_NAME to $INSTALL_DIR"
+    if [ -e "$INSTALL_DIR/$LEGACY_BIN_NAME" ] && [ "$LEGACY_BIN_NAME" != "$BIN_NAME" ]; then
+        rm -f "$INSTALL_DIR/$LEGACY_BIN_NAME"
+    fi
 }
 
 release_url_for() {

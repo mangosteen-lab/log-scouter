@@ -65,7 +65,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --release --locked --bin scout --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin logscout --target ${{ matrix.target }}
 
       - name: Package Unix archive
         if: matrix.archive == 'tar.gz'
@@ -74,7 +74,7 @@ jobs:
           set -euo pipefail
           package="log-scouter-${{ matrix.target }}"
           mkdir -p "dist/$package"
-          cp "target/${{ matrix.target }}/release/scout" "dist/$package/"
+          cp "target/${{ matrix.target }}/release/logscout" "dist/$package/"
           cp README.md LICENSE "dist/$package/"
           tar -C dist -czf "dist/$package.tar.gz" "$package"
 
@@ -84,7 +84,7 @@ jobs:
         run: |
           $package = "log-scouter-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/scout.exe" "dist/$package/"
+          Copy-Item "target/${{ matrix.target }}/release/logscout.exe" "dist/$package/"
           Copy-Item README.md,LICENSE "dist/$package/"
           Compress-Archive -Force -Path "dist/$package/*" -DestinationPath "dist/$package.zip"
 

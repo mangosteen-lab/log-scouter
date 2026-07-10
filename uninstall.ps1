@@ -10,7 +10,8 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\log-scouter\bin"
 }
 
-$binary = Join-Path $InstallDir "scout.exe"
+$binary = Join-Path $InstallDir "logscout.exe"
+$legacyBinary = Join-Path $InstallDir "scout.exe"
 
 if (Test-Path $binary) {
     Remove-Item -Force $binary
@@ -18,6 +19,11 @@ if (Test-Path $binary) {
 }
 else {
     Write-Host "$binary was not installed"
+}
+
+if (Test-Path $legacyBinary) {
+    Remove-Item -Force $legacyBinary
+    Write-Host "Removed legacy $legacyBinary"
 }
 
 if (-not $KeepPath) {

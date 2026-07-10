@@ -57,6 +57,7 @@ enum Mode {
     Normal,
     Search(String),
     AddFile(String),
+    OpenFolder(String),
     Filter(String),
     TimePicker(TimePicker),
     ExportFilters(String),
@@ -1593,6 +1594,13 @@ impl AppState {
             Mode::AddFile(text) => {
                 self.draw_input_popup(frame, root, "Add File", "Type a path and press Enter", &text)
             }
+            Mode::OpenFolder(text) => self.draw_input_popup(
+                frame,
+                root,
+                "Open Folder",
+                "Type a folder path and press Enter",
+                &text,
+            ),
             Mode::Filter(text) => self.draw_input_popup(
                 frame,
                 root,
@@ -2467,6 +2475,7 @@ impl AppState {
             }
             KeyCode::Char('H') => self.begin_hide(),
             KeyCode::Char('a') => self.open_input(Mode::AddFile(String::new())),
+            KeyCode::Char('o') => self.open_input(Mode::OpenFolder(String::new())),
             KeyCode::Char('d') => self.remove_active_file(),
             KeyCode::Char('S') => self.open_new_schema_input(),
             KeyCode::Char('|') | KeyCode::Char('\\') => self.split_active(SplitMode::Horizontal),
@@ -2543,6 +2552,7 @@ impl AppState {
         self.input_cursor = match &mode {
             Mode::Search(text)
             | Mode::AddFile(text)
+            | Mode::OpenFolder(text)
             | Mode::Filter(text)
             | Mode::ExportFilters(text)
             | Mode::LoadFilters(text)
@@ -2607,6 +2617,7 @@ impl AppState {
         match &mut self.mode {
             Mode::Search(input)
             | Mode::AddFile(input)
+            | Mode::OpenFolder(input)
             | Mode::Filter(input)
             | Mode::ExportFilters(input)
             | Mode::LoadFilters(input)
@@ -2626,6 +2637,7 @@ impl AppState {
         match mode {
             Mode::Search(text) => self.submit_search(text),
             Mode::AddFile(path) => self.submit_add_file(path)?,
+            Mode::OpenFolder(path) => self.submit_open_folder(path)?,
             Mode::Filter(text) => self.submit_filter(text),
             Mode::ExportFilters(folder) => self.submit_export_filters(folder),
             Mode::LoadFilters(folder) => self.submit_load_filters(folder),
@@ -2693,6 +2705,43 @@ impl AppState {
         // Name the schema: it was detected, not chosen, so say which one won.
         self.status = format!("opened {} as schema '{schema}'", path.display());
         self.autosave_project();
+        Ok(())
+    }
+
+    fn submit_open_folder(&mut self, path: String) -> anyhow::Result<()> {
+        let path = PathBuf::from(path.trim());
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let Ok(folder) = std::fs::canonicalize(&path) else {
+            self.status = format!("missing folder: {}", path.display());
+            return Ok(());
+        };
+        if !folder.is_dir() {
+            self.status = format!("not a folder: {}", folder.display());
+            return Ok(());
+        }
+
+        self.capture_session();
+        self.project.save().ok();
+
+        let mut project = Project::load(&folder);
+        let added = match project.add_text_files_from_dir(&folder) {
+            Ok(added) => added,
+            Err(error) => {
+                self.status = format!("could not read folder {}: {error}", folder.display());
+                return Ok(());
+            }
+        };
+
+        let mut next = AppState::new(project);
+        next.status = match added {
+            0 => format!("opened {} with no new text files", folder.display()),
+            1 => format!("opened {} with 1 text file", folder.display()),
+            n => format!("opened {} with {n} text files", folder.display()),
+        };
+        next.queue_initial_loads();
+        *self = next;
         Ok(())
     }
 
@@ -4732,7 +4781,7 @@ fn centered_rect(width: u16, height: u16, root: Rect) -> Rect {
 
 fn help_text() -> &'static str {
     "Project/files
-  a add file        d remove focused file       Ctrl+s save
+  a add file        o open folder text files    d remove focused file       Ctrl+s save
   S define reusable log schema
   e apply/edit this file's schema (schema name, or full format template)
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
@@ -6111,6 +6160,45 @@ mod tests {
         assert_eq!(app.project.files[0].entries.len(), 30_000);
         assert_eq!(app.active_view().unwrap().visible.len(), 30_000);
         assert!(app.progress.is_none(), "bar should clear when work drains");
+    }
+
+    #[test]
+    fn opening_a_folder_from_an_empty_project_loads_direct_text_files() {
+        let start = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        std::fs::write(
+            logs.path().join("a.log"),
+            "2026-06-16 10:00:01.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] alpha\n",
+        )
+        .unwrap();
+        std::fs::write(
+            logs.path().join("b.txt"),
+            "2026-06-16 10:00:02.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][b.cpp:1] beta\n",
+        )
+        .unwrap();
+        std::fs::write(logs.path().join("bin.dat"), b"text\0binary").unwrap();
+        std::fs::create_dir(logs.path().join("nested")).unwrap();
+        std::fs::write(logs.path().join("nested").join("c.log"), "nested\n").unwrap();
+
+        let mut app = AppState::new(Project::new(start.path()));
+        assert!(app.active_view().is_none());
+
+        app.submit_open_folder(logs.path().to_string_lossy().to_string())
+            .unwrap();
+        assert!(app.work_pending());
+        assert!(app.status.contains("with 2 text files"), "{}", app.status);
+        app.finish_work();
+
+        assert_eq!(app.project.root, std::fs::canonicalize(logs.path()).unwrap());
+        let names: Vec<&str> = app
+            .project
+            .files
+            .iter()
+            .map(|file| file.display_name.as_str())
+            .collect();
+        assert_eq!(names, ["a.log", "b.txt"]);
+        assert!(app.project.files.iter().all(|file| file.loaded));
+        assert_eq!(app.active_view().unwrap().visible.len(), 1);
     }
 
     #[test]
