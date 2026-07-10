@@ -110,7 +110,12 @@ detect_target() {
     esac
 
     case "$os" in
-        Linux) printf '%s-unknown-linux-gnu\n' "$arch" ;;
+        Linux)
+            case "$arch" in
+                x86_64) printf '%s-unknown-linux-musl\n' "$arch" ;;
+                *) return 1 ;;
+            esac
+            ;;
         Darwin) printf '%s-apple-darwin\n' "$arch" ;;
         *) return 1 ;;
     esac
