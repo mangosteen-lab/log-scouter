@@ -1,0 +1,1353 @@
+use chrono::{NaiveDate, Timelike};
+use log_scouter::core::extractor::{
+    default_extractor, detect, export_schemas_to_folder, load_schemas_from_folder,
+    preview_extraction, user_schema_dir, Extractor, SampleLine, BRACKETED_LEGACY_FORMAT,
+};
+use log_scouter::core::filters::{
+    common_message_pattern, expand_tilde, export_filters_to_folder, hide_like,
+    load_filters_from_folder, user_filter_dir, FilterFile, FilterRule, FilterSet,
+};
+use log_scouter::core::models::{merge_files, LogFileModel, ViewModel, VisibleIndices};
+use log_scouter::core::project::Project;
+use log_scouter::core::search::{compile_query, parse_datetime};
+use std::path::PathBuf;
+
+const SAMPLE: &str = include_str!("../fixtures/sample.log");
+
+fn sample_model() -> LogFileModel {
+    let extractor = default_extractor();
+    let mut model = LogFileModel::new(
+        "f1",
+        "sample.log",
+        extractor.name.clone(),
+        "",
+        Some(extractor),
+    );
+    model.load_from_lines(SAMPLE.lines());
+    model
+}
+
+fn synthetic(n: usize) -> LogFileModel {
+    let extractor = default_extractor();
+    let mut lines = Vec::new();
+    let modules = ["Kernel", "Net", "SQL"];
+    let levels = ["Trace", "Info", "Error"];
+    for i in 0..n {
+        lines.push(format!(
+            "2026-06-16 10:{:02}:{:02}.{:03} [HOST:h][SERVER:S][PID:1][THR:2][{}][{}][UID:0][SID:0][OID:0][F.cpp:{}] msg {}",
+            (i / 60) % 60,
+            i % 60,
+            i % 1000,
+            modules[i % 3],
+            levels[i % 3],
+            i,
+            i
+        ));
+    }
+    let mut model = LogFileModel::new(
+        "f1",
+        "synthetic.log",
+        extractor.name.clone(),
+        "",
+        Some(extractor),
+    );
+    model.load_from_lines(lines.iter().map(String::as_str));
+    model
+}
+
+#[test]
+fn default_extractor_parses_all_fields() {
+    let extractor = default_extractor();
+    let example = SAMPLE.lines().next().unwrap();
+    let fields = preview_extraction(&extractor, example);
+    let fields: std::collections::HashMap<_, _> = fields.into_iter().collect();
+
+    assert_eq!(fields["timestamp"], "2026-06-16 10:09:43.288");
+    assert_eq!(fields["host"], "log-host-1");
+    assert_eq!(fields["server"], "AppServer");
+    assert_eq!(fields["process_id"], "54");
+    assert_eq!(fields["thread_id"], "136612056716864");
+    assert_eq!(fields["log_module"], "Kernel");
+    assert_eq!(fields["log_level"], "Trace");
+    assert_eq!(fields["file_name"], "ServerDispatcher.cpp");
+    assert_eq!(fields["line_number"], "394");
+    assert!(fields["message"].starts_with("NetChannel : Channel is closed."));
+}
+
+#[test]
+fn timestamp_is_parsed() {
+    let extractor = default_extractor();
+    let fields = extractor.extract(SAMPLE.lines().next().unwrap()).unwrap();
+    let expected = NaiveDate::from_ymd_opt(2026, 6, 16)
+        .unwrap()
+        .and_hms_micro_opt(10, 9, 43, 288000)
+        .unwrap();
+    assert_eq!(extractor.parse_timestamp(&fields), Some(expected));
+}
+
+#[test]
+fn multiline_continuation_is_appended() {
+    let extractor = default_extractor();
+    let example = SAMPLE.lines().next().unwrap();
+    let mut model = LogFileModel::new(
+        "f1",
+        "test.log",
+        extractor.name.clone(),
+        "",
+        Some(extractor),
+    );
+    model.load_from_lines([
+        example.to_string(),
+        "    at frame_one() (a.cpp:1)".to_string(),
+        "    at frame_two() (b.cpp:2)".to_string(),
+        example.replace("Trace", "Error"),
+    ]);
+
+    assert_eq!(model.entries.len(), 2);
+    assert!(model.message(&model.entries[0]).contains("frame_one"));
+    assert!(model.message(&model.entries[0]).contains("frame_two"));
+    assert_eq!(model.entries[0].raw.matches('\n').count(), 2);
+    assert_eq!(model.level(&model.entries[1]), "Error");
+}
+
+#[test]
+fn logical_field_aliases_work() {
+    let model = sample_model();
+    let entry = &model.entries[0];
+    assert_eq!(model.get_field(entry, "level"), "Trace");
+    assert_eq!(model.get_field(entry, "module"), "Kernel");
+    assert_eq!(model.get_field(entry, "file"), "ServerDispatcher.cpp");
+}
+
+#[test]
+fn custom_format_parses() {
+    let extractor = Extractor::new("simple", "<level>: <message>").unwrap();
+    let fields = extractor.extract("ERROR: disk full").unwrap();
+    assert_eq!(fields["level"], "ERROR");
+    assert_eq!(fields["message"], "disk full");
+}
+
+/// An bracketed error line carries an extra `[0x800424FB]` between level and UID. Before
+/// `<error_code?>` the non-greedy `<log_level>` swallowed it, so `log_level` came out as
+/// `Error][0x800424FB` and a `level equals Error` filter silently dropped the line.
+const ERROR_LINE: &str = "2026-06-16 10:12:08.631 [HOST:h1][SERVER:AppServer][PID:53][THR:135332369409600][Query Engine][Error][0x800424FB][UID:5CCC][SID:B830][OID:72EF][QueryEngine.cpp:6580] We could not obtain the data.";
+const PLAIN_LINE: &str = "2026-06-16 10:12:09.000 [HOST:h1][SERVER:AppServer][PID:53][THR:135332369409600][Query Engine][Error][UID:5CCC][SID:B830][OID:72EF][QueryEngine.cpp:6581] Plain error, no code.";
+
+#[test]
+fn optional_field_is_captured_when_present() {
+    let fields = default_extractor().extract(ERROR_LINE).unwrap();
+    assert_eq!(fields["log_level"], "Error");
+    assert_eq!(fields["error_code"], "0x800424FB");
+    assert_eq!(fields["user_id"], "5CCC");
+    assert_eq!(fields["file_name"], "QueryEngine.cpp");
+    assert_eq!(fields["message"], "We could not obtain the data.");
+}
+
+#[test]
+fn optional_field_is_empty_when_absent() {
+    let fields = default_extractor().extract(PLAIN_LINE).unwrap();
+    assert_eq!(fields["log_level"], "Error");
+    assert_eq!(fields["error_code"], "");
+    assert_eq!(fields["user_id"], "5CCC");
+    assert_eq!(fields["message"], "Plain error, no code.");
+}
+
+/// The regression the optional field exists to prevent: one filter must catch both.
+#[test]
+fn level_filter_matches_lines_with_and_without_the_optional_code() {
+    let extractor = default_extractor();
+    let mut model = LogFileModel::new("f1", "e.log", extractor.name.clone(), "", Some(extractor));
+    model.load_from_lines([ERROR_LINE, PLAIN_LINE]);
+    assert_eq!(model.entries.len(), 2);
+
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new("level", "equals", "Error", "include"));
+    let kept = model
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&model, entry))
+        .count();
+    assert_eq!(
+        kept, 2,
+        "both error lines must survive a level=Error filter"
+    );
+}
+
+/// A leading `<error_code?>` capture must not steal the separator behind it.
+#[test]
+fn optional_field_absorbs_the_separator_in_front_of_it() {
+    let extractor = Extractor::new("opt", "[<a>][<b?>][C:<c>]").unwrap();
+
+    let both = extractor.extract("[1][2][C:3]").unwrap();
+    assert_eq!(
+        (&both["a"], &both["b"], &both["c"]),
+        (&"1".into(), &"2".into(), &"3".into())
+    );
+
+    let without = extractor.extract("[1][C:3]").unwrap();
+    assert_eq!(without["a"], "1");
+    assert_eq!(without["b"], "");
+    assert_eq!(without["c"], "3");
+}
+
+/// Multi-line grouping must still fire: a continuation line is not a record start.
+#[test]
+fn optional_field_does_not_break_multiline_grouping() {
+    let extractor = default_extractor();
+    let mut model = LogFileModel::new("f1", "e.log", extractor.name.clone(), "", Some(extractor));
+    model.load_from_lines([
+        ERROR_LINE,
+        "Error type: Odbc error. Connection refused.",
+        PLAIN_LINE,
+    ]);
+
+    assert_eq!(
+        model.entries.len(),
+        2,
+        "continuation must fold into the error line"
+    );
+    assert!(model.entries[0].raw.contains("Odbc error"));
+    assert_eq!(
+        model.get_field(&model.entries[0], "error_code"),
+        "0x800424FB"
+    );
+}
+
+#[test]
+fn search_query_language_matches_expected_entries() {
+    let model = sample_model();
+
+    let q = compile_query("Cache miss");
+    assert!(model.entries.iter().any(|entry| q.matches(&model, entry)));
+
+    let q = compile_query("level=Error");
+    let hits: Vec<_> = model
+        .entries
+        .iter()
+        .filter(|entry| q.matches(&model, entry))
+        .collect();
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|entry| model.level(entry) == "Error"));
+
+    let q = compile_query("module~SQL level=Warn");
+    let hits: Vec<_> = model
+        .entries
+        .iter()
+        .filter(|entry| q.matches(&model, entry))
+        .collect();
+    assert!(!hits.is_empty());
+    assert!(hits
+        .iter()
+        .all(|entry| model.module(entry).to_lowercase().contains("sql")));
+    assert!(hits.iter().all(|entry| model.level(entry) == "Warn"));
+
+    let q = compile_query(r#""/completed in \d+ms/""#);
+    assert!(model.entries.iter().any(|entry| q.matches(&model, entry)));
+
+    let q = compile_query("after:2026-06-16T10:09:50 before:2026-06-16T10:09:56");
+    let hits: Vec<_> = model
+        .entries
+        .iter()
+        .filter(|entry| q.matches(&model, entry))
+        .collect();
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|entry| {
+        let ts = model.timestamp(entry).unwrap();
+        ts.second() >= 50 && ts.second() <= 56
+    }));
+}
+
+#[test]
+fn date_range_and_datetime_formats_work() {
+    let model = sample_model();
+    let q = compile_query("date:[2026-06-16T10:09:44..2026-06-16T10:09:46]");
+    assert!(model.entries.iter().any(|entry| q.matches(&model, entry)));
+
+    assert!(parse_datetime("2026-06-16").is_some());
+    assert!(parse_datetime("2026-06-16 10:09").is_some());
+    assert!(parse_datetime("2026-06-16 10:09:43.288").is_some());
+    assert!(parse_datetime("nonsense").is_none());
+}
+
+#[test]
+fn invalid_regex_is_recorded_not_raised() {
+    let q = compile_query("/(unclosed/");
+    assert!(!q.error.is_empty());
+}
+
+#[test]
+fn filters_include_exclude_and_hide_like() {
+    let model = sample_model();
+
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new("level", "equals", "Trace", "exclude"));
+    let visible: Vec<_> = model
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&model, entry))
+        .collect();
+    assert!(visible.iter().all(|entry| model.level(entry) != "Trace"));
+    assert!(visible.len() < model.entries.len());
+
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new("level", "equals", "Error", "include"));
+    let visible: Vec<_> = model
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&model, entry))
+        .collect();
+    assert!(!visible.is_empty());
+    assert!(visible.iter().all(|entry| model.level(entry) == "Error"));
+
+    let kernel_index = model
+        .entries
+        .iter()
+        .position(|entry| model.module(entry) == "Kernel")
+        .unwrap();
+    let mut filters = FilterSet::default();
+    filters.add(hide_like(
+        &model,
+        &model.entries[kernel_index],
+        "module",
+        "",
+    ));
+    let visible: Vec<_> = model
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&model, entry))
+        .collect();
+    assert!(visible.iter().all(|entry| model.module(entry) != "Kernel"));
+}
+
+#[test]
+fn timestamp_range_filter_works() {
+    let model = sample_model();
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new(
+        "timestamp",
+        "range",
+        "2026-06-16 10:09:50..",
+        "include",
+    ));
+    let visible: Vec<_> = model
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&model, entry))
+        .collect();
+    assert!(!visible.is_empty());
+    assert!(visible
+        .iter()
+        .all(|entry| model.timestamp(entry).unwrap().second() >= 50
+            || model.timestamp(entry).unwrap().minute() >= 10));
+}
+
+#[test]
+fn filters_export_and_load_as_individual_json_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("filters");
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new("level", "equals", "Trace", "exclude"));
+    filters.add(FilterRule::new("module", "contains", "SQL", "include"));
+
+    let exported = export_filters_to_folder(&filters, &folder).unwrap();
+    assert_eq!(exported, 2);
+
+    let mut files = std::fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    files.sort();
+    assert_eq!(files.len(), 2);
+
+    let first_body = std::fs::read_to_string(&files[0]).unwrap();
+    let first: FilterFile = serde_json::from_str(&first_body).unwrap();
+    assert!(!first.name.is_empty());
+    assert!(first.description.contains("level"));
+    assert_eq!(first.filter, filters.rules[0]);
+
+    let loaded = load_filters_from_folder(&folder).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].filter, filters.rules[0]);
+    assert_eq!(loaded[1].filter, filters.rules[1]);
+}
+
+#[test]
+fn view_model_fast_path_and_context_work() {
+    let model = synthetic(1000);
+    let mut view = ViewModel::new("L1", &model);
+    assert_eq!(view.visible, VisibleIndices::Range(1000));
+
+    view.filters
+        .add(FilterRule::new("level", "equals", "Trace", "exclude"));
+    view.rebuild(&model);
+    assert!(matches!(view.visible, VisibleIndices::List(_)));
+    assert!(view
+        .visible
+        .iter()
+        .all(|index| model.level(&model.entries[index]) != "Trace"));
+
+    let model = sample_model();
+    let mut view = ViewModel::new("L1", &model);
+    view.query = Some(compile_query("Fatal"));
+    view.context = 2;
+    view.rebuild(&model);
+    assert!(!view.visible.is_empty());
+    assert!(view.visible.len() < model.entries.len());
+    assert!(view
+        .visible
+        .iter()
+        .any(|index| view.match_set.contains(&index)));
+}
+
+#[test]
+fn common_pattern_generalises_differing_tokens_in_place() {
+    let pattern = common_message_pattern(&[
+        "Distribution Service Trigger: 5 subscriptions queued",
+        "Distribution Service Trigger: 7 subscriptions queued",
+    ])
+    .unwrap();
+    assert_eq!(
+        pattern,
+        r"Distribution\s+Service\s+Trigger:\s+\S+\s+subscriptions\s+queued"
+    );
+
+    // The derived regex must match every line it was derived from.
+    let regex = regex::Regex::new(&pattern).unwrap();
+    assert!(regex.is_match("Distribution Service Trigger: 5 subscriptions queued"));
+    assert!(regex.is_match("Distribution Service Trigger: 7 subscriptions queued"));
+    assert!(!regex.is_match("Cache miss for session 12"));
+}
+
+#[test]
+fn common_pattern_escapes_regex_metacharacters() {
+    let pattern = common_message_pattern(&[
+        "UserSession::TimeOut() id=1",
+        "UserSession::TimeOut() id=2",
+    ])
+    .unwrap();
+    let regex = regex::Regex::new(&pattern).unwrap();
+    assert!(regex.is_match("UserSession::TimeOut() id=9"));
+    // `()` was escaped, not treated as an empty group that matches anything.
+    assert!(!regex.is_match("UserSession::TimeOut id=9"));
+}
+
+#[test]
+fn common_pattern_falls_back_to_shared_tokens_when_lengths_differ() {
+    let pattern = common_message_pattern(&[
+        "Cache miss for session 12",
+        "Cache miss for user bob in session 13",
+    ])
+    .unwrap();
+    assert_eq!(pattern, r"Cache.*miss.*for.*session");
+
+    let regex = regex::Regex::new(&pattern).unwrap();
+    assert!(regex.is_match("Cache miss for session 12"));
+    assert!(regex.is_match("Cache miss for user bob in session 13"));
+}
+
+#[test]
+fn common_pattern_falls_back_to_literals_rather_than_a_catch_all() {
+    // Nothing shared: generalising would hide the file, so match the lines exactly.
+    let pattern = common_message_pattern(&["alpha beta", "gamma delta"]).unwrap();
+    assert_eq!(pattern, r"(?:alpha beta|gamma delta)");
+    let regex = regex::Regex::new(&pattern).unwrap();
+    assert!(regex.is_match("alpha beta"));
+    assert!(regex.is_match("gamma delta"));
+    assert!(!regex.is_match("alpha delta"));
+
+    // Different lengths, nothing shared -> literals again.
+    let pattern = common_message_pattern(&["alpha", "gamma delta"]).unwrap();
+    assert_eq!(pattern, r"(?:alpha|gamma delta)");
+
+    // One shared token out of many is too thin to be a template.
+    let pattern =
+        common_message_pattern(&["the quick brown fox", "the slow purple elephant here"]).unwrap();
+    assert!(pattern.starts_with("(?:"), "over-generalised to {pattern}");
+
+    // Duplicates collapse.
+    assert_eq!(common_message_pattern(&["same", "same"]).unwrap(), "same");
+
+    // Nothing to generalise against.
+    assert_eq!(common_message_pattern(&["alpha beta"]), None);
+    assert_eq!(common_message_pattern(&[]), None);
+    // All-blank has no content at all.
+    assert_eq!(common_message_pattern(&["  ", "   "]), None);
+}
+
+#[test]
+fn common_pattern_still_generalises_when_one_line_is_an_outlier_free_header() {
+    // The real trigger for "H does nothing": a log's banner line shares no tokens.
+    let pattern = common_message_pattern(&[
+        "# Server Log version 2.0",
+        "NetChannel : Channel is closed. remote 'ip-1'",
+        "NetChannel : Channel is closed. remote 'ip-2'",
+    ])
+    .unwrap();
+    let regex = regex::Regex::new(&pattern).unwrap();
+    // Whatever strategy it picks, it must match every line it was derived from.
+    assert!(regex.is_match("# Server Log version 2.0"));
+    assert!(regex.is_match("NetChannel : Channel is closed. remote 'ip-1'"));
+    assert!(regex.is_match("NetChannel : Channel is closed. remote 'ip-2'"));
+    assert!(!regex.is_match("Cache miss for session 12"));
+}
+
+#[test]
+fn common_pattern_keeps_a_literal_when_only_some_tokens_differ() {
+    let pattern = common_message_pattern(&["a 1 c", "a 2 c", "a 3 c"]).unwrap();
+    assert_eq!(pattern, r"a\s+\S+\s+c");
+}
+
+#[test]
+fn prepared_filters_agree_with_the_per_entry_path() {
+    let model = sample_model();
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new(
+        "message",
+        "regex",
+        r"Cache\s+miss",
+        "exclude",
+    ));
+    filters.add(FilterRule::new("level", "equals", "Error", "include"));
+
+    let prepared = filters.prepare();
+    for entry in &model.entries {
+        assert_eq!(
+            prepared.visible(&model, entry),
+            filters.visible(&model, entry)
+        );
+    }
+}
+
+#[test]
+fn an_invalid_regex_rule_matches_nothing_rather_than_panicking() {
+    let model = sample_model();
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new("message", "regex", "(unclosed", "exclude"));
+    let visible = model
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&model, entry))
+        .count();
+    assert_eq!(visible, model.entries.len());
+}
+
+/// A second, unrelated log format, to prove schemas really are per file.
+fn simple_model(file_id: &str, lines: &[&str]) -> LogFileModel {
+    let extractor =
+        Extractor::with_timestamp_format("simple", "<timestamp> <level>: <message>", "%H:%M:%S")
+            .unwrap();
+    let mut model = LogFileModel::new(
+        file_id,
+        format!("{file_id}.log"),
+        extractor.name.clone(),
+        format!("{file_id}.log"),
+        Some(extractor),
+    );
+    model.load_from_lines(lines.iter().copied());
+    model
+}
+
+fn bracketed_model(file_id: &str, lines: &[&str]) -> LogFileModel {
+    let extractor = default_extractor();
+    let mut model = LogFileModel::new(
+        file_id,
+        format!("{file_id}.log"),
+        extractor.name.clone(),
+        format!("{file_id}.log"),
+        Some(extractor),
+    );
+    model.load_from_lines(lines.iter().copied());
+    model
+}
+
+#[test]
+fn merge_interleaves_two_files_by_timestamp() {
+    let left = bracketed_model(
+        "f1",
+        &[
+            "2026-06-16 10:00:01.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] first",
+            "2026-06-16 10:00:03.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Error][UID:0][SID:0][OID:0][a.cpp:2] third",
+        ],
+    );
+    let right = bracketed_model(
+        "f2",
+        &[
+            "2026-06-16 10:00:02.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Warn][UID:0][SID:0][OID:0][b.cpp:1] second",
+            "2026-06-16 10:00:04.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][b.cpp:2] fourth",
+        ],
+    );
+
+    let merged = merge_files("m1", &[&left, &right]);
+    assert!(merged.is_merged());
+    assert_eq!(merged.entries.len(), 4);
+
+    let messages: Vec<String> = merged
+        .entries
+        .iter()
+        .map(|entry| merged.message(entry))
+        .collect();
+    assert_eq!(messages, ["first", "second", "third", "fourth"]);
+
+    // Each entry still reports the file it came from.
+    let origins: Vec<&str> = merged
+        .entries
+        .iter()
+        .filter_map(|entry| merged.source_name(entry))
+        .collect();
+    assert_eq!(origins, ["f1.log", "f2.log", "f1.log", "f2.log"]);
+
+    let stamps: Vec<_> = merged
+        .entries
+        .iter()
+        .map(|entry| merged.timestamp(entry).unwrap())
+        .collect();
+    assert!(stamps.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+#[test]
+fn merge_applies_each_files_own_schema() {
+    let bracketed = bracketed_model(
+        "f1",
+        &["2026-06-16 10:00:02.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Error][UID:0][SID:0][OID:0][a.cpp:7] boom"],
+    );
+    // A totally different format, whose `level` sits somewhere else entirely.
+    let simple = simple_model("f2", &["10:00:01 WARN: disk almost full"]);
+
+    let merged = merge_files("m1", &[&bracketed, &simple]);
+    assert_eq!(merged.entries.len(), 2);
+
+    // The simple line carries no date, so its timestamp does not parse; it inherits
+    // the sentinel and keeps the head position rather than being dropped.
+    assert_eq!(merged.level(&merged.entries[0]), "WARN");
+    assert_eq!(merged.message(&merged.entries[0]), "disk almost full");
+    assert_eq!(merged.level(&merged.entries[1]), "Error");
+    assert_eq!(merged.module(&merged.entries[1]), "Kernel");
+    assert_eq!(merged.get_field(&merged.entries[1], "file"), "a.cpp");
+    assert_eq!(merged.message(&merged.entries[1]), "boom");
+}
+
+#[test]
+fn merge_keeps_untimestamped_lines_next_to_their_own_file() {
+    // A banner with no timestamp must not sink to the top of the merge.
+    let left = bracketed_model(
+        "f1",
+        &[
+            "# Server Log version 2.0",
+            "2026-06-16 10:00:03.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] late",
+        ],
+    );
+    let right = bracketed_model(
+        "f2",
+        &["2026-06-16 10:00:01.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][b.cpp:1] early"],
+    );
+
+    let merged = merge_files("m1", &[&left, &right]);
+    let messages: Vec<String> = merged
+        .entries
+        .iter()
+        .map(|entry| merged.message(entry))
+        .collect();
+    assert_eq!(messages[0], "# Server Log version 2.0");
+    assert_eq!(messages[1], "early");
+    assert_eq!(messages[2], "late");
+}
+
+#[test]
+fn project_merges_files_and_does_not_persist_the_merged_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.log");
+    let b = tmp.path().join("b.log");
+    std::fs::write(&a, "2026-06-16 10:00:01.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] one\n").unwrap();
+    std::fs::write(&b, "2026-06-16 10:00:02.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][b.cpp:1] two\n").unwrap();
+
+    let mut project = Project::load(tmp.path());
+    let id_a = project.add_file(&a, None).file_id.clone();
+    let id_b = project.add_file(&b, None).file_id.clone();
+    project.load_all_files();
+
+    let merged_id = project.add_merged(&[id_a.clone(), id_b.clone()]).unwrap();
+    assert_eq!(project.files.len(), 3);
+    assert_eq!(project.get_file(&merged_id).unwrap().entries.len(), 2);
+
+    // Merging the same pair again reuses the existing view.
+    assert_eq!(
+        project.add_merged(&[id_a.clone(), id_b.clone()]).unwrap(),
+        merged_id
+    );
+    assert_eq!(project.files.len(), 3);
+
+    // Fewer than two files is not a merge; a merged view cannot be re-merged.
+    assert!(project.add_merged(std::slice::from_ref(&id_a)).is_err());
+    assert!(project
+        .add_merged(&[merged_id.clone(), id_a.clone()])
+        .is_err());
+
+    project.save().unwrap();
+    let reloaded = Project::load(tmp.path());
+    assert_eq!(reloaded.files.len(), 2, "merged view must not be persisted");
+    assert!(reloaded.files.iter().all(|file| !file.is_merged()));
+
+    // Removing a source file drops the merge built on it.
+    project.remove_file(&id_a);
+    assert!(project.get_file(&merged_id).is_none());
+}
+
+#[test]
+fn a_files_schema_can_be_changed_independently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.log");
+    let b = tmp.path().join("b.log");
+    std::fs::write(&a, "10:00:01 WARN: disk almost full\n").unwrap();
+    std::fs::write(&b, "2026-06-16 10:00:02.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][b.cpp:1] two\n").unwrap();
+
+    let mut project = Project::load(tmp.path());
+    let id_a = project.add_file(&a, None).file_id.clone();
+    let id_b = project.add_file(&b, None).file_id.clone();
+    project.load_all_files();
+
+    // `a` does not match the bracketed schema, so it has no level.
+    let file_a = project.get_file(&id_a).unwrap();
+    assert_eq!(file_a.level(&file_a.entries[0]), "");
+
+    let simple =
+        Extractor::with_timestamp_format("simple", "<timestamp> <level>: <message>", "%H:%M:%S")
+            .unwrap();
+    project.add_extractor(simple).unwrap();
+    project.set_file_extractor(&id_a, "simple").unwrap();
+    // Changing the schema invalidates the parse; the caller must re-read.
+    assert!(!project.get_file(&id_a).unwrap().loaded);
+    project.load_all_files();
+
+    let file_a = project.get_file(&id_a).unwrap();
+    assert_eq!(file_a.level(&file_a.entries[0]), "WARN");
+    assert_eq!(file_a.message(&file_a.entries[0]), "disk almost full");
+
+    // `b` is untouched and still uses the bracketed schema.
+    let file_b = project.get_file(&id_b).unwrap();
+    assert_eq!(file_b.level(&file_b.entries[0]), "Info");
+    assert_eq!(file_b.module(&file_b.entries[0]), "Net");
+
+    // The per-file schema survives a save/load round trip.
+    project.save().unwrap();
+    let reloaded = Project::load(tmp.path());
+    assert_eq!(reloaded.get_file(&id_a).unwrap().extractor_name, "simple");
+    assert_eq!(
+        reloaded.get_file(&id_b).unwrap().extractor_name,
+        "Bracketed default"
+    );
+}
+
+#[test]
+fn project_persists_compatible_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log_path = tmp.path().join("a.log");
+    std::fs::write(&log_path, SAMPLE).unwrap();
+
+    let mut project = Project::load(tmp.path());
+    project.add_file(&log_path, None);
+    project.saved_searches.push("level=Error".to_string());
+    project.save().unwrap();
+
+    let reloaded = Project::load(tmp.path());
+    assert_eq!(reloaded.files.len(), 1);
+    assert_eq!(reloaded.saved_searches, vec!["level=Error"]);
+    assert!(reloaded.config_path().exists());
+}
+
+#[test]
+fn project_autosaves_and_restores_filters() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut project = Project::load(tmp.path());
+    assert!(project.filters.rules.is_empty());
+    project
+        .filters
+        .add(FilterRule::new("level", "equals", "Trace", "exclude"));
+    project.filters.add(FilterRule::new(
+        "message",
+        "contains",
+        "TimeOut()",
+        "exclude",
+    ));
+    project.save().unwrap();
+
+    let reloaded = Project::load(tmp.path());
+    assert_eq!(reloaded.filters.rules.len(), 2);
+    assert_eq!(reloaded.filters.rules[0].field, "level");
+    assert_eq!(reloaded.filters.rules[1].value, "TimeOut()");
+
+    // The restored set actually filters entries, not just round-trips as data.
+    let model = sample_model();
+    let visible: Vec<_> = model
+        .entries
+        .iter()
+        .filter(|entry| reloaded.filters.visible(&model, entry))
+        .collect();
+    assert!(!visible.is_empty());
+    assert!(visible.iter().all(|entry| model.level(entry) != "Trace"));
+}
+
+#[test]
+fn schema_descriptions_survive_project_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut project = Project::load(tmp.path());
+    let schema = Extractor::new("simple", "<timestamp> <level>: <message>")
+        .unwrap()
+        .with_description("compact one-line service log");
+
+    project.add_extractor(schema).unwrap();
+    project.save().unwrap();
+
+    let reloaded = Project::load(tmp.path());
+    assert_eq!(
+        reloaded.extractors["simple"].description,
+        "compact one-line service log"
+    );
+}
+
+#[test]
+fn filter_rules_can_be_scoped_to_a_log_schema() {
+    let bracketed = bracketed_model(
+        "bracketed",
+        &["2026-06-16 10:00:01.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] noisy"],
+    );
+    let simple = simple_model("simple", &["10:00:01 Trace: same word different schema"]);
+    let mut filters = FilterSet::default();
+    filters
+        .add(FilterRule::new("level", "equals", "Trace", "exclude").for_log_schema("Bracketed default"));
+
+    assert!(!filters.visible(&bracketed, &bracketed.entries[0]));
+    assert!(filters.visible(&simple, &simple.entries[0]));
+    assert_eq!(
+        filters.rules[0].describe(),
+        "exclude level equals 'Trace' on schema 'Bracketed default'"
+    );
+}
+
+#[test]
+fn scoped_include_filters_do_not_hide_other_schemas() {
+    let bracketed = bracketed_model(
+        "bracketed",
+        &["2026-06-16 10:00:01.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] noisy"],
+    );
+    let simple = simple_model("simple", &["10:00:01 WARN: disk almost full"]);
+    let mut filters = FilterSet::default();
+    filters
+        .add(FilterRule::new("level", "equals", "Error", "include").for_log_schema("Bracketed default"));
+
+    assert!(!filters.visible(&bracketed, &bracketed.entries[0]));
+    assert!(filters.visible(&simple, &simple.entries[0]));
+}
+
+#[test]
+fn schema_scoped_filters_apply_per_source_entry_in_a_merge() {
+    let bracketed = bracketed_model(
+        "bracketed",
+        &["2026-06-16 10:00:02.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] bracketed trace"],
+    );
+    let simple = simple_model("simple", &["10:00:01 Trace: simple trace"]);
+    let merged = merge_files("merged", &[&bracketed, &simple]);
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new("level", "equals", "Trace", "exclude").for_log_schema("simple"));
+
+    let visible: Vec<_> = merged
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&merged, entry))
+        .map(|entry| merged.message(entry))
+        .collect();
+    assert_eq!(visible, ["bracketed trace"]);
+}
+
+#[test]
+fn project_json_without_filters_key_still_loads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join(".logscouter");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("project.json"),
+        r#"{"version":1,"file_counter":0,"saved_searches":["INBOX"]}"#,
+    )
+    .unwrap();
+
+    let project = Project::load(tmp.path());
+    assert!(project.filters.rules.is_empty());
+    assert_eq!(project.saved_searches, vec!["INBOX"]);
+}
+
+#[test]
+fn user_filter_dir_is_under_home() {
+    let home = std::env::var("HOME").expect("HOME is set in this environment");
+    let dir = user_filter_dir().expect("HOME is set, so a user filter dir exists");
+    assert_eq!(dir, PathBuf::from(&home).join(".log-scouter/filters"));
+}
+
+#[test]
+fn expand_tilde_resolves_home_and_leaves_other_paths_alone() {
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    assert_eq!(expand_tilde("~"), home);
+    assert_eq!(
+        expand_tilde("~/.log-scouter/filters"),
+        home.join(".log-scouter/filters")
+    );
+    assert_eq!(expand_tilde("  ~/x  "), home.join("x"));
+    assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    assert_eq!(
+        expand_tilde("relative/path"),
+        PathBuf::from("relative/path")
+    );
+    // A literal `~name` is a username-style path, not ours to expand.
+    assert_eq!(expand_tilde("~other/x"), PathBuf::from("~other/x"));
+}
+
+#[test]
+fn filters_round_trip_through_the_user_level_library() {
+    let tmp = tempfile::tempdir().unwrap();
+    let library = tmp.path().join(".log-scouter").join("filters");
+
+    let mut source = Project::load(tmp.path());
+    source
+        .filters
+        .add(FilterRule::new("level", "equals", "Trace", "exclude"));
+    source
+        .filters
+        .add(FilterRule::new("module", "contains", "SQL", "include"));
+    assert_eq!(
+        export_filters_to_folder(&source.filters, &library).unwrap(),
+        2
+    );
+
+    // A different project imports them.
+    let other = tempfile::tempdir().unwrap();
+    let mut target = Project::load(other.path());
+    for filter_file in load_filters_from_folder(&library).unwrap() {
+        target.filters.add(filter_file.filter);
+    }
+    target.save().unwrap();
+
+    assert_eq!(
+        Project::load(other.path()).filters.rules,
+        source.filters.rules
+    );
+}
+
+// ---- schema packs ----------------------------------------------------------------
+
+#[test]
+fn user_schema_dir_sits_beside_the_filter_library() {
+    let Some(dir) = user_schema_dir() else {
+        return; // $HOME unset in this environment
+    };
+    assert!(
+        dir.ends_with(".log-scouter/schemas"),
+        "{}",
+        dir.display()
+    );
+}
+
+#[test]
+fn schemas_export_and_import_as_individual_json_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("schemas");
+
+    let custom =
+        Extractor::with_timestamp_format("compact", "<timestamp> <level>: <message>", "%H:%M:%S")
+            .unwrap()
+            .with_description("compact service log");
+    let schemas = vec![default_extractor(), custom];
+
+    assert_eq!(export_schemas_to_folder(&schemas, &folder).unwrap(), 2);
+    let files: Vec<_> = std::fs::read_dir(&folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+
+    let loaded = load_schemas_from_folder(&folder).unwrap();
+    assert_eq!(loaded.len(), 2);
+    let compact = loaded
+        .iter()
+        .find(|entry| entry.name == "compact")
+        .expect("compact schema round-tripped");
+    assert_eq!(compact.description, "compact service log");
+    assert_eq!(compact.schema.timestamp_format, "%H:%M:%S");
+
+    // Imported schemas are compiled, so they parse immediately.
+    let fields = compact
+        .schema
+        .extract("10:00:01 WARN: disk almost full")
+        .unwrap();
+    assert_eq!(fields["level"], "WARN");
+    assert_eq!(fields["message"], "disk almost full");
+}
+
+/// An optional field must survive the JSON round-trip, not silently become required.
+#[test]
+fn exported_schema_keeps_optional_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("schemas");
+    export_schemas_to_folder(&[default_extractor()], &folder).unwrap();
+
+    let loaded = load_schemas_from_folder(&folder).unwrap();
+    let schema = &loaded[0].schema;
+    assert!(schema.format.contains("<error_code?>"), "{}", schema.format);
+
+    let fields = schema.extract(ERROR_LINE).unwrap();
+    assert_eq!(fields["log_level"], "Error");
+    assert_eq!(fields["error_code"], "0x800424FB");
+}
+
+/// A bare Extractor, copied out of project.json, imports without rewrapping.
+#[test]
+fn a_bare_extractor_json_is_accepted_as_a_schema_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("schemas");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("bare.json"),
+        r#"{"name":"bare","format":"<level>: <message>"}"#,
+    )
+    .unwrap();
+
+    let loaded = load_schemas_from_folder(&folder).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].name, "bare");
+    let fields = loaded[0].schema.extract("INFO: hello").unwrap();
+    assert_eq!(fields["level"], "INFO");
+}
+
+/// A schema whose format cannot compile must fail loudly at import, not at first line.
+#[test]
+fn an_uncompilable_schema_is_reported_at_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("schemas");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("bad.json"),
+        r#"{"name":"bad","format":"<a>","field_patterns":{"a":"([unclosed"}}"#,
+    )
+    .unwrap();
+
+    let error = load_schemas_from_folder(&folder).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(format!("{error}").contains("bad.json"), "{error}");
+}
+
+#[test]
+fn importing_schemas_from_a_missing_folder_errors_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(load_schemas_from_folder(&tmp.path().join("nope")).is_err());
+}
+
+// ---- schema samples and detection ------------------------------------------------
+
+fn lines(text: &str) -> Vec<String> {
+    text.lines().map(str::to_string).collect()
+}
+
+const COMPACT_LOG: &str = "10:00:01 WARN: disk almost full\n10:00:02 INFO: recovered\n";
+
+fn compact_schema() -> Extractor {
+    Extractor::with_timestamp_format("compact", "<timestamp> <level>: <message>", "%H:%M:%S")
+        .unwrap()
+}
+
+/// Every schema shipped in the binary carries samples, and they pass.
+#[test]
+fn the_builtin_schema_validates_its_own_samples() {
+    let extractor = default_extractor();
+    assert_eq!(extractor.samples.len(), 3);
+    assert_eq!(extractor.level_field(), Some("log_level"));
+    for sample in &extractor.samples {
+        let fields = extractor.extract(&sample.line).expect("sample parses");
+        assert_eq!(fields["log_level"], *sample.level.as_ref().unwrap());
+    }
+}
+
+/// The whole point of samples: the pre-`<error_code?>` format still *matches* the error
+/// line, it just extracts the wrong level. A sample turns that into a load-time error.
+#[test]
+fn a_sample_catches_a_format_that_matches_but_mis_parses() {
+    let error_line = "2026-06-16 10:12:08.631 [HOST:h1][SERVER:S][PID:53][THR:135][Query Engine][Error][0x800424FB][UID:5CCC][SID:B830][OID:72EF][Q.cpp:6580] boom";
+
+    // The legacy format happily matches the line...
+    let legacy = Extractor::new("legacy", BRACKETED_LEGACY_FORMAT).unwrap();
+    let fields = legacy.extract(error_line).unwrap();
+    assert_eq!(
+        fields["log_level"], "Error][0x800424FB",
+        "matches, but wrongly"
+    );
+
+    // ...and a sample asserting the level rejects it, naming the value it actually got.
+    let error = Extractor::new("legacy", BRACKETED_LEGACY_FORMAT)
+        .unwrap()
+        .with_samples(vec![SampleLine::with_level(error_line, "Error")])
+        .unwrap_err();
+    assert_eq!(
+        error,
+        r#"sample 1 parsed level "Error][0x800424FB", expected "Error""#
+    );
+
+    // The current format accepts the same sample.
+    assert!(default_extractor()
+        .with_samples(vec![SampleLine::with_level(error_line, "Error")])
+        .is_ok());
+}
+
+#[test]
+fn a_sample_that_does_not_match_at_all_is_rejected() {
+    let error = compact_schema()
+        .with_samples(vec![SampleLine::new("this is not a compact log line")])
+        .unwrap_err();
+    assert!(
+        error.starts_with("sample 1 does not match the format:"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_sample_expecting_a_level_needs_a_level_field() {
+    let error = Extractor::new("bodyonly", "<timestamp> <message>")
+        .unwrap()
+        .with_samples(vec![SampleLine::with_level("10:00:01 hello", "INFO")])
+        .unwrap_err();
+    assert!(error.contains("no level field"), "{error}");
+}
+
+/// A schema without samples still loads: samples are a guard, not a requirement.
+#[test]
+fn samples_are_optional() {
+    assert!(Extractor::new("bare", "<message>").is_ok());
+}
+
+// ---- detection -------------------------------------------------------------------
+
+#[test]
+fn detection_prefers_the_specific_schema_over_a_catch_all() {
+    let generic = Extractor::new("aaa-generic", "<message>").unwrap();
+    let bracketed = default_extractor();
+    let candidates = vec![&generic, &bracketed];
+
+    // `<message>` matches every line of an bracketed log, so scoring alone would pick it.
+    assert_eq!(generic.match_score(&lines(SAMPLE)), SAMPLE.lines().count());
+    assert!(bracketed.specificity() > generic.specificity());
+
+    let chosen = detect(candidates, &lines(SAMPLE)).unwrap();
+    assert_eq!(chosen.name, "Bracketed default");
+}
+
+#[test]
+fn detection_picks_the_schema_that_actually_matches() {
+    let compact = compact_schema();
+    let bracketed = default_extractor();
+
+    let chosen = detect(vec![&compact, &bracketed], &lines(COMPACT_LOG)).unwrap();
+    assert_eq!(chosen.name, "compact");
+    assert_eq!(bracketed.match_score(&lines(COMPACT_LOG)), 0);
+
+    let chosen = detect(vec![&compact, &bracketed], &lines(SAMPLE)).unwrap();
+    assert_eq!(chosen.name, "Bracketed default");
+}
+
+/// Continuation lines of a multi-line record do not match the schema, and must not
+/// disqualify it.
+#[test]
+fn detection_tolerates_multiline_continuations() {
+    let body = format!(
+        "{}\n    at frame_one() (a.cpp:1)\n    at frame_two() (b.cpp:2)\n{}",
+        SAMPLE.lines().next().unwrap(),
+        SAMPLE.lines().next().unwrap()
+    );
+    let bracketed = default_extractor();
+    assert_eq!(
+        bracketed.match_score(&lines(&body)),
+        2,
+        "only the record starts match"
+    );
+    assert_eq!(
+        detect(vec![&bracketed], &lines(&body)).unwrap().name,
+        "Bracketed default"
+    );
+}
+
+#[test]
+fn detection_returns_none_when_nothing_explains_the_file() {
+    let bracketed = default_extractor();
+    let compact = compact_schema();
+    assert!(detect(vec![&bracketed, &compact], &lines("just prose\nmore prose\n")).is_none());
+    assert!(detect(vec![&bracketed], &[]).is_none());
+}
+
+/// The bug this replaced: `extractors` is a HashMap, so the old `values().next()` default
+/// changed between runs. Detection must be a total, reproducible order.
+#[test]
+fn detection_is_deterministic_across_equally_scoring_schemas() {
+    let a = Extractor::new("aaa", "<message>").unwrap();
+    let b = Extractor::new("bbb", "<message>").unwrap();
+    let c = Extractor::new("ccc", "<message>").unwrap();
+    assert_eq!(a.specificity(), b.specificity());
+
+    let text = lines("anything at all\n");
+    for order in [vec![&a, &b, &c], vec![&c, &b, &a], vec![&b, &c, &a]] {
+        assert_eq!(
+            detect(order, &text).unwrap().name,
+            "aaa",
+            "ties break by name"
+        );
+    }
+}
+
+// ---- project-level detection -----------------------------------------------------
+
+#[test]
+fn adding_a_file_detects_its_schema_instead_of_guessing() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("server.log"), SAMPLE).unwrap();
+    std::fs::write(tmp.path().join("compact.log"), COMPACT_LOG).unwrap();
+
+    let mut project = Project::new(tmp.path());
+    project.add_extractor(default_extractor()).unwrap();
+    project.add_extractor(compact_schema()).unwrap();
+    project
+        .add_extractor(Extractor::new("aaa-generic", "<message>").unwrap())
+        .unwrap();
+
+    assert_eq!(
+        project
+            .add_file(tmp.path().join("server.log"), None)
+            .extractor_name,
+        "Bracketed default"
+    );
+    assert_eq!(
+        project
+            .add_file(tmp.path().join("compact.log"), None)
+            .extractor_name,
+        "compact"
+    );
+}
+
+/// An explicit schema name still wins over detection.
+#[test]
+fn an_explicit_schema_name_skips_detection() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("server.log"), SAMPLE).unwrap();
+
+    let mut project = Project::new(tmp.path());
+    project.add_extractor(default_extractor()).unwrap();
+    project.add_extractor(compact_schema()).unwrap();
+    let name = project
+        .add_file(tmp.path().join("server.log"), Some("compact".to_string()))
+        .extractor_name
+        .clone();
+    assert_eq!(name, "compact");
+}
+
+/// A file nothing matches, and an unreadable one, both land on a stable fallback.
+#[test]
+fn the_fallback_schema_is_the_builtin_not_a_hash_order_accident() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("junk.log"), "prose\nmore prose\n").unwrap();
+
+    let mut project = Project::new(tmp.path());
+    project.add_extractor(default_extractor()).unwrap();
+    project.add_extractor(compact_schema()).unwrap();
+    project
+        .add_extractor(Extractor::new("aaa-first-alphabetically", "<a>=<b>").unwrap())
+        .unwrap();
+
+    assert_eq!(project.default_extractor_obj().name, "Bracketed default");
+    assert_eq!(
+        project
+            .add_file(tmp.path().join("missing.log"), None)
+            .extractor_name,
+        "Bracketed default",
+        "an unreadable file falls back rather than erroring"
+    );
+}
+
+/// Without the built-in present, the fallback is still stable: first name alphabetically.
+#[test]
+fn the_fallback_without_the_builtin_is_the_first_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut project = Project::new(tmp.path());
+    project.extractors.clear();
+    project.add_extractor(compact_schema()).unwrap();
+    project
+        .add_extractor(Extractor::new("aaa-other", "<message>").unwrap())
+        .unwrap();
+    assert_eq!(project.default_extractor_obj().name, "aaa-other");
+}
+
+/// Import is strict: a schema whose sample mis-parses is rejected, with the file named.
+#[test]
+fn importing_a_schema_whose_sample_mis_parses_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("schemas");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("wrong.json"),
+        serde_json::json!({
+            "name": "wrong",
+            "schema": {
+                "name": "wrong",
+                "format": "<timestamp> <level>: <message>",
+                "samples": [{"line": "10:00:01 WARN: disk full", "level": "ERROR"}]
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let error = load_schemas_from_folder(&folder).unwrap_err();
+    let text = format!("{error}");
+    assert!(text.contains("wrong.json"), "{text}");
+    assert!(
+        text.contains(r#"parsed level "WARN", expected "ERROR""#),
+        "{text}"
+    );
+}
+
+/// Loading a project is relaxed: a stored schema with a stale sample must survive, or
+/// every file using it would be silently repointed at another schema.
+#[test]
+fn a_stored_schema_with_a_failing_sample_still_loads() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".logscouter")).unwrap();
+    std::fs::write(
+        tmp.path().join(".logscouter/project.json"),
+        serde_json::json!({
+            "version": 1,
+            "extractors": [{
+                "name": "stale",
+                "format": "<timestamp> <level>: <message>",
+                "samples": [{"line": "10:00:01 WARN: x", "level": "NOPE"}]
+            }],
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let project = Project::load(tmp.path());
+    assert!(
+        project.extractors.contains_key("stale"),
+        "relaxed load must keep the schema: {:?}",
+        project.extractors.keys().collect::<Vec<_>>()
+    );
+
+    // But re-adding it through the strict path still rejects it.
+    let mut strict = Project::new(tmp.path());
+    let stale = project.extractors["stale"].clone();
+    assert!(strict.add_extractor(stale).is_err());
+}
+
+/// Samples survive an export/import round trip, so the guard travels with the schema.
+#[test]
+fn samples_round_trip_through_a_schema_pack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("schemas");
+    export_schemas_to_folder(&[default_extractor()], &folder).unwrap();
+
+    let loaded = load_schemas_from_folder(&folder).unwrap();
+    assert_eq!(loaded[0].schema.samples.len(), 3);
+    assert_eq!(loaded[0].schema.samples[1].level.as_deref(), Some("Error"));
+}

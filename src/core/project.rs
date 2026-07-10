@@ -1,0 +1,425 @@
+use crate::core::extractor::{
+    default_extractor, detect, extractor_from_project, Extractor, DEFAULT_EXTRACTOR_NAME,
+    DETECT_LINES, BRACKETED_DEFAULT_FORMAT, BRACKETED_LEGACY_FORMAT,
+};
+use crate::core::filters::FilterSet;
+use crate::core::models::{display_name, merge_files, LogFileModel};
+use crate::core::parser;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub const CONFIG_DIR: &str = ".logscouter";
+pub const CONFIG_FILE: &str = "project.json";
+
+#[derive(Debug, Clone)]
+pub struct Project {
+    pub root: PathBuf,
+    pub files: Vec<LogFileModel>,
+    pub extractors: HashMap<String, Extractor>,
+    pub saved_searches: Vec<String>,
+    pub filters: FilterSet,
+    /// What was on screen when the folder was last closed. Filters live in `filters`
+    /// because they are project-wide; this is the per-pane part.
+    pub session: Option<Session>,
+    pub settings: Value,
+    file_counter: usize,
+}
+
+/// The panes as they were at quit, so reopening a folder resumes where it left off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    #[serde(default)]
+    pub panes: Vec<PaneSession>,
+    #[serde(default)]
+    pub focused_pane: usize,
+    /// "horizontal" or "vertical"; anything else falls back to horizontal.
+    #[serde(default)]
+    pub split_mode: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSession {
+    /// The files feeding this pane. More than one means a timestamp merge, which cannot
+    /// be rebuilt until those files have loaded.
+    #[serde(default)]
+    pub file_ids: Vec<String>,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub context: usize,
+}
+
+impl Session {
+    pub fn is_empty(&self) -> bool {
+        self.panes.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProjectData {
+    #[serde(default = "project_version")]
+    version: u32,
+    #[serde(default)]
+    file_counter: usize,
+    #[serde(default)]
+    files: Vec<FileData>,
+    #[serde(default)]
+    extractors: Vec<Extractor>,
+    #[serde(default)]
+    saved_searches: Vec<String>,
+    #[serde(default)]
+    filters: FilterSet,
+    #[serde(default)]
+    session: Option<Session>,
+    #[serde(default = "default_settings")]
+    settings: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FileData {
+    #[serde(default)]
+    file_id: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    extractor_name: String,
+    #[serde(default)]
+    display_name: String,
+}
+
+impl Project {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: absolute_path(root.into()),
+            files: Vec::new(),
+            extractors: HashMap::new(),
+            saved_searches: Vec::new(),
+            filters: FilterSet::default(),
+            session: None,
+            settings: default_settings(),
+            file_counter: 0,
+        }
+    }
+
+    pub fn load(root: impl Into<PathBuf>) -> Self {
+        let mut project = Self::new(root);
+        let path = project.config_path();
+        if path.exists() {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if let Ok(data) = serde_json::from_str::<ProjectData>(&raw) {
+                    project.apply(data);
+                }
+            }
+        }
+        if project.extractors.is_empty() {
+            let extractor = default_extractor();
+            project.extractors.insert(extractor.name.clone(), extractor);
+        }
+        project
+    }
+
+    pub fn config_dir(&self) -> PathBuf {
+        self.root.join(CONFIG_DIR)
+    }
+
+    pub fn config_path(&self) -> PathBuf {
+        self.config_dir().join(CONFIG_FILE)
+    }
+
+    pub fn add_extractor(&mut self, mut extractor: Extractor) -> Result<(), String> {
+        extractor.compile()?;
+        self.extractors.insert(extractor.name.clone(), extractor);
+        Ok(())
+    }
+
+    pub fn get_extractor(&mut self, name: &str) -> Extractor {
+        if let Some(extractor) = self.extractors.get(name) {
+            return extractor.clone();
+        }
+        self.default_extractor_obj()
+    }
+
+    /// The schema to fall back on when nothing is known about a file.
+    ///
+    /// `extractors` is a `HashMap`, so `values().next()` is whatever the hasher felt like
+    /// that run -- with more than one schema in the project it picked a different default
+    /// on every launch. Prefer the built-in, then the first name alphabetically.
+    pub fn default_extractor_obj(&mut self) -> Extractor {
+        if let Some(extractor) = self.extractors.get(DEFAULT_EXTRACTOR_NAME) {
+            return extractor.clone();
+        }
+        let first_by_name = self
+            .extractors
+            .keys()
+            .min()
+            .cloned()
+            .and_then(|name| self.extractors.get(&name).cloned());
+        if let Some(extractor) = first_by_name {
+            return extractor;
+        }
+
+        let extractor = default_extractor();
+        self.extractors
+            .insert(extractor.name.clone(), extractor.clone());
+        extractor
+    }
+
+    /// The schema whose format best explains the start of `path`, or the fallback.
+    /// An unreadable file yields the fallback rather than an error: the load will report
+    /// the read failure on its own.
+    pub fn detect_extractor_for(&mut self, path: &Path) -> Extractor {
+        let Ok(lines) = parser::read_first_lines(path, DETECT_LINES) else {
+            return self.default_extractor_obj();
+        };
+        match detect(self.extractors.values(), &lines) {
+            Some(extractor) => extractor.clone(),
+            None => self.default_extractor_obj(),
+        }
+    }
+
+    pub fn add_file(
+        &mut self,
+        path: impl AsRef<Path>,
+        extractor_name: Option<String>,
+    ) -> &mut LogFileModel {
+        let absolute = self.resolve_path(path.as_ref());
+        if let Some(index) = self
+            .files
+            .iter()
+            .position(|file| absolute_path(file.path.clone()) == absolute)
+        {
+            return &mut self.files[index];
+        }
+
+        self.file_counter += 1;
+        // No schema asked for: work it out from the file rather than from hash order.
+        let extractor_name =
+            extractor_name.unwrap_or_else(|| self.detect_extractor_for(&absolute).name);
+        let extractor = Some(self.get_extractor(&extractor_name));
+        let model = LogFileModel::new(
+            format!("f{}", self.file_counter),
+            absolute.clone(),
+            extractor_name,
+            display_name(&absolute),
+            extractor,
+        );
+        self.files.push(model);
+        self.files.last_mut().expect("just pushed file")
+    }
+
+    pub fn remove_file(&mut self, file_id: &str) {
+        self.files.retain(|file| file.file_id != file_id);
+        // A merged view over a removed file no longer reflects the project.
+        self.files
+            .retain(|file| !file.merged_from.iter().any(|id| id == file_id));
+    }
+
+    /// Build a timestamp-ordered merge of `file_ids` and add it as a virtual file.
+    /// Returns its id, or an error naming what is not ready yet.
+    pub fn add_merged(&mut self, file_ids: &[String]) -> Result<String, String> {
+        if file_ids.len() < 2 {
+            return Err("select at least two files to merge".to_string());
+        }
+
+        let mut sources = Vec::with_capacity(file_ids.len());
+        for file_id in file_ids {
+            let Some(file) = self.get_file(file_id) else {
+                return Err(format!("unknown file {file_id}"));
+            };
+            if file.is_merged() {
+                return Err("cannot merge a merged view".to_string());
+            }
+            if !file.loaded {
+                return Err(format!("{} is still loading", file.display_name));
+            }
+            sources.push(file);
+        }
+
+        // Reuse an existing merge of exactly these files rather than stacking copies.
+        if let Some(existing) = self
+            .files
+            .iter()
+            .find(|file| file.merged_from == *file_ids)
+            .map(|file| file.file_id.clone())
+        {
+            return Ok(existing);
+        }
+
+        // Build while `sources` still borrows `self.files`, then commit.
+        let next = self.file_counter + 1;
+        let merged = merge_files(format!("m{next}"), &sources);
+        drop(sources);
+
+        let file_id = merged.file_id.clone();
+        self.file_counter = next;
+        self.files.push(merged);
+        Ok(file_id)
+    }
+
+    /// Point a file at a different schema. The caller must re-read the file: multi-line
+    /// grouping depends on the extractor, so existing entries are wrong.
+    pub fn set_file_extractor(
+        &mut self,
+        file_id: &str,
+        extractor_name: &str,
+    ) -> Result<(), String> {
+        let extractor = self.get_extractor(extractor_name);
+        let Some(file) = self.get_file_mut(file_id) else {
+            return Err(format!("unknown file {file_id}"));
+        };
+        if file.is_merged() {
+            return Err("a merged view takes each file's own schema".to_string());
+        }
+        file.extractor_name = extractor_name.to_string();
+        file.refresh_extractor(Some(extractor));
+        file.loaded = false;
+        file.entries.clear();
+
+        // Merged views captured the old schema and the old entries; drop them.
+        let file_id = file_id.to_string();
+        self.files
+            .retain(|file| !file.merged_from.contains(&file_id));
+        Ok(())
+    }
+
+    pub fn get_file(&self, file_id: &str) -> Option<&LogFileModel> {
+        self.files.iter().find(|file| file.file_id == file_id)
+    }
+
+    pub fn get_file_mut(&mut self, file_id: &str) -> Option<&mut LogFileModel> {
+        self.files.iter_mut().find(|file| file.file_id == file_id)
+    }
+
+    pub fn file_index(&self, file_id: &str) -> Option<usize> {
+        self.files.iter().position(|file| file.file_id == file_id)
+    }
+
+    pub fn rel(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        fs::create_dir_all(self.config_dir())?;
+        let tmp = self.config_path().with_extension("json.tmp");
+        let data = self.to_data();
+        fs::write(&tmp, serde_json::to_string_pretty(&data).unwrap())?;
+        fs::rename(tmp, self.config_path())
+    }
+
+    pub fn load_all_files(&mut self) {
+        let extractor_names: Vec<String> = self
+            .files
+            .iter()
+            .map(|f| f.extractor_name.clone())
+            .collect();
+        let extractors: Vec<Extractor> = extractor_names
+            .iter()
+            .map(|name| self.get_extractor(name))
+            .collect();
+        for (file, extractor) in self.files.iter_mut().zip(extractors) {
+            if file.is_merged() {
+                continue;
+            }
+            file.refresh_extractor(Some(extractor));
+            if !file.loaded && file.error.is_empty() {
+                if let Err(exc) = file.load() {
+                    file.error = format!("read error: {exc}");
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, data: ProjectData) {
+        self.file_counter = data.file_counter;
+        self.saved_searches = data.saved_searches;
+        self.filters = data.filters;
+        self.session = data.session;
+        self.settings = data.settings;
+
+        for mut extractor in data.extractors {
+            // Projects written before `<error_code?>` stored the old format verbatim, and
+            // under it every `[<hex code>]` error line mis-parses its level. Heal them.
+            if extractor.format == BRACKETED_LEGACY_FORMAT {
+                extractor.format = BRACKETED_DEFAULT_FORMAT.to_string();
+            }
+            if let Some(extractor) = extractor_from_project(extractor) {
+                self.extractors.insert(extractor.name.clone(), extractor);
+            }
+        }
+
+        for file_data in data.files {
+            let path = if Path::new(&file_data.path).is_absolute() {
+                PathBuf::from(&file_data.path)
+            } else {
+                self.root.join(&file_data.path)
+            };
+            let extractor_name = file_data.extractor_name;
+            let extractor = Some(self.get_extractor(&extractor_name));
+            self.files.push(LogFileModel::new(
+                file_data.file_id,
+                absolute_path(path),
+                extractor_name,
+                file_data.display_name,
+                extractor,
+            ));
+        }
+    }
+
+    fn to_data(&self) -> ProjectData {
+        ProjectData {
+            version: project_version(),
+            file_counter: self.file_counter,
+            // Merged views are derived, not files on disk; they are rebuilt on demand.
+            files: self
+                .files
+                .iter()
+                .filter(|file| !file.is_merged())
+                .map(|file| FileData {
+                    file_id: file.file_id.clone(),
+                    path: self.rel(&file.path),
+                    extractor_name: file.extractor_name.clone(),
+                    display_name: file.display_name.clone(),
+                })
+                .collect(),
+            extractors: self.extractors.values().cloned().collect(),
+            saved_searches: self.saved_searches.clone(),
+            filters: self.filters.clone(),
+            session: self.session.clone(),
+            settings: self.settings.clone(),
+        }
+    }
+
+    fn resolve_path(&self, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            absolute_path(path)
+        } else {
+            absolute_path(self.root.join(path))
+        }
+    }
+}
+
+fn absolute_path(path: impl AsRef<Path>) -> PathBuf {
+    fs::canonicalize(path.as_ref()).unwrap_or_else(|_| {
+        if path.as_ref().is_absolute() {
+            path.as_ref().to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
+}
+
+fn project_version() -> u32 {
+    1
+}
+
+fn default_settings() -> Value {
+    serde_json::json!({ "context_default": 3 })
+}

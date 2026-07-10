@@ -1,0 +1,22 @@
+2026-06-16 10:09:43.288 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716864][Kernel][Trace][UID:0][SID:0][OID:0][ServerDispatcher.cpp:394] NetChannel : Channel is closed. The network connection has been closed by remote 'ip-127-0-0-6.ec2.internal-564'
+2026-06-16 10:09:43.301 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716864][Net][Info][UID:0][SID:0][OID:0][ConnManager.cpp:88] Accepted new connection from 10.0.0.5
+2026-06-16 10:09:43.355 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][Kernel][Debug][UID:12][SID:900][OID:41][SessionMgr.cpp:210] Session 900 created for user analyst
+2026-06-16 10:09:44.010 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][Report][Info][UID:12][SID:900][OID:55][ReportServer.cpp:1402] Executing report 'Sales by Region'
+2026-06-16 10:09:44.520 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][SQL][Trace][UID:12][SID:900][OID:55][SQLEngine.cpp:733] SELECT region, SUM(sales) FROM fact GROUP BY region
+2026-06-16 10:09:45.118 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][SQL][Warn][UID:12][SID:900][OID:55][SQLEngine.cpp:801] Query took 1200ms which exceeds the warning threshold
+2026-06-16 10:09:45.900 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716888][Cache][Debug][UID:12][SID:900][OID:55][CacheMgr.cpp:66] Cache miss for key report:55:region
+2026-06-16 10:09:46.204 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][Report][Info][UID:12][SID:900][OID:55][ReportServer.cpp:1455] Report 'Sales by Region' completed in 2194ms
+2026-06-16 10:09:47.777 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716001][Net][Error][UID:0][SID:0][OID:0][ConnManager.cpp:142] Connection reset by peer 10.0.0.9 while reading request header
+2026-06-16 10:09:48.010 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716001][Kernel][Error][UID:0][SID:0][OID:0][ServerDispatcher.cpp:512] Unhandled exception while dispatching request
+    at AppServer::Dispatcher::dispatch(Request&) (ServerDispatcher.cpp:498)
+    at AppServer::WorkerThread::run() (WorkerThread.cpp:77)
+    at std::thread::_State_impl::_M_run() (thread.cc:210)
+2026-06-16 10:09:49.330 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][Report][Info][UID:12][SID:900][OID:60][ReportServer.cpp:1402] Executing report 'Inventory Snapshot'
+2026-06-16 10:09:50.001 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][SQL][Trace][UID:12][SID:900][OID:60][SQLEngine.cpp:733] SELECT sku, qty FROM inventory WHERE qty < 10
+2026-06-16 10:09:51.442 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716777][Auth][Warn][UID:0][SID:0][OID:0][AuthProvider.cpp:301] Failed login attempt for user 'guest' from 10.0.0.20
+2026-06-16 10:09:52.889 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716777][Auth][Error][UID:0][SID:0][OID:0][AuthProvider.cpp:333] Account 'guest' locked after 5 failed attempts
+2026-06-16 10:09:53.500 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716888][Cache][Info][UID:12][SID:900][OID:60][CacheMgr.cpp:120] Cache populated for key report:60:inventory
+2026-06-16 10:09:54.220 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][Report][Info][UID:12][SID:900][OID:60][ReportServer.cpp:1455] Report 'Inventory Snapshot' completed in 4890ms
+2026-06-16 10:09:55.010 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716002][Kernel][Fatal][UID:0][SID:0][OID:0][MemPool.cpp:88] Out of memory allocating 512MB for result set; aborting worker
+2026-06-16 10:09:56.771 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716002][Kernel][Info][UID:0][SID:0][OID:0][MemPool.cpp:140] Worker restarted after fatal condition
+2026-06-16 10:10:01.005 [HOST:log-host-1][SERVER:AppServer][PID:54][THR:136612056716999][Report][Trace][UID:12][SID:900][OID:0][SessionMgr.cpp:288] Session 900 idle for 5s

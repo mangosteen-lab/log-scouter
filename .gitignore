@@ -1,0 +1,4 @@
+target/
+.logscouter/
+examples/*.log
+*.svg
