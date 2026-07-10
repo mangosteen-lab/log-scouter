@@ -103,14 +103,16 @@ To install a specific release or custom location:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install.sh \
-  | LOG_SCOUTER_VERSION=v0.1.0 LOG_SCOUTER_INSTALL_DIR="$HOME/bin" bash
+  | LOG_SCOUTER_VERSION=v0.0.1 LOG_SCOUTER_INSTALL_DIR="$HOME/bin" bash
 ```
 
-GitHub release packages are built when a version tag is pushed:
+GitHub release packages are built when a version tag is pushed. After the
+version change is committed and pushed to `master`, the Makefile publishes the
+current `Cargo.toml` version as an annotated tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+make publish-release
+make release-status
 ```
 
 Without installing:
