@@ -70,6 +70,51 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 
 ## Quick Start
 
+Install the `scout` command from GitHub Releases:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install.sh | bash
+scout /path/to/logs
+```
+
+Upgrade or uninstall with the matching scripts:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/upgrade.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/uninstall.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/upgrade.ps1 | iex
+irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/uninstall.ps1 | iex
+```
+
+Proxy users can pass the proxy to the outer `curl` and to the installer downloads:
+
+```bash
+curl -fsSL -x http://proxy:8080 https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install.sh \
+  | LOG_SCOUTER_CURL_OPTS="-x http://proxy:8080" bash
+```
+
+To install a specific release or custom location:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install.sh \
+  | LOG_SCOUTER_VERSION=v0.1.0 LOG_SCOUTER_INSTALL_DIR="$HOME/bin" bash
+```
+
+GitHub release packages are built when a version tag is pushed:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Without installing:
+
 ```bash
 ./run.sh
 ./run.sh /path/to/logs
