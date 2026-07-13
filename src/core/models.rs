@@ -209,13 +209,23 @@ impl LogFileModel {
         parsed
     }
 
+    /// The entry's time, from its schema's timestamp field when that field exists and
+    /// parses. Otherwise the line itself is sniffed: a schema with no timestamp field
+    /// (`Generic line`) or a `timestamp_format` that does not fit would leave the entry
+    /// timeless, and a timeless entry cannot take its place in a merge.
     pub fn timestamp(&self, entry: &LogEntry) -> Option<NaiveDateTime> {
-        let format = self.extractor_for(entry)?.timestamp_format.clone();
-        let raw = self.get_field(entry, "timestamp");
-        if raw.trim().is_empty() {
-            return None;
+        if let Some(extractor) = self.extractor_for(entry) {
+            let raw = self.get_field(entry, "timestamp");
+            if !raw.trim().is_empty() {
+                if let Some(stamp) = crate::core::extractor::parse_timestamp_with_format(
+                    &raw,
+                    &extractor.timestamp_format,
+                ) {
+                    return Some(stamp);
+                }
+            }
         }
-        crate::core::extractor::parse_timestamp_with_format(&raw, &format)
+        crate::core::extractor::sniff_timestamp(head_line(&entry.raw))
     }
 
     pub fn message(&self, entry: &LogEntry) -> String {
@@ -239,6 +249,11 @@ impl LogFileModel {
         self.extractor = extractor;
         self.concrete.clear();
     }
+}
+
+/// The first physical line of an entry. Continuation lines carry no timestamp of their own.
+fn head_line(raw: &str) -> &str {
+    raw.split_once('\n').map(|(head, _)| head).unwrap_or(raw)
 }
 
 /// Resolve a logical name (`level`) to the extractor's actual group (`log_level`).
@@ -589,7 +604,12 @@ impl ViewModel {
 ///
 /// Entries without a parseable timestamp (banner lines, stack-trace continuations that
 /// began a new record) inherit the previous timestamp *from their own file*, so they
-/// stay next to the line they belong with instead of sinking to the top.
+/// stay next to the line they belong with instead of sinking to the top. A file's
+/// *leading* entries have no previous line to inherit from, so they borrow the file's
+/// first known timestamp and sit just above it.
+///
+/// A file with no readable timestamp anywhere still sorts ahead of everything else --
+/// there is nothing to interleave it on. `sniff_timestamp` exists to make that rare.
 pub fn merge_files(file_id: impl Into<String>, files: &[&LogFileModel]) -> LogFileModel {
     let display_name = files
         .iter()
@@ -611,9 +631,21 @@ pub fn merge_files(file_id: impl Into<String>, files: &[&LogFileModel]) -> LogFi
     // (sort key, source, original position, entry)
     let mut ordered: Vec<(NaiveDateTime, u16, usize, &LogEntry)> = Vec::new();
     for (source, file) in files.iter().enumerate() {
-        let mut last = NaiveDateTime::MIN;
-        for (position, entry) in file.entries.iter().enumerate() {
-            let stamp = file.timestamp(entry).unwrap_or(last);
+        let stamps: Vec<Option<NaiveDateTime>> = file
+            .entries
+            .iter()
+            .map(|entry| file.timestamp(entry))
+            .collect();
+        // Seeded with the file's first known time so a leading banner does not sort
+        // ahead of every other file's first record.
+        let mut last = stamps
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+            .unwrap_or(NaiveDateTime::MIN);
+        for (position, (entry, stamp)) in file.entries.iter().zip(stamps).enumerate() {
+            let stamp = stamp.unwrap_or(last);
             last = stamp;
             ordered.push((stamp, source as u16, position, entry));
         }

@@ -1,11 +1,14 @@
+use crate::ai::config::AiConfig;
+use crate::ai::message::{ChatMsg, ToolResult};
+use crate::ai::{tools as ai_tools, AgentRequest, AiWorker};
 use crate::core::extractor::{
     export_schemas_to_folder, load_schemas_from_folder, user_schema_dir, Extractor,
-    DEFAULT_TIMESTAMP_FORMAT, BRACKETED_DEFAULT_FORMAT, USER_SCHEMAS_SUBDIR,
+    BRACKETED_DEFAULT_FORMAT, DEFAULT_TIMESTAMP_FORMAT, USER_SCHEMAS_SUBDIR,
 };
 use crate::core::filters::{
     common_message_pattern, expand_tilde, export_filters_to_folder, hide_like,
-    load_filters_from_folder, user_filter_dir, FilterRule, FilterSet, USER_DIR,
-    USER_FILTERS_SUBDIR,
+    load_filters_from_folder, message_template, pattern_candidates, user_filter_dir, FilterRule,
+    FilterSet, PatternOption, USER_DIR, USER_FILTERS_SUBDIR,
 };
 use crate::core::models::{apply_context, LogEntry, LogFileModel, ViewModel, VisibleIndices};
 use crate::core::parser::{self, EntryBuilder};
@@ -28,7 +31,7 @@ use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, 
 use ratatui::{Frame, Terminal};
 use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const CONTEXT_CYCLE: &[usize] = &[0, 3, 10];
@@ -39,6 +42,7 @@ enum Focus {
     Sidebar,
     Pane,
     Results,
+    Chat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,12 +56,229 @@ struct PaneState {
     view: ViewModel,
 }
 
+/// One rendered line in the chat transcript.
+#[derive(Debug, Clone)]
+enum ChatLine {
+    User(String),
+    Assistant(String),
+    /// A tool the assistant ran, and what it reported.
+    Action(String),
+    Error(String),
+    /// Status text such as "thinking…".
+    Info(String),
+}
+
+/// The AI chat panel: the worker, the conversation the model sees, and what to draw.
+///
+/// `conversation` is the model's view (system + user + assistant + tool turns);
+/// `transcript` is the human's view. They are kept in step but are not the same list --
+/// a tool result is a full turn for the model but a one-line `[ran …]` for the reader.
+struct AiChat {
+    worker: AiWorker,
+    config: AiConfig,
+    /// Keys typed in the chat with `/key`, per provider. Kept in memory only -- they are
+    /// never written to disk, so nothing sensitive lands in `ai.json`.
+    keys: std::collections::HashMap<crate::ai::Provider, String>,
+    conversation: Vec<ChatMsg>,
+    transcript: Vec<ChatLine>,
+    input: String,
+    /// Bumped on every question and on Esc, so a stale reply is ignored.
+    generation: u64,
+    /// A turn is in flight (waiting on the model or running its tools).
+    pending: bool,
+    scroll: usize,
+    /// How many turns this exchange has taken, to stop a runaway tool loop.
+    turns: usize,
+}
+
+/// Cap the tool-calling loop so a confused model cannot spin forever.
+const AI_MAX_TURNS: usize = 12;
+
+impl AiChat {
+    fn new() -> Self {
+        Self {
+            worker: AiWorker::spawn(),
+            config: AiConfig::load(),
+            keys: std::collections::HashMap::new(),
+            conversation: Vec::new(),
+            transcript: Vec::new(),
+            input: String::new(),
+            generation: 0,
+            pending: false,
+            scroll: 0,
+            turns: 0,
+        }
+    }
+
+    /// The key to use for the current provider: one typed with `/key` if present, else the
+    /// environment variable.
+    fn resolved_key(&self) -> Option<String> {
+        self.keys
+            .get(&self.config.provider)
+            .cloned()
+            .or_else(|| self.config.api_key())
+    }
+}
+
+/// Rows the hide-pattern preview will read before it stops counting. Large enough that a
+/// normal pane is covered exactly, small enough that a million-line view still redraws
+/// between keystrokes.
+const PATTERN_PREVIEW_LIMIT: usize = 50_000;
+const PATTERN_PREVIEW_SAMPLES: usize = 2;
+
+/// What a candidate hide pattern would do to the rows on screen.
+#[derive(Debug, Default)]
+struct PatternPreview {
+    matched: usize,
+    scanned: usize,
+    total: usize,
+    samples: Vec<String>,
+    error: Option<String>,
+}
+
+impl PatternPreview {
+    /// True when the scan stopped short of the pane, so `matched` is a floor, not a total.
+    fn capped(&self) -> bool {
+        self.scanned < self.total
+    }
+}
+
+/// One offered template, with the rows it matches. Measured once, when the templates are
+/// derived: the set does not change while the user picks among it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatternCandidate {
+    option: PatternOption,
+    matched: usize,
+}
+
+/// The `H` field menu for one log line: every field of that line's schema, with the value
+/// the line carries, and which of them the user has picked.
+///
+/// Picking several ANDs them. One field alone stays an `equals` rule, which reads better
+/// in the sidebar and holds even on a line the schema cannot fully parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HideMenu {
+    /// `(field, value)` in schema order.
+    fields: Vec<(String, String)>,
+    cursor: usize,
+    picked: Vec<bool>,
+    /// Which way the rule points. `H` is named for hiding, so it opens on exclude; Tab
+    /// flips it to keep-only, matching the pattern popup.
+    exclude: bool,
+}
+
+impl HideMenu {
+    fn new(fields: Vec<(String, String)>) -> Self {
+        Self {
+            picked: vec![false; fields.len()],
+            fields,
+            cursor: 0,
+            exclude: true,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        if self.fields.is_empty() {
+            return;
+        }
+        self.cursor = self
+            .cursor
+            .saturating_add_signed(delta)
+            .min(self.fields.len() - 1);
+    }
+
+    fn toggle(&mut self, index: usize) {
+        if let Some(picked) = self.picked.get_mut(index) {
+            *picked = !*picked;
+        }
+    }
+
+    /// The picked fields with their values; the cursor's field when nothing is picked, so
+    /// Enter always does something.
+    fn chosen(&self) -> Vec<(String, String)> {
+        let picked: Vec<(String, String)> = self
+            .fields
+            .iter()
+            .zip(&self.picked)
+            .filter(|(_, picked)| **picked)
+            .map(|(field, _)| field.clone())
+            .collect();
+        if !picked.is_empty() {
+            return picked;
+        }
+        self.fields.get(self.cursor).cloned().into_iter().collect()
+    }
+}
+
+/// The `H` popup: an editable regex, and the templates the selection supports.
+///
+/// A single derived pattern is a guess about how greedy the user wanted to be. Offering
+/// the whole ladder, each with the rows it would take out, turns that guess into a choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatternPrompt {
+    text: String,
+    /// The field the regex is matched against. `message` for a template derived from log
+    /// text; `raw` for one built out of several of a line's fields at once.
+    field: String,
+    /// Which way the rule points. Tab flips it, so one derivation serves both
+    /// "hide lines like this" and "show only lines like this".
+    exclude: bool,
+    /// Greediest first. Empty when the caller had no ladder to offer.
+    candidates: Vec<PatternCandidate>,
+    selected: usize,
+    /// Rows read while counting, and rows the pane holds. They differ on a huge pane.
+    scanned: usize,
+    total: usize,
+}
+
+impl PatternPrompt {
+    /// A bare prompt with no ladder behind it. Every real one comes from a selection.
+    #[cfg(test)]
+    fn new(text: impl Into<String>, exclude: bool) -> Self {
+        Self {
+            text: text.into(),
+            field: "message".to_string(),
+            exclude,
+            candidates: Vec::new(),
+            selected: 0,
+            scanned: 0,
+            total: 0,
+        }
+    }
+
+    /// Step through the ladder, loading the template into the editable field. An edit the
+    /// user made is discarded: they asked for a different template.
+    fn pick(&mut self, delta: isize) {
+        if self.candidates.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(self.candidates.len() - 1);
+        self.text = self.candidates[self.selected].option.pattern.clone();
+    }
+
+    /// True once the field no longer holds the template it was loaded from.
+    fn edited(&self) -> bool {
+        self.candidates
+            .get(self.selected)
+            .map(|candidate| candidate.option.pattern != self.text)
+            .unwrap_or(false)
+    }
+
+    fn capped(&self) -> bool {
+        self.scanned < self.total
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Mode {
     Normal,
     Search(String),
     AddFile(String),
-    OpenFolder(String),
+    /// The `o` popup: walk the filesystem and pick a folder, rather than typing its path.
+    OpenFolder(FolderBrowser),
     Filter(String),
     TimePicker(TimePicker),
     ExportFilters(String),
@@ -77,8 +298,10 @@ enum Mode {
         index: usize,
         text: String,
     },
-    HideChoice,
-    HidePattern(String),
+    /// `H` on a single line: hide by one of that line's fields, or by several at once.
+    HideChoice(HideMenu),
+    /// Regexes derived from the selected lines, awaiting the user's sign-off.
+    HidePattern(PatternPrompt),
     EntryDetail {
         scroll: usize,
     },
@@ -88,6 +311,8 @@ enum Mode {
 #[derive(Debug, Clone)]
 enum SidebarItem {
     Section(String),
+    /// A heading inside a section: `Text` and `Time` under `Filters`.
+    SubSection(String),
     File {
         file_id: String,
         label: String,
@@ -95,6 +320,12 @@ enum SidebarItem {
     /// `index` addresses `project.filters.rules`, so Space and Enter act on the rule
     /// itself rather than re-deriving it by counting rows.
     Filter {
+        index: usize,
+        label: String,
+    },
+    /// The project's one time range. Enter reopens the picker on it rather than the
+    /// filter text editor: nobody wants to hand-edit `timestamp range 'a..b'`.
+    TimeFilter {
         index: usize,
         label: String,
     },
@@ -162,7 +393,8 @@ impl TimePicker {
         picker
     }
 
-    /// "Last 1 hour" counts back from the newest entry in the log, not from wall-clock
+    /// "Last 1 hour" counts back from the newest entry across the loaded logs, not from
+    /// wall-clock
     /// now: a log opened a week after it was written would otherwise select nothing.
     fn anchor(&self) -> NaiveDateTime {
         self.latest
@@ -181,6 +413,15 @@ impl TimePicker {
         };
         self.start = format_filter_datetime(start);
         self.end = format_filter_datetime(end);
+    }
+
+    /// Show an existing range, with the caret on its start rather than on a preset that
+    /// would overwrite it the moment the user pressed Space.
+    fn load_range(&mut self, start: &str, end: &str) {
+        self.start = start.to_string();
+        self.end = end.to_string();
+        self.row = Self::START_ROW;
+        self.cursor = self.start.chars().count();
     }
 
     fn on_preset(&self) -> bool {
@@ -203,8 +444,15 @@ impl TimePicker {
         }
     }
 
+    /// Clamped rather than wrapping: `Down` off the End field must not land on a preset
+    /// and overwrite what was just typed there.
     fn move_row(&mut self, delta: isize) {
-        self.row = (self.row as isize + delta).rem_euclid(Self::ROWS as isize) as usize;
+        self.row = (self.row as isize + delta).clamp(0, Self::ROWS as isize - 1) as usize;
+        // Landing on a preset fills the fields from it, so the picker always shows the
+        // range Enter would apply. Stepping onto Start or End leaves them alone.
+        if self.on_preset() {
+            self.apply_preset(self.row);
+        }
         // Land the caret at the end of a field you step onto, as the input popups do.
         self.cursor = self.field().map(|value| value.chars().count()).unwrap_or(0);
     }
@@ -232,6 +480,132 @@ impl TimePicker {
         }
         Ok(format!("{start}..{end}"))
     }
+}
+
+/// One row of the folder browser. The first row opens the folder being browsed, so Enter
+/// always means "do the thing this row names" and never has to guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserRow {
+    OpenCurrent,
+    Parent,
+    Child(PathBuf),
+}
+
+/// The `o` popup: the folder being browsed, and its subfolders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FolderBrowser {
+    current: PathBuf,
+    rows: Vec<BrowserRow>,
+    selected: usize,
+    /// First row on screen. The drawer owns this: only it knows how tall the popup is.
+    scroll: usize,
+    /// Dot-folders are hidden by default; a project's own `.logscouter` is not a
+    /// destination, and neither is most of what lives under `~`.
+    show_hidden: bool,
+    /// Files directly inside `current`, the pool `o` would draw its logs from.
+    file_count: usize,
+}
+
+impl FolderBrowser {
+    fn open(folder: PathBuf) -> std::io::Result<Self> {
+        let mut browser = Self {
+            current: folder,
+            rows: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            show_hidden: false,
+            file_count: 0,
+        };
+        browser.reload()?;
+        Ok(browser)
+    }
+
+    /// Re-read `current`. Selection returns to the top, which is the "open this" row.
+    fn reload(&mut self) -> std::io::Result<()> {
+        let mut children = Vec::new();
+        let mut file_count = 0;
+        for entry in std::fs::read_dir(&self.current)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                if self.show_hidden || !is_hidden(&path) {
+                    children.push(path);
+                }
+            } else if path.is_file() {
+                file_count += 1;
+            }
+        }
+        children.sort_by_key(|path| folder_name(path).to_lowercase());
+
+        self.rows = vec![BrowserRow::OpenCurrent];
+        if self.current.parent().is_some() {
+            self.rows.push(BrowserRow::Parent);
+        }
+        self.rows
+            .extend(children.into_iter().map(BrowserRow::Child));
+        self.file_count = file_count;
+        self.selected = 0;
+        self.scroll = 0;
+        Ok(())
+    }
+
+    /// Browse `folder`. An unreadable folder leaves the browser exactly where it was,
+    /// so a wrong turn into `/root` is not a dead end.
+    fn go_to(&mut self, folder: PathBuf) -> std::io::Result<()> {
+        let previous = std::mem::replace(&mut self.current, folder);
+        if let Err(error) = self.reload() {
+            self.current = previous;
+            let _ = self.reload();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// `None` at the filesystem root, where there is nowhere left to go up to.
+    fn parent_path(&self) -> Option<PathBuf> {
+        self.current.parent().map(Path::to_path_buf)
+    }
+
+    fn toggle_hidden(&mut self) -> std::io::Result<()> {
+        self.show_hidden = !self.show_hidden;
+        self.reload()
+    }
+
+    fn selected_row(&self) -> Option<&BrowserRow> {
+        self.rows.get(self.selected)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(self.rows.len() - 1);
+    }
+
+    fn label(&self, row: &BrowserRow) -> String {
+        match row {
+            BrowserRow::OpenCurrent => "./     open this folder".to_string(),
+            BrowserRow::Parent => "../    go up".to_string(),
+            BrowserRow::Child(path) => format!("{}/", folder_name(path)),
+        }
+    }
+}
+
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with('.'))
+        .unwrap_or(false)
+}
+
+/// The last component of `path`, or the whole path for a root like `/`.
+fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| path.to_str().unwrap_or(""))
+        .to_string()
 }
 
 /// The `>`, `+` and `*` columns in front of every pane row. Not selectable: a drag from
@@ -360,6 +734,9 @@ pub fn run(project: Project) -> anyhow::Result<()> {
     app.queue_initial_loads();
 
     loop {
+        // A reply from the AI worker may have arrived; run any tools it asked for.
+        app.drain_ai_events();
+
         // Long work runs in slices between frames, so the progress bar animates and
         // Esc still gets through. Everything else waits until the work is done.
         if app.work_pending() {
@@ -376,7 +753,14 @@ pub fn run(project: Project) -> anyhow::Result<()> {
         }
 
         terminal.draw(|frame| app.draw(frame))?;
-        if event::poll(Duration::from_millis(100))? {
+        // A chat turn in flight arrives asynchronously, so poll briefly instead of blocking
+        // a whole 100ms -- the "thinking…" state and the reply then land promptly.
+        let poll = if app.ai_busy() {
+            Duration::from_millis(30)
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(poll)? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -472,6 +856,9 @@ struct AppState {
     /// timestamp, so it cannot be rebuilt until those files have finished loading;
     /// `finish_load` drains this once they have.
     pending_merges: Vec<(usize, Vec<String>)>,
+    /// The AI chat panel. Created lazily on first use so the worker thread and its runtime
+    /// only exist for a session that asks for them.
+    ai: Option<AiChat>,
 }
 
 impl AppState {
@@ -503,6 +890,7 @@ impl AppState {
             progress: None,
             input_cursor: 0,
             pending_merges: Vec::new(),
+            ai: None,
         };
         app.restore_session();
         app
@@ -638,6 +1026,11 @@ impl AppState {
 
     fn work_pending(&self) -> bool {
         !self.work.is_empty()
+    }
+
+    /// True while an AI chat turn is waiting on the model or running its tools.
+    fn ai_busy(&self) -> bool {
+        self.ai.as_ref().map(|ai| ai.pending).unwrap_or(false)
     }
 
     fn cancel_work(&mut self) {
@@ -880,6 +1273,7 @@ impl AppState {
 
     /// Attach extractors, queue a load for every unread file, and recompute each pane.
     fn queue_initial_loads(&mut self) {
+        self.project.redetect_mismatched_schemas();
         let names: Vec<String> = self
             .project
             .files
@@ -1011,17 +1405,31 @@ impl AppState {
                 Constraint::Min(1),
             ])
             .split(rows[1]);
-        let detail_height = detail_panel_height(body[0].height);
+        // The chat panel, when open, takes the bottom of the left column, below the detail
+        // panel. It grows when focused so there is room to read and type.
+        let chat_height = self.chat_panel_height(body[0].height);
+        let left = if chat_height > 0 {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(chat_height)])
+                .split(body[0]);
+            self.draw_chat(frame, split[1]);
+            split[0]
+        } else {
+            body[0]
+        };
+
+        let detail_height = detail_panel_height(left.height);
         if detail_height > 0 {
             let column = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(4), Constraint::Length(detail_height)])
-                .split(body[0]);
+                .split(left);
             self.draw_sidebar(frame, column[0]);
             self.draw_detail(frame, column[1]);
         } else {
             self.detail_area = Rect::default();
-            self.draw_sidebar(frame, body[0]);
+            self.draw_sidebar(frame, left);
         }
         self.draw_panes(frame, body[1]);
         if show_results {
@@ -1145,9 +1553,18 @@ impl AppState {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    SidebarItem::SubSection(label) => (
+                        format!("  {label}"),
+                        Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     SidebarItem::File { label, .. } => (format!("  {label}"), Style::default()),
                     SidebarItem::Filter { label, .. } => {
-                        (format!("  {label}"), Style::default().fg(Color::Yellow))
+                        (format!("    {label}"), Style::default().fg(Color::Yellow))
+                    }
+                    SidebarItem::TimeFilter { label, .. } => {
+                        (format!("    {label}"), Style::default().fg(Color::Magenta))
                     }
                     SidebarItem::Search { label, .. } => {
                         (format!("  {label}"), Style::default().fg(Color::Green))
@@ -1183,6 +1600,128 @@ impl AppState {
 
     /// Full, word-wrapped content of the selected entry. Log lines are routinely wider
     /// than the pane, so this is where you read one without scrolling sideways.
+    /// Height of the chat panel in the left column, or 0 when it is closed. It gets more of
+    /// the column while focused, so a conversation is comfortable to read.
+    fn chat_panel_height(&self, column_height: u16) -> u16 {
+        if self.ai.is_none() {
+            return 0;
+        }
+        let want = if self.focus == Focus::Chat {
+            column_height.saturating_sub(6)
+        } else {
+            8
+        };
+        // Always leave the sidebar at least a few rows.
+        want.min(column_height.saturating_sub(6))
+    }
+
+    /// The chat transcript above a one-line input. Kept scrolled to the tail unless the
+    /// user has paged up.
+    fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Chat;
+        let pending = self.ai.as_ref().map(|ai| ai.pending).unwrap_or(false);
+        let title = match (focused, pending) {
+            (_, true) => "AI  (thinking…)",
+            (true, false) => "AI  (Enter send · Esc leave)",
+            (false, false) => "AI",
+        };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(if focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            });
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height < 2 {
+            return;
+        }
+
+        let width = inner.width as usize;
+        let transcript_rows = (inner.height as usize).saturating_sub(1);
+
+        // Wrap every transcript line to the panel width, tagging each wrapped row with its
+        // colour, then show the tail (respecting the user's scroll-back).
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(ai) = &self.ai {
+            for entry in &ai.transcript {
+                let (prefix, style) = match entry {
+                    ChatLine::User(_) => (
+                        "you ",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    ChatLine::Assistant(_) => ("ai  ", Style::default().fg(Color::Cyan)),
+                    ChatLine::Action(_) => ("  » ", Style::default().fg(Color::Green)),
+                    ChatLine::Error(_) => ("  ! ", Style::default().fg(Color::Red)),
+                    ChatLine::Info(_) => ("  · ", Style::default().fg(Color::DarkGray)),
+                };
+                let body = match entry {
+                    ChatLine::User(text)
+                    | ChatLine::Assistant(text)
+                    | ChatLine::Action(text)
+                    | ChatLine::Error(text)
+                    | ChatLine::Info(text) => text,
+                };
+                for (index, chunk) in chunk_chars(&format!("{prefix}{body}"), width)
+                    .into_iter()
+                    .enumerate()
+                {
+                    // Continuation rows line up under the message, not the tag.
+                    let text = if index == 0 {
+                        chunk
+                    } else {
+                        format!("    {}", chunk.trim_start())
+                    };
+                    lines.push(Line::from(Span::styled(text, style)));
+                }
+            }
+        }
+
+        let scroll = self.ai.as_ref().map(|ai| ai.scroll).unwrap_or(0);
+        let max_start = lines.len().saturating_sub(transcript_rows);
+        let start = max_start.saturating_sub(scroll);
+        let shown: Vec<Line<'static>> = lines
+            .into_iter()
+            .skip(start)
+            .take(transcript_rows)
+            .collect();
+
+        let transcript_area = Rect {
+            height: transcript_rows as u16,
+            ..inner
+        };
+        frame.render_widget(Paragraph::new(Text::from(shown)), transcript_area);
+
+        // The input line at the bottom.
+        let input_area = Rect {
+            y: inner.y + transcript_rows as u16,
+            height: 1,
+            ..inner
+        };
+        let input = self.ai.as_ref().map(|ai| ai.input.as_str()).unwrap_or("");
+        // The input scrolls horizontally to keep the caret in view, so a long question is
+        // always visible where you are typing it. Two columns go to the "> " prompt.
+        let field_width = width.saturating_sub(2).max(1);
+        let caret = self.input_cursor;
+        let offset = caret.saturating_sub(field_width.saturating_sub(1));
+        let shown: String = input.chars().skip(offset).take(field_width).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::raw(format!("> {shown}")))),
+            input_area,
+        );
+        if focused {
+            let column = 2 + (caret - offset);
+            frame.set_cursor_position((
+                input_area.x + column.min(width.saturating_sub(1)) as u16,
+                input_area.y,
+            ));
+        }
+    }
+
     fn draw_detail(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .title("Detail")
@@ -1276,9 +1815,17 @@ impl AppState {
                 .rules
                 .get(*index)
                 .map(|rule| filter_detail_lines(rule, width)),
+            SidebarItem::TimeFilter { index, .. } => self
+                .project
+                .filters
+                .rules
+                .get(*index)
+                .map(|rule| time_filter_detail_lines(rule, width)),
             SidebarItem::Search { text, .. } => Some(search_detail_lines(text, width)),
-            SidebarItem::Section(label) => Some(label_detail_lines("section", label, width)),
-            SidebarItem::Hint(label) => Some(label_detail_lines("hint", label, width)),
+            SidebarItem::Section(label) | SidebarItem::SubSection(label) => {
+                Some(label_detail_lines("section", label, width))
+            }
+            SidebarItem::Hint(label) => Some(label_detail_lines("hint", label.trim(), width)),
         }
     }
 
@@ -1594,13 +2141,7 @@ impl AppState {
             Mode::AddFile(text) => {
                 self.draw_input_popup(frame, root, "Add File", "Type a path and press Enter", &text)
             }
-            Mode::OpenFolder(text) => self.draw_input_popup(
-                frame,
-                root,
-                "Open Folder",
-                "Type a folder path and press Enter",
-                &text,
-            ),
+            Mode::OpenFolder(browser) => self.draw_folder_browser(frame, root, browser),
             Mode::Filter(text) => self.draw_input_popup(
                 frame,
                 root,
@@ -1665,40 +2206,8 @@ impl AppState {
                 "text | \"phrase\" | /regex/ | field=value | after:<ts>",
                 &text,
             ),
-            Mode::HideChoice => {
-                let choices = self.hide_choice_fields();
-                let height = (choices.len() as u16 + 5).clamp(7, root.height.max(7));
-                let area = centered_rect(64, height, root);
-                frame.render_widget(Clear, area);
-                let mut lines = vec![
-                    Line::from("Hide logs where this field has the current value"),
-                    Line::from(""),
-                ];
-                for (index, field) in choices.iter().enumerate() {
-                    let Some(key) = hide_choice_key(index) else {
-                        break;
-                    };
-                    lines.push(Line::from(format!("{key}  {field}")));
-                }
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Esc cancel",
-                    Style::default().fg(Color::DarkGray),
-                )));
-                frame.render_widget(
-                    Paragraph::new(Text::from(lines))
-                        .block(Block::default().title("Hide").borders(Borders::ALL))
-                        .wrap(Wrap { trim: false }),
-                    area,
-                );
-            }
-            Mode::HidePattern(text) => self.draw_input_popup(
-                frame,
-                root,
-                "Hide Pattern",
-                "Regex shared by the selected lines - edit, then Enter to exclude",
-                &text,
-            ),
+            Mode::HideChoice(menu) => self.draw_hide_choice_popup(frame, root, &menu),
+            Mode::HidePattern(prompt) => self.draw_hide_pattern_popup(frame, root, &prompt),
             Mode::EntryDetail { scroll } => self.draw_entry_detail_popup(frame, root, scroll),
             Mode::Help => {
                 let area = centered_rect(84, 46, root);
@@ -1711,6 +2220,80 @@ impl AppState {
                 );
             }
         }
+    }
+
+    /// The folder browser. Scrolling lives here rather than in the key handler: only the
+    /// drawer knows how many rows the popup has room for.
+    fn draw_folder_browser(&mut self, frame: &mut Frame, root: Rect, mut browser: FolderBrowser) {
+        const CHROME_ROWS: u16 = 7; // borders, path, blank, blank, footer
+        let width = 82.min(root.width);
+        let height = (browser.rows.len() as u16 + CHROME_ROWS).min(root.height.max(9));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+
+        let block = Block::default().title("Open Folder").borders(Borders::ALL);
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+        let listed = (inner.height as usize)
+            .saturating_sub(CHROME_ROWS as usize - 2)
+            .max(1);
+
+        // Keep the selection on screen, scrolling by the least that achieves it.
+        if browser.selected < browser.scroll {
+            browser.scroll = browser.selected;
+        } else if browser.selected >= browser.scroll + listed {
+            browser.scroll = browser.selected + 1 - listed;
+        }
+
+        let files = match browser.file_count {
+            0 => "no files here".to_string(),
+            1 => "1 file here".to_string(),
+            n => format!("{n} files here"),
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                truncate_head(&browser.current.display().to_string(), text_width),
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(Span::styled(files, Style::default().fg(Color::DarkGray))),
+            Line::from(""),
+        ];
+
+        for (offset, row) in browser
+            .rows
+            .iter()
+            .enumerate()
+            .skip(browser.scroll)
+            .take(listed)
+        {
+            let at_cursor = offset == browser.selected;
+            let marker = if at_cursor { "> " } else { "  " };
+            let style = if at_cursor {
+                Style::default().bg(Color::DarkGray)
+            } else if matches!(row, BrowserRow::OpenCurrent) {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(
+                crop(&format!("{marker}{}", browser.label(row)), 0, text_width),
+                style,
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "j/k move   Enter select   Right in   Left up   . hidden   Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .alignment(Alignment::Left),
+            area,
+        );
+        self.mode = Mode::OpenFolder(browser);
     }
 
     fn draw_time_picker(&mut self, frame: &mut Frame, root: Rect, picker: &TimePicker) {
@@ -1768,7 +2351,7 @@ impl AppState {
             )));
         }
         lines.push(Line::from(Span::styled(
-            "Up/Down move  Space pick preset  Enter apply  Esc cancel",
+            "Up/Down move (a preset fills the fields)  Enter apply  Esc cancel",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1863,12 +2446,206 @@ impl AppState {
         }
     }
 
+    /// One line's fields, each with the value that line carries, so a rule can be picked
+    /// by what it will match rather than by the field's name alone.
+    fn draw_hide_choice_popup(&self, frame: &mut Frame, root: Rect, menu: &HideMenu) {
+        let width = 76.min(root.width);
+        // Heading, blank, the fields, blank, three hints, blank, footer, two borders.
+        let height = (menu.fields.len() as u16 + 10).clamp(12, root.height.max(12));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+
+        let picked = menu.picked.iter().filter(|picked| **picked).count();
+        // "Hide" drops the matching lines; "Keep only" drops everything else.
+        let verb = if menu.exclude { "Hide" } else { "Keep only" };
+        let heading = match picked {
+            0 | 1 => format!("{verb} logs where this field has the current value"),
+            n => format!("{verb} logs matching all {n} picked fields"),
+        };
+        let heading_style = if menu.exclude {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                heading,
+                heading_style.add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
+
+        let inner_width = (width as usize).saturating_sub(4);
+        for (index, (field, value)) in menu.fields.iter().enumerate() {
+            let Some(key) = hide_choice_key(index) else {
+                break;
+            };
+            let at_cursor = index == menu.cursor;
+            let row = format!(
+                "{}{} {key}  {field:<14} {}",
+                if at_cursor { ">" } else { " " },
+                if menu.picked[index] { "+" } else { " " },
+                field_value_preview(value),
+            );
+            let style = if at_cursor {
+                Style::default().bg(Color::DarkGray)
+            } else if menu.picked[index] {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(crop(&row, 0, inner_width), style)));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Space picks a field   Enter combines the picks with AND",
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Tab  switch to {}",
+                if menu.exclude { "keep only" } else { "hide" }
+            ),
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(Span::styled(
+            "H  message pattern, with the ids and counters generalised",
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(""));
+        let verb = if menu.exclude { "hides" } else { "keeps" };
+        lines.push(Line::from(Span::styled(
+            format!("A field's own key {verb} by it at once   Esc cancel"),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let title = if menu.exclude { "Hide" } else { "Keep" };
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(Block::default().title(title).borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+
+    /// The chosen regex, the ladder it came from, and what it would do if committed.
+    /// Nothing else in the app commits a project-wide rule from a text field, so nothing
+    /// else needs the preview.
+    fn draw_hide_pattern_popup(&self, frame: &mut Frame, root: Rect, prompt: &PatternPrompt) {
+        let value = prompt.text.as_str();
+        let exclude = prompt.exclude;
+        let preview = self.hide_pattern_preview(value, &prompt.field);
+        let width = 82.min(root.width);
+        let value_width = (width as usize).saturating_sub(4).max(1);
+        let wrapped = chunk_chars(value, value_width);
+
+        let target = match prompt.field.as_str() {
+            "raw" => "the whole log line".to_string(),
+            field => format!("the {field} field"),
+        };
+        let hint = if prompt.candidates.len() > 1 {
+            format!("Regex over {target} - Up/Down pick a template, or edit it")
+        } else {
+            format!("Regex over {target} - edit it, then Enter")
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            Line::from(""),
+        ];
+        for (index, chunk) in wrapped.iter().enumerate() {
+            let prefix = if index == 0 { "> " } else { "  " };
+            lines.push(Line::from(Span::raw(format!("{prefix}{chunk}"))));
+        }
+
+        // The ladder, greediest first, each with the rows it would take out.
+        if prompt.candidates.len() > 1 {
+            lines.push(Line::from(""));
+            for (index, candidate) in prompt.candidates.iter().enumerate() {
+                let at_cursor = index == prompt.selected;
+                let marker = if at_cursor { "  \u{25b8} " } else { "    " };
+                let edited = if at_cursor && prompt.edited() {
+                    "  (edited)"
+                } else {
+                    ""
+                };
+                let counted = format!(
+                    "matches {}{}",
+                    thousands(candidate.matched),
+                    if prompt.capped() { "+" } else { "" }
+                );
+                let row = format!(
+                    "{marker}{:<9} {:<32} {counted}{edited}",
+                    candidate.option.name, candidate.option.hint
+                );
+                let style = if at_cursor {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                lines.push(Line::from(Span::styled(crop(&row, 0, value_width), style)));
+            }
+        }
+        lines.push(Line::from(""));
+
+        match &preview.error {
+            Some(error) => lines.push(Line::from(Span::styled(
+                format!("  invalid regex: {}", crop(error, 0, value_width)),
+                Style::default().fg(Color::Red),
+            ))),
+            None => {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", preview_summary(&preview, exclude)),
+                    Style::default()
+                        .fg(if exclude { Color::Yellow } else { Color::Green })
+                        .add_modifier(Modifier::BOLD),
+                )));
+                for sample in &preview.samples {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {}", crop(sample, 0, value_width.saturating_sub(2))),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Tab hide/keep   Enter apply   Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let height = (lines.len() as u16 + 2).min(root.height.max(7));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let title = if exclude {
+            "Hide Pattern"
+        } else {
+            "Keep Pattern"
+        };
+        let block = Block::default().title(title).borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(block)
+                .alignment(Alignment::Left),
+            area,
+        );
+
+        let caret = self.input_cursor.min(value.chars().count());
+        let (row, column) = (caret / value_width, caret % value_width);
+        let x = inner.x + 2 + column as u16;
+        let y = inner.y + 2 + row as u16;
+        if x < inner.right() && y < inner.bottom() {
+            frame.set_cursor_position((x, y));
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
         let mode_kind = match &self.mode {
             Mode::Normal => 0,
             Mode::Search(_)
             | Mode::AddFile(_)
-            | Mode::OpenFolder(_)
             | Mode::Filter(_)
             | Mode::ExportFilters(_)
             | Mode::LoadFilters(_)
@@ -1879,10 +2656,11 @@ impl AppState {
             | Mode::EditFilter { .. }
             | Mode::EditSearch { .. }
             | Mode::HidePattern(_) => 1,
-            Mode::HideChoice => 2,
+            Mode::HideChoice(_) => 2,
             Mode::EntryDetail { .. } => 3,
             Mode::Help => 4,
             Mode::TimePicker(_) => 5,
+            Mode::OpenFolder(_) => 6,
         };
 
         match mode_kind {
@@ -1895,6 +2673,7 @@ impl AppState {
                 Ok(false)
             }
             5 => self.handle_time_picker_key(key),
+            6 => self.handle_folder_browser_key(key),
             _ => Ok(false),
         }
     }
@@ -2283,6 +3062,17 @@ impl AppState {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        // The chat panel is a focus, not a mode: when it has focus, keystrokes are its
+        // input. `A` from anywhere else opens and focuses it.
+        if self.focus == Focus::Chat {
+            return self.handle_chat_key(key);
+        }
+        if key.code == KeyCode::Char('A') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_ai_chat();
+            self.input_cursor = 0;
+            return Ok(false);
+        }
+
         // Ctrl+<motion> never disturbs the selection, so you can travel to a distant
         // line and Space it in without losing what you already picked.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2476,8 +3266,9 @@ impl AppState {
             }
             KeyCode::Char('H') => self.begin_hide(),
             KeyCode::Char('a') => self.open_input(Mode::AddFile(String::new())),
-            KeyCode::Char('o') => self.open_input(Mode::OpenFolder(String::new())),
+            KeyCode::Char('o') => self.open_folder_browser(),
             KeyCode::Char('d') => self.remove_active_file(),
+            KeyCode::Delete if self.focus == Focus::Sidebar => self.remove_selected_filter(),
             KeyCode::Char('S') => self.open_new_schema_input(),
             KeyCode::Char('|') | KeyCode::Char('\\') => self.split_active(SplitMode::Horizontal),
             KeyCode::Char('-') => self.split_active(SplitMode::Vertical),
@@ -2488,6 +3279,7 @@ impl AppState {
                 Focus::Sidebar => self.activate_sidebar_item(),
                 Focus::Results => self.jump_to_selected_result(),
                 Focus::Pane => self.open_entry_detail_popup(),
+                Focus::Chat => {}
             },
             _ => {}
         }
@@ -2499,6 +3291,22 @@ impl AppState {
         let caret = self.input_cursor;
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            // The one input popup with a direction to flip; elsewhere Tab does nothing.
+            KeyCode::Tab => {
+                if let Mode::HidePattern(prompt) = &mut self.mode {
+                    prompt.exclude = !prompt.exclude;
+                }
+            }
+            // Up/Down step the template ladder; no input popup is multi-line, so they are
+            // free everywhere else.
+            KeyCode::Up | KeyCode::Down => {
+                let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                if let Mode::HidePattern(prompt) = &mut self.mode {
+                    prompt.pick(delta);
+                    let caret = prompt.text.chars().count();
+                    self.input_cursor = caret;
+                }
+            }
             KeyCode::Backspace => {
                 if caret > 0 {
                     if let Some(input) = self.input_mut() {
@@ -2553,7 +3361,6 @@ impl AppState {
         self.input_cursor = match &mode {
             Mode::Search(text)
             | Mode::AddFile(text)
-            | Mode::OpenFolder(text)
             | Mode::Filter(text)
             | Mode::ExportFilters(text)
             | Mode::LoadFilters(text)
@@ -2562,26 +3369,87 @@ impl AppState {
             | Mode::Extractor(text)
             | Mode::LogSchema(text)
             | Mode::EditFilter { text, .. }
-            | Mode::EditSearch { text, .. }
-            | Mode::HidePattern(text) => text.chars().count(),
+            | Mode::EditSearch { text, .. } => text.chars().count(),
+            Mode::HidePattern(prompt) => prompt.text.chars().count(),
             _ => 0,
         };
         self.mode = mode;
     }
 
     fn handle_hide_choice_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::HideChoice(mut menu) = self.mode.clone() else {
+            return Ok(false);
+        };
+
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                return Ok(false);
+            }
+            // Uppercase, so it cannot collide with the lowercase field keys.
+            KeyCode::Char('H') => {
+                self.begin_hide_pattern_from_one_line();
+                return Ok(false);
+            }
+            // Arrows only: `j` and `k` are field keys here.
+            KeyCode::Down => menu.move_cursor(1),
+            KeyCode::Up => menu.move_cursor(-1),
+            KeyCode::Char(' ') => menu.toggle(menu.cursor),
+            KeyCode::Tab => menu.exclude = !menu.exclude,
+            KeyCode::Enter => {
+                self.apply_hide_menu(&menu);
+                return Ok(false);
+            }
+            // A field's own key still hides by it in one press, as it always has. It
+            // honours the current direction, so a keep menu keeps by it.
             KeyCode::Char(ch) => {
                 if let Some(index) = hide_choice_index(ch) {
-                    if let Some(field) = self.hide_choice_fields().get(index).cloned() {
-                        self.hide_like(&field, "");
+                    if let Some((field, _)) = menu.fields.get(index).cloned() {
+                        self.hide_like(&field, "", menu.exclude);
+                        return Ok(false);
                     }
                 }
             }
             _ => {}
         }
+
+        self.mode = Mode::HideChoice(menu);
         Ok(false)
+    }
+
+    /// Enter in the field menu. One field is an `equals` rule; several become a single
+    /// regex over the raw line, which the user then vets in the pattern popup. Either way
+    /// the menu's direction (hide or keep) carries through.
+    fn apply_hide_menu(&mut self, menu: &HideMenu) {
+        let chosen = menu.chosen();
+        match chosen.len() {
+            0 => self.mode = Mode::Normal,
+            1 => self.hide_like(&chosen[0].0, "", menu.exclude),
+            n => match self.combined_field_pattern(&chosen) {
+                Some(pattern) => {
+                    let fields: Vec<&str> =
+                        chosen.iter().map(|(field, _)| field.as_str()).collect();
+                    let verb = if menu.exclude { "hide" } else { "keep" };
+                    self.status =
+                        format!("{verb} pattern from {n} fields: {}", fields.join(" and "));
+                    self.open_pattern_prompt_for("raw", Vec::new(), pattern, menu.exclude);
+                }
+                None => {
+                    self.status = "this log format cannot combine fields".to_string();
+                    self.mode = Mode::Normal;
+                }
+            },
+        }
+    }
+
+    /// The targeted line's schema, with `chosen` pinned and every other field left free.
+    fn combined_field_pattern(&self, chosen: &[(String, String)]) -> Option<String> {
+        let (file, _) = self.active_file_view()?;
+        let entry = file.entries.get(self.target_globals().first().copied()?)?;
+        let pattern = file.extractor_for(entry)?.field_pattern(chosen)?;
+        // A format that yields a regex the engine rejects is not usable for this.
+        regex::Regex::new(&pattern).ok()?;
+        Some(pattern)
     }
 
     fn handle_entry_detail_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
@@ -2618,7 +3486,6 @@ impl AppState {
         match &mut self.mode {
             Mode::Search(input)
             | Mode::AddFile(input)
-            | Mode::OpenFolder(input)
             | Mode::Filter(input)
             | Mode::ExportFilters(input)
             | Mode::LoadFilters(input)
@@ -2627,8 +3494,8 @@ impl AppState {
             | Mode::Extractor(input)
             | Mode::LogSchema(input)
             | Mode::EditFilter { text: input, .. }
-            | Mode::EditSearch { text: input, .. }
-            | Mode::HidePattern(input) => Some(input),
+            | Mode::EditSearch { text: input, .. } => Some(input),
+            Mode::HidePattern(prompt) => Some(&mut prompt.text),
             _ => None,
         }
     }
@@ -2638,7 +3505,6 @@ impl AppState {
         match mode {
             Mode::Search(text) => self.submit_search(text),
             Mode::AddFile(path) => self.submit_add_file(path)?,
-            Mode::OpenFolder(path) => self.submit_open_folder(path)?,
             Mode::Filter(text) => self.submit_filter(text),
             Mode::ExportFilters(folder) => self.submit_export_filters(folder),
             Mode::LoadFilters(folder) => self.submit_load_filters(folder),
@@ -2648,7 +3514,9 @@ impl AppState {
             Mode::LogSchema(text) => self.submit_schema_definition(text),
             Mode::EditFilter { index, text } => self.submit_edit_filter(index, text),
             Mode::EditSearch { index, text } => self.submit_edit_search(index, text),
-            Mode::HidePattern(pattern) => self.submit_hide_pattern(pattern),
+            Mode::HidePattern(prompt) => {
+                self.submit_hide_pattern(prompt.text, prompt.field, prompt.exclude)
+            }
             _ => {}
         }
         Ok(())
@@ -2872,16 +3740,646 @@ impl AppState {
         self.status = "search updated".to_string();
     }
 
+    /// The project holds one time range, so a new one replaces whatever was there.
     fn apply_time_range(&mut self, value: String) {
+        let rule = FilterRule::new("timestamp", "range", value.as_str(), "include");
+        let label = summarize_time_range(&rule);
+        self.mutate_filters(|filters| filters.set_time(rule));
+        self.status = format!("time range: {label}");
+    }
+
+    // ---- AI assistant ----------------------------------------------------------------
+
+    /// Open the chat panel and focus it, creating it (and its worker) on first use.
+    fn open_ai_chat(&mut self) {
+        if self.ai.is_none() {
+            self.ai = Some(AiChat::new());
+        }
+        self.focus = Focus::Chat;
+        // A first-run hint about the key, shown only while the transcript is empty.
+        if let Some(ai) = &mut self.ai {
+            if ai.transcript.is_empty() {
+                let provider = ai.config.provider;
+                if ai.resolved_key().is_none() {
+                    ai.transcript.push(ChatLine::Error(format!(
+                        "No API key. Type /key <your-key> here, or set {} in the environment. \
+                         Switch provider with /provider openai|anthropic|deepseek.",
+                        provider.key_var()
+                    )));
+                } else {
+                    ai.transcript.push(ChatLine::Info(format!(
+                        "Ask me to troubleshoot these logs. Using {} ({}).",
+                        provider.label(),
+                        ai.config.model()
+                    )));
+                }
+            }
+        }
+    }
+
+    /// The project context handed to the model as a system prompt. Rebuilt each turn so it
+    /// always reflects the current sources, filters, search, and focused view.
+    fn ai_system_prompt(&self) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "You are a log-troubleshooting assistant embedded in log-scouter, a terminal log \
+             browser. Help the user find and understand problems in their server logs. Use the \
+             tools to inspect the logs and to apply filters, searches, and time ranges on their \
+             behalf; the UI updates as you do. Prefer inspecting (sample_lines, count_matches, \
+             level_breakdown) before changing anything. Keep replies short and concrete.\n\n",
+        );
+        out.push_str(&format!(
+            "Project folder: {}\n",
+            self.project.root.display()
+        ));
+
+        out.push_str("Log sources:\n");
+        let real: Vec<&LogFileModel> = self
+            .project
+            .files
+            .iter()
+            .filter(|file| !file.is_merged())
+            .collect();
+        if real.is_empty() {
+            out.push_str("  (none loaded)\n");
+        } else {
+            for file in real {
+                let state = if !file.error.is_empty() {
+                    format!("error: {}", file.error)
+                } else if file.loaded {
+                    format!("{} entries", file.entries.len())
+                } else {
+                    "loading".to_string()
+                };
+                out.push_str(&format!(
+                    "  - {} [schema {}] {state}\n",
+                    file.display_name, file.extractor_name
+                ));
+            }
+        }
+
+        if let Some((file, view)) = self.active_file_view() {
+            out.push_str(&format!(
+                "\nFocused log: {} — showing {} of {} entries\n",
+                file.display_name,
+                view.visible.len(),
+                file.entries.len()
+            ));
+            if let Some(entry) = file.entries.first() {
+                if let Some(extractor) = file.extractor_for(entry) {
+                    out.push_str(&format!("Fields: {}\n", extractor.field_names.join(", ")));
+                }
+            }
+            if !view.query_text.trim().is_empty() {
+                out.push_str(&format!("Active search: {}\n", view.query_text));
+            }
+        }
+
+        out.push_str("\nFilters:\n");
+        if self.project.filters.rules.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for rule in &self.project.filters.rules {
+                out.push_str(&format!("  - {}\n", rule.describe()));
+            }
+        }
+        out
+    }
+
+    /// Run one tool the model asked for, against the live project. Returns text the model
+    /// reads next, and (as a side effect) mutates the UI through the normal paths.
+    fn dispatch_ai_tool(&mut self, name: &str, args: &serde_json::Value) -> Result<String, String> {
+        let string = |key: &str| {
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        match name {
+            ai_tools::LIST_SOURCES => Ok(self.ai_list_sources()),
+            ai_tools::LIST_FILTERS => Ok(self.ai_list_filters()),
+            ai_tools::LEVEL_BREAKDOWN => self.ai_level_breakdown(),
+            ai_tools::SAMPLE_LINES => {
+                let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(10);
+                self.ai_sample_lines(count.clamp(1, 50) as usize)
+            }
+            ai_tools::COUNT_MATCHES => self.ai_count_matches(&string("query")),
+            ai_tools::ADD_FILTER => self.ai_add_filter(
+                &string("field"),
+                &string("op"),
+                &string("value"),
+                &string("action"),
+            ),
+            ai_tools::SET_TIME_RANGE => self.ai_set_time_range(&string("start"), &string("end")),
+            ai_tools::SEARCH => {
+                let query = string("query");
+                if query.trim().is_empty() {
+                    return Err("search needs a non-empty query".to_string());
+                }
+                self.submit_search(query.clone());
+                let shown = self.active_view().map(|v| v.visible.len()).unwrap_or(0);
+                Ok(format!("searched for {query:?}; {shown} rows now shown"))
+            }
+            ai_tools::ADD_SOURCE => self.ai_add_source(&string("path")),
+            other => Err(format!("unknown tool: {other}")),
+        }
+    }
+
+    fn ai_list_sources(&self) -> String {
+        let mut out = String::new();
+        for file in self.project.files.iter().filter(|f| !f.is_merged()) {
+            let state = if !file.error.is_empty() {
+                format!("error: {}", file.error)
+            } else if file.loaded {
+                format!("{} entries", file.entries.len())
+            } else {
+                "loading".to_string()
+            };
+            out.push_str(&format!(
+                "{} | schema {} | {state}\n",
+                file.display_name, file.extractor_name
+            ));
+        }
+        if out.is_empty() {
+            "no log sources loaded".to_string()
+        } else {
+            out
+        }
+    }
+
+    fn ai_list_filters(&self) -> String {
+        if self.project.filters.rules.is_empty() {
+            return "no filters applied".to_string();
+        }
+        self.project
+            .filters
+            .rules
+            .iter()
+            .map(|rule| rule.describe())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn ai_sample_lines(&self, count: usize) -> Result<String, String> {
+        let (file, view) = self.active_file_view().ok_or("no log is open")?;
+        let mut out = String::new();
+        for position in 0..view.visible.len().min(count) {
+            if let Some(global) = view.visible.get(position) {
+                if let Some(entry) = file.entries.get(global) {
+                    let line = entry.raw.lines().next().unwrap_or("");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        if out.is_empty() {
+            Ok("the focused view is empty".to_string())
+        } else {
+            Ok(out)
+        }
+    }
+
+    fn ai_count_matches(&self, query: &str) -> Result<String, String> {
+        if query.trim().is_empty() {
+            return Err("count_matches needs a non-empty query".to_string());
+        }
+        let (file, _) = self.active_file_view().ok_or("no log is open")?;
+        let compiled = compile_query(query);
+        let matched = file
+            .entries
+            .iter()
+            .filter(|entry| compiled.matches(file, entry))
+            .count();
+        Ok(format!(
+            "{matched} of {} entries match {query:?}",
+            file.entries.len()
+        ))
+    }
+
+    fn ai_level_breakdown(&self) -> Result<String, String> {
+        let (file, _) = self.active_file_view().ok_or("no log is open")?;
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for entry in &file.entries {
+            let level = file.level(entry);
+            let key = if level.trim().is_empty() {
+                "(none)".to_string()
+            } else {
+                level
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        if counts.is_empty() {
+            return Ok("no entries".to_string());
+        }
+        Ok(counts
+            .into_iter()
+            .map(|(level, n)| format!("{level}: {n}"))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn ai_add_filter(
+        &mut self,
+        field: &str,
+        op: &str,
+        value: &str,
+        action: &str,
+    ) -> Result<String, String> {
+        if field.trim().is_empty() || value.is_empty() {
+            return Err("add_filter needs a field and a value".to_string());
+        }
+        if !matches!(op, "equals" | "contains" | "regex") {
+            return Err(format!(
+                "op must be equals, contains, or regex (got {op:?})"
+            ));
+        }
+        if !matches!(action, "exclude" | "include") {
+            return Err(format!(
+                "action must be exclude or include (got {action:?})"
+            ));
+        }
+        if op == "regex" && regex::Regex::new(value).is_err() {
+            return Err(format!("invalid regex: {value}"));
+        }
+        let before = self.ai_visible_count();
+        let rule = FilterRule::new(field, op, value, action);
+        let describe = rule.describe();
+        self.mutate_filters(|filters| filters.add(rule));
+        let after = self.ai_visible_count();
+        Ok(format!(
+            "added filter [{describe}]; {before} -> {after} rows"
+        ))
+    }
+
+    fn ai_set_time_range(&mut self, start: &str, end: &str) -> Result<String, String> {
+        let start = start.trim();
+        let end = end.trim();
+        if start.is_empty() && end.is_empty() {
+            return Err("set_time_range needs a start, an end, or both".to_string());
+        }
+        if !start.is_empty() && parse_datetime(start).is_none() {
+            return Err(format!("start is not a timestamp: {start}"));
+        }
+        if !end.is_empty() && parse_datetime(end).is_none() {
+            return Err(format!("end is not a timestamp: {end}"));
+        }
+        let before = self.ai_visible_count();
+        self.apply_time_range(format!("{start}..{end}"));
+        let after = self.ai_visible_count();
+        Ok(format!(
+            "time range {start}..{end}; {before} -> {after} rows"
+        ))
+    }
+
+    fn ai_add_source(&mut self, path: &str) -> Result<String, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("add_source needs a path".to_string());
+        }
+        if !std::path::Path::new(path).is_file() {
+            return Err(format!("no file at {path}"));
+        }
+        let file_id = self.project.add_file(path, None).file_id.clone();
+        self.queue_load(&file_id);
+        let name = self
+            .project
+            .get_file(&file_id)
+            .map(|f| f.display_name.clone())
+            .unwrap_or_default();
+        Ok(format!("added source {name}; it is loading now"))
+    }
+
+    /// Count the entries the current filters admit in the focused log, computed directly so
+    /// it is accurate before the async view recompute catches up.
+    fn ai_visible_count(&self) -> usize {
+        let Some((file, _)) = self.active_file_view() else {
+            return 0;
+        };
+        if !self.project.filters.has_enabled_rules() {
+            return file.entries.len();
+        }
+        let prepared = self.project.filters.prepare();
+        file.entries
+            .iter()
+            .filter(|entry| prepared.visible(file, entry))
+            .count()
+    }
+
+    /// Enter in the chat input: run a slash command, or ask the model a question.
+    fn submit_ai_input(&mut self) {
+        let text = match &self.ai {
+            Some(ai) => ai.input.trim().to_string(),
+            None => return,
+        };
+        if text.is_empty() {
+            return;
+        }
+        if let Some(rest) = text.strip_prefix('/') {
+            self.ai_command(rest);
+            if let Some(ai) = &mut self.ai {
+                ai.input.clear();
+            }
+            self.input_cursor = 0;
+            return;
+        }
+
+        if let Some(ai) = &mut self.ai {
+            ai.transcript.push(ChatLine::User(text.clone()));
+            ai.conversation.push(ChatMsg::user(text));
+            ai.turns = 0;
+            ai.input.clear();
+            // Follow the newest lines as the answer streams in.
+            ai.scroll = 0;
+        }
+        self.input_cursor = 0;
+        self.ai_send_turn();
+    }
+
+    /// A `/`-prefixed line: set the key, pick the provider or model, or clear the chat.
+    fn ai_command(&mut self, rest: &str) {
+        let mut words = rest.split_whitespace();
+        let command = words.next().unwrap_or("");
+        let argument = words.next().unwrap_or("");
+        // The rest of the line verbatim, for a value that keeps its spacing (a key).
+        let tail = rest[command.len()..].trim();
+        let Some(ai) = &mut self.ai else { return };
+        match command {
+            "key" => {
+                if tail.is_empty() {
+                    ai.transcript
+                        .push(ChatLine::Error("usage: /key <api-key>".to_string()));
+                } else {
+                    let provider = ai.config.provider;
+                    ai.keys.insert(provider, tail.to_string());
+                    // Never echo the key back into the transcript.
+                    ai.transcript.push(ChatLine::Info(format!(
+                        "key set for {} (this session only, not saved to disk)",
+                        provider.label()
+                    )));
+                }
+            }
+            "provider" => match crate::ai::Provider::from_label(argument) {
+                Some(provider) => {
+                    ai.config.provider = provider;
+                    let _ = ai.config.save();
+                    let has_key = ai.resolved_key().is_some();
+                    ai.transcript.push(ChatLine::Info(format!(
+                        "provider set to {} ({}){}",
+                        provider.label(),
+                        ai.config.model(),
+                        if has_key {
+                            String::new()
+                        } else {
+                            format!(" — set {}", provider.key_var())
+                        }
+                    )));
+                }
+                None => ai.transcript.push(ChatLine::Error(
+                    "usage: /provider openai|anthropic|deepseek".to_string(),
+                )),
+            },
+            "model" => {
+                if argument.is_empty() {
+                    ai.transcript
+                        .push(ChatLine::Error("usage: /model <name>".to_string()));
+                } else {
+                    ai.config.model = argument.to_string();
+                    let _ = ai.config.save();
+                    ai.transcript
+                        .push(ChatLine::Info(format!("model set to {argument}")));
+                }
+            }
+            "clear" => {
+                ai.conversation.clear();
+                ai.transcript.clear();
+                ai.transcript
+                    .push(ChatLine::Info("conversation cleared".to_string()));
+            }
+            other => ai.transcript.push(ChatLine::Error(format!(
+                "unknown command /{other}; try /key, /provider, /model, /clear"
+            ))),
+        }
+    }
+
+    /// Send the conversation (with a fresh system prompt) to the worker for one completion.
+    fn ai_send_turn(&mut self) {
+        let prompt = self.ai_system_prompt();
+        let Some(ai) = &mut self.ai else { return };
+
+        let Some(key) = ai.resolved_key() else {
+            ai.transcript.push(ChatLine::Error(format!(
+                "No API key. Type /key <your-key>, or set {} in the environment.",
+                ai.config.provider.key_var()
+            )));
+            ai.pending = false;
+            return;
+        };
+
+        let mut conversation = Vec::with_capacity(ai.conversation.len() + 1);
+        conversation.push(ChatMsg::system(prompt));
+        conversation.extend(ai.conversation.iter().cloned());
+
+        ai.generation += 1;
+        ai.turns += 1;
+        ai.pending = true;
+
+        let request = AgentRequest {
+            generation: ai.generation,
+            config: ai.config.clone(),
+            key,
+            conversation,
+            tools: ai_tools::specs(),
+        };
+        if let Err(error) = ai.worker.send(request) {
+            ai.transcript.push(ChatLine::Error(error));
+            ai.pending = false;
+        }
+    }
+
+    /// Drain the worker's replies, run any tools the model asked for, and continue the loop
+    /// until it stops calling tools. Called once per frame.
+    fn drain_ai_events(&mut self) {
+        loop {
+            let event = match &self.ai {
+                Some(ai) if ai.pending => ai.worker.poll(),
+                _ => None,
+            };
+            let Some(event) = event else { break };
+            if self.apply_ai_event(event) {
+                self.ai_send_turn();
+            }
+        }
+    }
+
+    /// Handle one worker reply. Records the assistant turn, runs any tools it asked for
+    /// against the live project, and returns `true` when a follow-up turn should be sent.
+    /// Split out from the drain loop so the whole agentic cycle can be tested by feeding
+    /// scripted events, with no network.
+    fn apply_ai_event(&mut self, event: crate::ai::AgentEvent) -> bool {
+        // A reply to a superseded or cancelled question: drop it.
+        let generation = self.ai.as_ref().map(|ai| ai.generation).unwrap_or(0);
+        if event.generation != generation {
+            return false;
+        }
+
+        let assistant = match event.result {
+            Err(error) => {
+                if let Some(ai) = &mut self.ai {
+                    ai.transcript.push(ChatLine::Error(error));
+                    ai.pending = false;
+                }
+                return false;
+            }
+            Ok(assistant) => assistant,
+        };
+
+        if let Some(ai) = &mut self.ai {
+            ai.conversation.push(ChatMsg::assistant(
+                assistant.text.clone(),
+                assistant.tool_calls.clone(),
+            ));
+            if !assistant.text.trim().is_empty() {
+                ai.transcript
+                    .push(ChatLine::Assistant(assistant.text.clone()));
+            }
+        }
+
+        if assistant.tool_calls.is_empty() {
+            if let Some(ai) = &mut self.ai {
+                ai.pending = false;
+            }
+            return false;
+        }
+
+        let turns = self.ai.as_ref().map(|ai| ai.turns).unwrap_or(0);
+        if turns >= AI_MAX_TURNS {
+            if let Some(ai) = &mut self.ai {
+                ai.transcript
+                    .push(ChatLine::Error("stopped: too many tool calls".to_string()));
+                ai.pending = false;
+            }
+            return false;
+        }
+
+        // Run the tools against the live project (this mutates panels), gather results.
+        let mut results = Vec::with_capacity(assistant.tool_calls.len());
+        for call in &assistant.tool_calls {
+            let (content, line) = match self.dispatch_ai_tool(&call.name, &call.arguments) {
+                Ok(text) => {
+                    let summary = text.lines().next().unwrap_or("").to_string();
+                    (text, format!("ran {}: {summary}", call.name))
+                }
+                Err(error) => (
+                    format!("error: {error}"),
+                    format!("ran {}: error: {error}", call.name),
+                ),
+            };
+            if let Some(ai) = &mut self.ai {
+                ai.transcript.push(ChatLine::Action(line));
+            }
+            results.push(ToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                content,
+            });
+        }
+        if let Some(ai) = &mut self.ai {
+            ai.conversation.push(ChatMsg::tool_results(results));
+        }
+        true
+    }
+
+    /// Keystrokes while the chat panel has focus.
+    fn handle_chat_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel an in-flight turn (drop its reply), else leave the panel.
+                let pending = self.ai.as_ref().map(|ai| ai.pending).unwrap_or(false);
+                if pending {
+                    if let Some(ai) = &mut self.ai {
+                        ai.generation += 1;
+                        ai.pending = false;
+                        ai.transcript.push(ChatLine::Info("cancelled".to_string()));
+                    }
+                } else {
+                    self.focus = Focus::Pane;
+                }
+            }
+            KeyCode::Enter => self.submit_ai_input(),
+            KeyCode::Backspace => {
+                let caret = self.input_cursor;
+                if caret > 0 {
+                    if let Some(ai) = &mut self.ai {
+                        remove_char(&mut ai.input, caret - 1);
+                    }
+                    self.input_cursor = caret - 1;
+                }
+            }
+            KeyCode::Left => self.input_cursor = self.input_cursor.saturating_sub(1),
+            KeyCode::Right => {
+                let len = self
+                    .ai
+                    .as_ref()
+                    .map(|ai| ai.input.chars().count())
+                    .unwrap_or(0);
+                self.input_cursor = (self.input_cursor + 1).min(len);
+            }
+            KeyCode::Up | KeyCode::PageUp => {
+                if let Some(ai) = &mut self.ai {
+                    ai.scroll = ai.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                if let Some(ai) = &mut self.ai {
+                    ai.scroll = ai.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(ai) = &mut self.ai {
+                    ai.input.clear();
+                }
+                self.input_cursor = 0;
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let caret = self.input_cursor;
+                if let Some(ai) = &mut self.ai {
+                    insert_char(&mut ai.input, caret, ch);
+                }
+                self.input_cursor = caret + 1;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Delete on a sidebar filter row drops that rule. Without it the only way out of a
+    /// time range is `F`, which takes every text filter with it.
+    fn remove_selected_filter(&mut self) {
+        let items = self.sidebar_items();
+        let index = match items.get(self.sidebar_selected) {
+            Some(SidebarItem::Filter { index, .. } | SidebarItem::TimeFilter { index, .. }) => {
+                *index
+            }
+            _ => return,
+        };
+        if index >= self.project.filters.rules.len() {
+            return;
+        }
+        let rule = &self.project.filters.rules[index];
+        let removed = if rule.is_time_range() {
+            format!("time range {}", summarize_time_range(rule))
+        } else {
+            rule.describe()
+        };
         self.mutate_filters(|filters| {
-            filters.add(FilterRule::new(
-                "timestamp",
-                "range",
-                value.as_str(),
-                "include",
-            ))
+            filters.rules.remove(index);
         });
-        self.status = format!("time range filter added: {value}");
+        // The row under the cursor is gone; do not leave it past the end of the list.
+        self.sidebar_selected = self
+            .sidebar_selected
+            .min(self.sidebar_items().len().saturating_sub(1));
+        self.status = format!("filter removed: {removed}");
     }
 
     /// A bad field leaves the popup open on the offending value rather than discarding
@@ -2896,6 +4394,8 @@ impl AppState {
                 self.mode = Mode::Normal;
                 return Ok(false);
             }
+            // Enter commits the Start and End fields. Moving onto a preset has already
+            // filled them from it, so highlighting one and pressing Enter applies it.
             KeyCode::Enter => match picker.to_range() {
                 Ok(value) => {
                     self.mode = Mode::Normal;
@@ -2958,6 +4458,98 @@ impl AppState {
         }
 
         self.mode = Mode::TimePicker(picker);
+        Ok(false)
+    }
+
+    /// `o`: browse for a folder, starting where the project already is.
+    fn open_folder_browser(&mut self) {
+        let start = if self.project.root.is_dir() {
+            self.project.root.clone()
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        };
+        match FolderBrowser::open(start) {
+            Ok(browser) => self.mode = Mode::OpenFolder(browser),
+            Err(error) => self.status = format!("could not read folder: {error}"),
+        }
+    }
+
+    fn handle_folder_browser_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::OpenFolder(mut browser) = self.mode.clone() else {
+            return Ok(false);
+        };
+        const HALF_PAGE: isize = 10;
+
+        // Any step that re-reads a folder can fail on permissions. `go_to` and `parent`
+        // put the browser back where it was, so all that is left is to say so.
+        let mut failure = None;
+        let walk = |browser: &mut FolderBrowser, target: Option<PathBuf>| {
+            let target = target?;
+            browser
+                .go_to(target.clone())
+                .err()
+                .map(|error| format!("could not read {}: {error}", target.display()))
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                return Ok(false);
+            }
+            KeyCode::Down | KeyCode::Char('j') => browser.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => browser.move_selection(-1),
+            KeyCode::PageDown => browser.move_selection(HALF_PAGE),
+            KeyCode::PageUp => browser.move_selection(-HALF_PAGE),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                browser.move_selection(HALF_PAGE)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                browser.move_selection(-HALF_PAGE)
+            }
+            KeyCode::Home | KeyCode::Char('g') => browser.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                browser.selected = browser.rows.len().saturating_sub(1)
+            }
+            // Going up is always available, even from a folder listing no subfolders.
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+                let parent = browser.parent_path();
+                failure = walk(&mut browser, parent);
+            }
+            KeyCode::Char('.') => {
+                if let Err(error) = browser.toggle_hidden() {
+                    failure = Some(format!("could not read folder: {error}"));
+                }
+            }
+            // Descend only. Enter does that too, but also opens and goes up, depending on
+            // the row; these keys keep their one meaning whatever is selected.
+            KeyCode::Right | KeyCode::Char('l') => {
+                let child = match browser.selected_row() {
+                    Some(BrowserRow::Child(path)) => Some(path.clone()),
+                    _ => None,
+                };
+                failure = walk(&mut browser, child);
+            }
+            KeyCode::Enter => match browser.selected_row().cloned() {
+                Some(BrowserRow::OpenCurrent) => {
+                    let folder = browser.current.to_string_lossy().to_string();
+                    self.mode = Mode::Normal;
+                    self.submit_open_folder(folder)?;
+                    return Ok(false);
+                }
+                Some(BrowserRow::Parent) => {
+                    let parent = browser.parent_path();
+                    failure = walk(&mut browser, parent);
+                }
+                Some(BrowserRow::Child(path)) => failure = walk(&mut browser, Some(path)),
+                None => {}
+            },
+            _ => {}
+        }
+
+        if let Some(error) = failure {
+            self.status = error;
+        }
+        self.mode = Mode::OpenFolder(browser);
         Ok(false)
     }
 
@@ -3149,7 +4741,7 @@ impl AppState {
         self.status = format!("schema '{name}' applied to {display}");
     }
 
-    fn hide_like(&mut self, dimension: &str, keyword: &str) {
+    fn hide_like(&mut self, dimension: &str, keyword: &str, exclude: bool) {
         // Honour a single Space-picked line even when the cursor has moved off it.
         let Some((file_id, global_index)) = self
             .active_view()
@@ -3167,9 +4759,14 @@ impl AppState {
             self.mode = Mode::Normal;
             return;
         };
-        let rule = hide_like(file, entry, dimension, keyword);
+        let rule = hide_like(file, entry, dimension, keyword, exclude);
         self.mutate_filters(|filters| filters.add(rule));
-        self.status = "hide rule added".to_string();
+        self.status = if exclude {
+            "hide rule added"
+        } else {
+            "keep rule added"
+        }
+        .to_string();
         self.mode = Mode::Normal;
     }
 
@@ -3203,7 +4800,7 @@ impl AppState {
             let items = self.sidebar_items();
             match items.get(self.sidebar_selected) {
                 Some(SidebarItem::File { .. }) => self.toggle_file_in_view(),
-                Some(SidebarItem::Filter { index, .. }) => {
+                Some(SidebarItem::Filter { index, .. } | SidebarItem::TimeFilter { index, .. }) => {
                     let index = *index;
                     self.toggle_filter_enabled(index);
                 }
@@ -3463,8 +5060,9 @@ impl AppState {
     /// time order and a merged model is sorted by timestamp, so the bounds sit at the
     /// ends; scanning inward stops at the first entry that has one, instead of parsing
     /// the whole file.
-    fn active_time_bounds(&self) -> Option<(NaiveDateTime, NaiveDateTime)> {
-        let (file, _) = self.active_file_view()?;
+    /// First and last timestamp of one file, cheaply: the extremes of the timestamped
+    /// entries at each end. Exact for a time-ordered log, which is the normal case.
+    fn file_time_bounds(file: &LogFileModel) -> Option<(NaiveDateTime, NaiveDateTime)> {
         let first = file
             .entries
             .iter()
@@ -3477,12 +5075,35 @@ impl AppState {
         Some((first.min(last), first.max(last)))
     }
 
+    /// The span of *every* loaded source, not just the focused pane's.
+    ///
+    /// The time filter is project-wide, so "Last 15 minutes" has to count back from the
+    /// newest entry across all logs. Anchored to one pane, a merge of a source ending at
+    /// 10:00 with one ending at 11:00 would take fifteen minutes from whichever pane had
+    /// focus -- so the same preset meant a different window depending on where the cursor
+    /// happened to be. Merged views are skipped: they are copies of the real files.
+    fn project_time_bounds(&self) -> Option<(NaiveDateTime, NaiveDateTime)> {
+        self.project
+            .files
+            .iter()
+            .filter(|file| !file.is_merged())
+            .filter_map(Self::file_time_bounds)
+            .reduce(|(lo, hi), (start, end)| (lo.min(start), hi.max(end)))
+    }
+
+    /// Opens on the range already in force, so `t` and Enter on the Time row both mean
+    /// "change this" rather than "start over".
     fn open_time_picker(&mut self) {
-        let bounds = self.active_time_bounds();
+        let bounds = self.project_time_bounds();
         if bounds.is_none() {
-            self.status = "no timestamps in this log; presets count back from now".to_string();
+            self.status = "no timestamps in these logs; presets count back from now".to_string();
         }
-        self.mode = Mode::TimePicker(TimePicker::new(bounds));
+        let mut picker = TimePicker::new(bounds);
+        if let Some(rule) = self.project.filters.time_rule() {
+            let (start, end) = rule.time_bounds();
+            picker.load_range(start, end);
+        }
+        self.mode = Mode::TimePicker(picker);
     }
 
     fn open_entry_detail_popup(&mut self) {
@@ -3602,39 +5223,147 @@ impl AppState {
         };
     }
 
-    /// One line: choose a schema field. Several: derive a shared regex and let the
-    /// user vet it before it becomes a saved, project-wide filter.
-    fn begin_hide(&mut self) {
-        let globals = self.target_globals();
-        if globals.len() < 2 {
-            self.mode = Mode::HideChoice;
-            return;
-        }
-
+    /// The first line of the message of every targeted entry.
+    fn target_messages(&self) -> Vec<String> {
         let Some(file) = self
             .active_view()
             .and_then(|view| self.project.get_file(&view.file_id))
         else {
-            return;
+            return Vec::new();
         };
-        let messages: Vec<String> = globals
+        self.target_globals()
             .iter()
             .filter_map(|global| file.entries.get(*global))
             .map(|entry| file.message(entry).lines().next().unwrap_or("").to_string())
-            .collect();
-        let borrowed: Vec<&str> = messages.iter().map(String::as_str).collect();
-
-        match common_message_pattern(&borrowed) {
-            Some(pattern) => {
-                self.status = format!("pattern from {} lines", globals.len());
-                self.open_input(Mode::HidePattern(pattern));
-            }
-            // Only when every selected message is blank; the choice menu still works.
-            None => self.mode = Mode::HideChoice,
-        }
+            .collect()
     }
 
-    fn submit_hide_pattern(&mut self, pattern: String) {
+    /// One line: choose a schema field. Several: derive the templates they support and let
+    /// the user pick before any of it becomes a saved, project-wide filter.
+    fn begin_hide(&mut self) {
+        let messages = self.target_messages();
+        if messages.len() < 2 {
+            self.mode = Mode::HideChoice(HideMenu::new(self.hide_choice_entries()));
+            return;
+        }
+
+        let borrowed: Vec<&str> = messages.iter().map(String::as_str).collect();
+        // Only when every selected message is blank; the choice menu still works.
+        let Some(default) = common_message_pattern(&borrowed) else {
+            self.mode = Mode::HideChoice(HideMenu::new(self.hide_choice_entries()));
+            return;
+        };
+        self.status = format!("pattern from {} lines", messages.len());
+        self.open_pattern_prompt(pattern_candidates(&borrowed), default);
+    }
+
+    /// `H` again from the choice menu: generalise the one targeted line into a template.
+    /// A single line has no second line to diff against, so the value shapes it contains
+    /// -- ids, counters, addresses -- are all there is to generalise.
+    fn begin_hide_pattern_from_one_line(&mut self) {
+        let messages = self.target_messages();
+        let template = messages
+            .first()
+            .and_then(|message| message_template(message));
+        let Some(default) = template else {
+            self.status = "no message to build a pattern from".to_string();
+            return;
+        };
+        let borrowed: Vec<&str> = messages[..1].iter().map(String::as_str).collect();
+        self.status = "pattern from 1 line".to_string();
+        self.open_pattern_prompt(pattern_candidates(&borrowed), default);
+    }
+
+    fn open_pattern_prompt(&mut self, options: Vec<PatternOption>, default: String) {
+        self.open_pattern_prompt_for("message", options, default, true);
+    }
+
+    /// Rank the templates by what they actually match here, and open on `default` -- the
+    /// one `H` has always produced. The looser rungs sit above it, a keypress away.
+    fn open_pattern_prompt_for(
+        &mut self,
+        field: &str,
+        options: Vec<PatternOption>,
+        default: String,
+        exclude: bool,
+    ) {
+        let (counts, scanned, total) = self.score_patterns(field, &options);
+        let mut candidates: Vec<PatternCandidate> = options
+            .into_iter()
+            .zip(counts)
+            .map(|(option, matched)| PatternCandidate { option, matched })
+            .collect();
+        // Greediest first. What a template matches *in this log* is the only honest
+        // measure of that; the strategy that built it only suggests an order.
+        candidates.sort_by(|left, right| {
+            right
+                .matched
+                .cmp(&left.matched)
+                .then(left.option.pattern.len().cmp(&right.option.pattern.len()))
+        });
+
+        let selected = candidates
+            .iter()
+            .position(|candidate| candidate.option.pattern == default)
+            .unwrap_or(0);
+        let text = candidates
+            .get(selected)
+            .map(|candidate| candidate.option.pattern.clone())
+            .unwrap_or(default);
+
+        self.open_input(Mode::HidePattern(PatternPrompt {
+            text,
+            field: field.to_string(),
+            exclude,
+            candidates,
+            selected,
+            scanned,
+            total,
+        }));
+    }
+
+    /// Rows matched by each option, plus how many rows were read and how many there are.
+    ///
+    /// One pass over the pane, testing every option against each row: pulling the field
+    /// out of an entry costs more than the regexes do, so it is done once per row rather
+    /// than once per option.
+    fn score_patterns(&self, field: &str, options: &[PatternOption]) -> (Vec<usize>, usize, usize) {
+        // A prompt with no ladder has nothing to rank, and its header counts for itself.
+        if options.is_empty() {
+            return (Vec::new(), 0, 0);
+        }
+        let mut counts = vec![0; options.len()];
+        let compiled: Vec<Option<regex::Regex>> = options
+            .iter()
+            .map(|option| regex::Regex::new(&option.pattern).ok())
+            .collect();
+
+        let Some((file, view)) = self.active_file_view() else {
+            return (counts, 0, 0);
+        };
+        let total = view.visible.len();
+        let mut scanned = 0;
+        for global in view.visible.iter().take(PATTERN_PREVIEW_LIMIT) {
+            let Some(entry) = file.entries.get(global) else {
+                continue;
+            };
+            scanned += 1;
+            file.with_field(entry, field, |text| {
+                for (index, regex) in compiled.iter().enumerate() {
+                    if regex
+                        .as_ref()
+                        .map(|regex| regex.is_match(text))
+                        .unwrap_or(false)
+                    {
+                        counts[index] += 1;
+                    }
+                }
+            });
+        }
+        (counts, scanned, total)
+    }
+
+    fn submit_hide_pattern(&mut self, pattern: String, field: String, exclude: bool) {
         let pattern = pattern.trim().to_string();
         if pattern.is_empty() {
             return;
@@ -3644,16 +5373,61 @@ impl AppState {
             return;
         }
 
+        let action = if exclude { "exclude" } else { "include" };
         self.mutate_filters(|filters| {
             filters.add(FilterRule::new(
-                "message",
+                field.as_str(),
                 "regex",
                 pattern.as_str(),
-                "exclude",
+                action,
             ))
         });
         self.clear_active_selection();
-        self.status = "hide pattern added".to_string();
+        self.status = if exclude {
+            "hide pattern added"
+        } else {
+            "keep pattern added"
+        }
+        .to_string();
+    }
+
+    /// How the pattern would land on the rows the pane is showing right now. Recomputed on
+    /// every keystroke, so the scan is capped: a filter is committed project-wide and the
+    /// user deserves to see its blast radius before pressing Enter, but not to wait for it.
+    fn hide_pattern_preview(&self, pattern: &str, field: &str) -> PatternPreview {
+        let mut preview = PatternPreview::default();
+        if pattern.trim().is_empty() {
+            return preview;
+        }
+        let regex = match regex::Regex::new(pattern) {
+            Ok(regex) => regex,
+            Err(error) => {
+                preview.error = Some(one_line(&error.to_string()));
+                return preview;
+            }
+        };
+        let Some((file, view)) = self.active_file_view() else {
+            return preview;
+        };
+
+        preview.total = view.visible.len();
+        for global in view.visible.iter().take(PATTERN_PREVIEW_LIMIT) {
+            let Some(entry) = file.entries.get(global) else {
+                continue;
+            };
+            preview.scanned += 1;
+            // The same field and the same regex the committed rule will use.
+            if !file.with_field(entry, field, |text| regex.is_match(text)) {
+                continue;
+            }
+            preview.matched += 1;
+            if preview.samples.len() < PATTERN_PREVIEW_SAMPLES {
+                preview
+                    .samples
+                    .push(file.message(entry).lines().next().unwrap_or("").to_string());
+            }
+        }
+        preview
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -3671,6 +5445,8 @@ impl AppState {
                 }
             }
             Focus::Results => self.move_result_selection(delta),
+            // Chat handles its own keys; arrows there scroll the transcript.
+            Focus::Chat => {}
         }
     }
 
@@ -3692,6 +5468,8 @@ impl AppState {
                 }
                 Focus::Pane => Focus::Sidebar,
                 Focus::Results => Focus::Pane,
+                // Tab leaves the chat panel rather than cycling through it.
+                Focus::Chat => Focus::Pane,
             };
             return;
         }
@@ -3713,6 +5491,7 @@ impl AppState {
                 self.focused_pane = 0;
                 Focus::Sidebar
             }
+            Focus::Chat => Focus::Pane,
         };
     }
 
@@ -3870,9 +5649,13 @@ impl AppState {
                 let text = rule.to_input();
                 self.open_input(Mode::EditFilter { index, text });
             }
+            // The picker, not the filter grammar: a range is edited as two timestamps.
+            SidebarItem::TimeFilter { .. } => self.open_time_picker(),
             SidebarItem::Search { index, text, .. } => {
                 self.open_input(Mode::EditSearch { index, text });
             }
+            // `none - t` under Time. Enter on it is the obvious way to make one.
+            SidebarItem::Hint(label) if label.trim() == "none - t" => self.open_time_picker(),
             _ => {}
         }
     }
@@ -4015,6 +5798,32 @@ impl AppState {
             .unwrap_or_else(|| vec!["message".to_string()])
     }
 
+    /// Those fields paired with what the targeted line holds in each, so the menu can be
+    /// read as "hide lines whose level is Trace" rather than "hide by level".
+    fn hide_choice_entries(&self) -> Vec<(String, String)> {
+        let fields = self.hide_choice_fields();
+        let Some((file, _)) = self.active_file_view() else {
+            return fields
+                .into_iter()
+                .map(|field| (field, String::new()))
+                .collect();
+        };
+        let entry = self
+            .target_globals()
+            .first()
+            .copied()
+            .and_then(|global| file.entries.get(global));
+        fields
+            .into_iter()
+            .map(|field| {
+                let value = entry
+                    .map(|entry| file.get_field(entry, &field))
+                    .unwrap_or_default();
+                (field, value)
+            })
+            .collect()
+    }
+
     fn active_file_index(&self) -> Option<usize> {
         let view = self.active_view()?;
         self.project.file_index(&view.file_id)
@@ -4144,16 +5953,33 @@ impl AppState {
         }
 
         items.push(SidebarItem::Section("Filters".to_string()));
-        if self.project.filters.rules.is_empty() {
-            items.push(SidebarItem::Hint("none - f or H".to_string()));
+        items.push(SidebarItem::SubSection("Text".to_string()));
+        let text_rules: Vec<(usize, &FilterRule)> = self.project.filters.text_rules().collect();
+        if text_rules.is_empty() {
+            // Indented by hand: a hint under a sub-section lines up with its rows, and a
+            // hint under a section lines up with those.
+            items.push(SidebarItem::Hint("  none - f or H".to_string()));
         } else {
-            for (index, rule) in self.project.filters.rules.iter().enumerate() {
+            for (index, rule) in text_rules {
                 let mark = if rule.enabled { "*" } else { "o" };
                 items.push(SidebarItem::Filter {
                     index,
                     label: format!("{mark} {}", rule.describe()),
                 });
             }
+        }
+
+        items.push(SidebarItem::SubSection("Time".to_string()));
+        match self.project.filters.time_index() {
+            Some(index) => {
+                let rule = &self.project.filters.rules[index];
+                let mark = if rule.enabled { "*" } else { "o" };
+                items.push(SidebarItem::TimeFilter {
+                    index,
+                    label: format!("{mark} {}", describe_time_range(rule)),
+                });
+            }
+            None => items.push(SidebarItem::Hint("  none - t".to_string())),
         }
 
         items.push(SidebarItem::Section("Saved Searches".to_string()));
@@ -4234,11 +6060,12 @@ fn build_view(leaf_id: impl Into<String>, file: &LogFileModel, filters: &FilterS
     view
 }
 
-/// Filter rules are long ("exclude message contains '...'"), so let a roomy terminal
-/// spend a quarter of its width on the sidebar. Never starve the log panes.
+/// Filter rules are long ("exclude message contains '...'") and now sit two levels deep
+/// under `Filters > Text`, so let a roomy terminal spend a quarter of its width on the
+/// sidebar. Never starve the log panes.
 fn sidebar_width(body_width: u16) -> u16 {
     (body_width / 4)
-        .clamp(34, 56)
+        .clamp(36, 56)
         .min(body_width.saturating_sub(24))
 }
 
@@ -4310,6 +6137,151 @@ fn parse_log_schema_input(input: &str) -> Result<Extractor, String> {
 
 fn format_filter_datetime(value: NaiveDateTime) -> String {
     value.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+}
+
+/// The time range as it fits a sidebar row: `10:09:03 → 10:09:05  (2s)`. The date is
+/// dropped when both ends share one and the detail panel can say it, and dropped to
+/// `06-16` otherwise -- a sidebar is 36 columns wide, and a year is never the surprise.
+fn describe_time_range(rule: &FilterRule) -> String {
+    let state = if rule.enabled { "" } else { " (off)" };
+    let (start, end) = rule.time_bounds();
+    let body = match (parse_datetime(start), parse_datetime(end)) {
+        (Some(low), Some(high)) => {
+            let dated = low.date() != high.date();
+            format!(
+                "{} → {}  ({})",
+                format_range_bound(low, dated),
+                format_range_bound(high, dated),
+                format_range_span(high - low)
+            )
+        }
+        (Some(low), None) => format!("from {}", format_range_bound(low, true)),
+        (None, Some(high)) => format!("until {}", format_range_bound(high, true)),
+        // Neither end parses: show what is stored rather than pretend.
+        (None, None) => rule.value.clone(),
+    };
+    format!("{body}{state}")
+}
+
+/// Full timestamps, for the status line and anywhere else with room to spell them out.
+fn summarize_time_range(rule: &FilterRule) -> String {
+    let (start, end) = rule.time_bounds();
+    match (start.is_empty(), end.is_empty()) {
+        (false, false) => format!("{start} → {end}"),
+        (false, true) => format!("from {start}"),
+        (true, false) => format!("until {end}"),
+        (true, true) => rule.value.clone(),
+    }
+}
+
+fn format_range_bound(value: NaiveDateTime, with_date: bool) -> String {
+    let time = if value.and_utc().timestamp_subsec_millis() == 0 {
+        value.format("%H:%M:%S").to_string()
+    } else {
+        value.format("%H:%M:%S%.3f").to_string()
+    };
+    if with_date {
+        format!("{} {time}", value.format("%m-%d"))
+    } else {
+        time
+    }
+}
+
+/// How long a range is. `format_elapsed` writes an offset from a mark, so it leads with a
+/// sign and always spells out the milliseconds; the length of a range wants neither.
+fn format_range_span(delta: ChronoDuration) -> String {
+    let total = delta.num_milliseconds().max(0);
+    let (seconds, millis) = (total / 1000, total % 1000);
+    if seconds < 60 {
+        return if millis == 0 {
+            format!("{seconds}s")
+        } else {
+            format!("{seconds}.{millis:03}s")
+        };
+    }
+    let (minutes, seconds) = (seconds / 60, seconds % 60);
+    if minutes < 60 {
+        return if seconds == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m{seconds:02}s")
+        };
+    }
+    let (hours, minutes) = (minutes / 60, minutes % 60);
+    if hours < 24 {
+        return if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{minutes:02}m")
+        };
+    }
+    let (days, hours) = (hours / 24, hours % 24);
+    if hours == 0 {
+        format!("{days}d")
+    } else {
+        format!("{days}d{hours:02}h")
+    }
+}
+
+/// "hides 412 of 8,201 shown lines", or the same in the keep direction. The count is what
+/// happens to the pane the user is looking at, which is the question they are asking.
+fn preview_summary(preview: &PatternPreview, exclude: bool) -> String {
+    if preview.total == 0 {
+        return "nothing on screen to match".to_string();
+    }
+    let verb = if exclude { "hides" } else { "keeps" };
+    if preview.capped() {
+        return format!(
+            "{verb} {} of the first {} rows scanned ({} shown)",
+            thousands(preview.matched),
+            thousands(preview.scanned),
+            thousands(preview.total)
+        );
+    }
+    if preview.matched == 0 {
+        return format!(
+            "matches none of the {} shown rows",
+            thousands(preview.total)
+        );
+    }
+    format!(
+        "{verb} {} of {} shown rows",
+        thousands(preview.matched),
+        thousands(preview.total)
+    )
+}
+
+/// `8201` -> `8,201`. A blast radius is easier to judge when it is grouped.
+fn thousands(value: usize) -> String {
+    let digits: Vec<char> = value.to_string().chars().collect();
+    let lead = match digits.len() % 3 {
+        0 => 3,
+        remainder => remainder,
+    };
+    let mut out: String = digits[..lead].iter().collect();
+    for group in digits[lead..].chunks(3) {
+        out.push(',');
+        out.extend(group);
+    }
+    out
+}
+
+/// A regex compile error spans several lines with a caret diagram; the popup has one.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A field's value, short enough to sit in the menu: its first three words. A message
+/// runs to hundreds of characters, and the first few are what identify it.
+fn field_value_preview(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return "(empty)".to_string();
+    }
+    let mut words = value.split_whitespace();
+    let head: Vec<&str> = words.by_ref().take(3).collect();
+    let more = words.next().is_some();
+    format!("{}{}", head.join(" "), if more { " …" } else { "" })
 }
 
 fn hide_choice_index(ch: char) -> Option<usize> {
@@ -4480,6 +6452,50 @@ fn file_detail_lines(file: &LogFileModel, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// The time range broken into the two things a person edits, plus how long it spans.
+fn time_filter_detail_lines(rule: &FilterRule, width: usize) -> Vec<Line<'static>> {
+    let value_width = width.saturating_sub(DETAIL_LABEL_WIDTH + 1).max(8);
+    let plain = Style::default();
+    let (start, end) = rule.time_bounds();
+    let mut lines = Vec::new();
+
+    push_detail(&mut lines, "start", open_end(start), value_width, plain);
+    push_detail(&mut lines, "end", open_end(end), value_width, plain);
+    if let (Some(low), Some(high)) = (parse_datetime(start), parse_datetime(end)) {
+        push_detail(
+            &mut lines,
+            "span",
+            &format_range_span(high - low),
+            value_width,
+            plain,
+        );
+    }
+    push_detail(
+        &mut lines,
+        "enabled",
+        if rule.enabled { "true" } else { "false" },
+        value_width,
+        plain,
+    );
+    push_detail(
+        &mut lines,
+        "edit",
+        "Enter reopens the picker",
+        value_width,
+        plain,
+    );
+    lines
+}
+
+/// How an omitted end of a range reads in the detail panel.
+fn open_end(bound: &str) -> &str {
+    if bound.is_empty() {
+        "(open)"
+    } else {
+        bound
+    }
+}
+
 fn filter_detail_lines(rule: &FilterRule, width: usize) -> Vec<Line<'static>> {
     let value_width = width.saturating_sub(DETAIL_LABEL_WIDTH + 1).max(8);
     let plain = Style::default();
@@ -4632,6 +6648,18 @@ fn crop(text: &str, start: usize, width: usize) -> String {
     text.chars().skip(start).take(width).collect()
 }
 
+/// Clip a path from the *left*. `…/microstrategy/Tech/log-scouter` says which folder you
+/// are in; the first 60 characters of `/var/lib/jenkins/...` say only where it lives.
+fn truncate_head(text: &str, width: usize) -> String {
+    let length = text.chars().count();
+    if width == 0 || length <= width {
+        return text.to_string();
+    }
+    let mut out = String::from("…");
+    out.extend(text.chars().skip(length + 1 - width));
+    out
+}
+
 /// A signed, human-scaled time offset. Padded to the timestamp column's width by the
 /// caller, so turning elapsed mode on never shifts the columns behind it.
 fn format_elapsed(delta: ChronoDuration) -> String {
@@ -4665,7 +6693,15 @@ fn timestamp_column(
     elapsed_from: Option<NaiveDateTime>,
 ) -> String {
     let Some(origin) = elapsed_from else {
-        return file.get_field(entry, "timestamp");
+        let field = file.get_field(entry, "timestamp");
+        if !field.trim().is_empty() {
+            return field;
+        }
+        // A schema with no timestamp field still shows the time sniffed off the line.
+        return file
+            .timestamp(entry)
+            .map(|stamp| stamp.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+            .unwrap_or_default();
     };
     match file.timestamp(entry) {
         Some(stamp) => format_elapsed(stamp - origin),
@@ -4782,14 +6818,17 @@ fn centered_rect(width: u16, height: u16, root: Rect) -> Rect {
 
 fn help_text() -> &'static str {
     "Project/files
-  a add file        o open folder text files    d remove focused file       Ctrl+s save
+  a add file        o browse for a folder       d remove focused file       Ctrl+s save
   S define reusable log schema
+  In the folder browser: j/k or arrows move, Enter opens './' or enters a subfolder,
+                         Right enters, Left/Backspace goes up, '.' shows hidden folders
   e apply/edit this file's schema (schema name, or full format template)
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
   In the sidebar: Space on a log adds/removes it, merging the logs by timestamp
-                  Space on a filter enables/disables it
+                  Space on a filter enables/disables it; Delete removes it
                   Space on a saved search runs it, or clears it if running
                   Enter edits that log's schema, that filter, or that search
+                  Enter on the Time row (or its 'none - t') reopens the time picker
   Enter also jumps to the selected search result
 
 Navigate
@@ -4813,13 +6852,22 @@ Select/copy
 Filter/search
   / search          n/N next/previous match      c context 0/3/10
   f add filter      t time range picker          F clear filters
+  Filters split into Text (as many as you like) and Time (at most one, replaced
+  by each new range rather than intersected with the old)
   T elapsed time from this line (again to restore absolute timestamps)
   H hide like current row
   x export filters  L import filters
   X export schemas  I import schemas (merges; existing names are kept)
   Time range picker presets count back from the newest entry, not from now
+  Moving onto a preset fills Start/End from it; Enter applies what they show
   Filter syntax     [schema=\"name\"] field op [include|exclude] value
+  In the hide menu: every field shows this line's value; a field's own key hides by it
+                    at once, Space picks several, Enter ANDs the picks into one regex;
+                    Tab switches the whole menu between hide and keep-only
   H with several lines selected derives a regex shared by them all
+  H again in the hide menu derives one from the single current line
+  In the pattern popup: Up/Down pick a template, greediest first, each with the
+                        rows it matches; Tab flips hide/keep; the header counts both
   Filters apply to the whole project and are saved automatically
   x/L default to ~/.log-scouter/filters (any path works)
   Search opens a bottom matches panel; click a match or focus it and press Enter
@@ -4830,6 +6878,15 @@ Layout
   Detail panel (left, bottom) shows the selected line or project item details
   A star marks files open in a pane, enabled filters, and the running search
   Quitting records the panes, their logs and their searches; reopening restores them
+
+AI assistant
+  A open the AI chat panel (bottom left); type a question and Enter to ask
+  It can inspect the logs and apply filters, searches, and time ranges for you;
+  the panels update as it works, and each action is noted in the transcript
+  Esc cancels a reply in flight, then leaves the panel; Up/Down scroll the transcript
+  Keys come from the environment: OPENAI_API_KEY / ANTHROPIC_API_KEY / DEEPSEEK_API_KEY
+  /key <api-key> sets the key here (session only); /provider openai|anthropic|deepseek,
+  /model <name>, /clear are the other chat commands
 
 Log schema
   <field> is required, <field?> is optional and may be missing from a line
@@ -4852,6 +6909,7 @@ Press any key to close."
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::extractor::{DEFAULT_EXTRACTOR_NAME, GENERIC_EXTRACTOR_NAME};
     use ratatui::backend::TestBackend;
 
     const LONG_MESSAGE: &str =
@@ -4957,6 +7015,167 @@ mod tests {
             .collect();
         std::fs::write(&log, body).unwrap();
         boot(Project::load(root), &log)
+    }
+
+    // ---- AI assistant ----------------------------------------------------------------
+
+    use crate::ai::message::{Assistant, ToolCall};
+    use crate::ai::AgentEvent;
+
+    /// An assistant reply carrying one tool call.
+    fn tool_call_event(generation: u64, name: &str, args: serde_json::Value) -> AgentEvent {
+        AgentEvent {
+            generation,
+            result: Ok(Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: name.into(),
+                    arguments: args,
+                }],
+            }),
+        }
+    }
+
+    fn text_event(generation: u64, text: &str) -> AgentEvent {
+        AgentEvent {
+            generation,
+            result: Ok(Assistant {
+                text: text.into(),
+                tool_calls: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn ai_read_tools_report_the_focused_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        // count_matches uses the same query language as the search box.
+        let count = app
+            .dispatch_ai_tool("count_matches", &serde_json::json!({"query": "queued"}))
+            .unwrap();
+        assert!(count.starts_with("5 of 5"), "{count}");
+        let none = app
+            .dispatch_ai_tool("count_matches", &serde_json::json!({"query": "nope"}))
+            .unwrap();
+        assert!(none.starts_with("0 of 5"), "{none}");
+
+        // level_breakdown sums to the entry count.
+        let levels = app
+            .dispatch_ai_tool("level_breakdown", &serde_json::json!({}))
+            .unwrap();
+        assert!(levels.contains("Trace: 5"), "{levels}");
+
+        // sample_lines returns real log text.
+        let sample = app
+            .dispatch_ai_tool("sample_lines", &serde_json::json!({"count": 2}))
+            .unwrap();
+        assert_eq!(sample.lines().count(), 2);
+        assert!(sample.contains("Distribution Service Trigger"), "{sample}");
+    }
+
+    #[test]
+    fn ai_add_filter_tool_narrows_the_view_and_reports_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        assert_eq!(app.active_view().unwrap().visible.len(), 10);
+
+        let result = app
+            .dispatch_ai_tool(
+                "add_filter",
+                &serde_json::json!({
+                    "field": "level", "op": "equals", "value": "Trace", "action": "exclude"
+                }),
+            )
+            .unwrap();
+        assert!(result.contains("10 -> 0 rows"), "{result}");
+        assert_eq!(app.project.filters.rules.len(), 1);
+        app.finish_work();
+        assert_eq!(app.active_view().unwrap().visible.len(), 0);
+
+        // A bad regex is rejected rather than added.
+        let err = app
+            .dispatch_ai_tool(
+                "add_filter",
+                &serde_json::json!({"field": "message", "op": "regex", "value": "(", "action": "exclude"}),
+            )
+            .unwrap_err();
+        assert!(err.contains("invalid regex"), "{err}");
+        assert_eq!(app.project.filters.rules.len(), 1);
+    }
+
+    /// The whole agentic cycle, driven with scripted replies instead of a live model:
+    /// a tool call runs and asks for a follow-up; a text reply ends the turn.
+    #[test]
+    fn ai_event_loop_runs_tools_then_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.open_ai_chat();
+        // Stand in for a turn already sent: a matching generation, mid-flight.
+        {
+            let ai = app.ai.as_mut().unwrap();
+            ai.generation = 7;
+            ai.turns = 1;
+            ai.pending = true;
+        }
+
+        // A stale reply (wrong generation) is ignored entirely.
+        assert!(!app.apply_ai_event(tool_call_event(1, "level_breakdown", serde_json::json!({}))));
+        assert!(app.ai.as_ref().unwrap().conversation.is_empty());
+
+        // The model asks to hide Trace: the tool runs and a follow-up is requested.
+        let needs_more = app.apply_ai_event(tool_call_event(
+            7,
+            "add_filter",
+            serde_json::json!({"field": "level", "op": "equals", "value": "Trace", "action": "exclude"}),
+        ));
+        assert!(needs_more, "a tool call should ask for another turn");
+        assert_eq!(app.project.filters.rules.len(), 1);
+        app.finish_work();
+        assert_eq!(app.active_view().unwrap().visible.len(), 0);
+        // The conversation now has the assistant turn and the tool result turn.
+        let ai = app.ai.as_ref().unwrap();
+        assert_eq!(ai.conversation.len(), 2);
+        assert!(matches!(ai.conversation[1].role, crate::ai::Role::Tool));
+        assert!(ai
+            .transcript
+            .iter()
+            .any(|line| matches!(line, ChatLine::Action(_))));
+
+        // A plain text reply ends the turn.
+        let needs_more = app.apply_ai_event(text_event(7, "Hidden the Trace noise."));
+        assert!(!needs_more);
+        let ai = app.ai.as_ref().unwrap();
+        assert!(!ai.pending);
+        assert!(ai
+            .transcript
+            .iter()
+            .any(|line| matches!(line, ChatLine::Assistant(text) if text.contains("Trace"))));
+    }
+
+    #[test]
+    fn ai_error_reply_stops_the_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 3);
+        app.open_ai_chat();
+        {
+            let ai = app.ai.as_mut().unwrap();
+            ai.generation = 2;
+            ai.pending = true;
+        }
+        let needs_more = app.apply_ai_event(AgentEvent {
+            generation: 2,
+            result: Err("provider error 401: bad key".into()),
+        });
+        assert!(!needs_more);
+        let ai = app.ai.as_ref().unwrap();
+        assert!(!ai.pending);
+        assert!(ai
+            .transcript
+            .iter()
+            .any(|line| matches!(line, ChatLine::Error(text) if text.contains("401"))));
     }
 
     fn selected_line_numbers(app: &AppState) -> Vec<usize> {
@@ -5092,7 +7311,8 @@ mod tests {
         let mut app = app_with_lines(tmp.path(), 5);
         press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
 
-        let screen = render(&mut app, 100, 30);
+        // Wide enough that the message column is not clipped; the markers are the point.
+        let screen = render(&mut app, 102, 30);
         // Pane rows only -- the Detail panel echoes the message too.
         let rows: Vec<&str> = screen
             .lines()
@@ -5258,11 +7478,13 @@ mod tests {
         press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
         press(&mut app, KeyCode::Char('H'));
 
-        // The popup is prefilled, not applied: the counter token is generalised.
-        let Mode::HidePattern(pattern) = app.mode.clone() else {
+        // The popup is prefilled, not applied: the counter token generalises to its shape,
+        // not to a blanket wildcard.
+        let Mode::HidePattern(prompt) = app.mode.clone() else {
             panic!("expected a HidePattern popup, got {:?}", app.mode);
         };
-        assert_eq!(pattern, r"Distribution\s+Service\s+Trigger:\s+\S+\s+queued");
+        let pattern = prompt.text;
+        assert_eq!(pattern, r"Distribution\s+Service\s+Trigger:\s+\d+\s+queued");
         assert_eq!(
             app.project.filters.rules.len(),
             0,
@@ -5287,7 +7509,7 @@ mod tests {
         let mut app = app_with_lines(tmp.path(), 5);
         press(&mut app, KeyCode::Char(' ')); // select exactly one
         press(&mut app, KeyCode::Char('H'));
-        assert!(matches!(app.mode, Mode::HideChoice));
+        assert!(matches!(app.mode, Mode::HideChoice(_)));
     }
 
     #[test]
@@ -5341,6 +7563,205 @@ mod tests {
         assert_eq!(app.project.filters.rules[0].field, "message");
     }
 
+    fn hide_menu(app: &AppState) -> HideMenu {
+        let Mode::HideChoice(menu) = app.mode.clone() else {
+            panic!("expected the hide menu, got {:?}", app.mode);
+        };
+        menu
+    }
+
+    #[test]
+    fn field_value_preview_shows_the_first_three_words() {
+        assert_eq!(field_value_preview(""), "(empty)");
+        assert_eq!(field_value_preview("   "), "(empty)");
+        assert_eq!(field_value_preview("Trace"), "Trace");
+        assert_eq!(field_value_preview("a b c"), "a b c");
+        assert_eq!(field_value_preview("a b c d"), "a b c …");
+    }
+
+    /// The menu names each field *and* what the targeted line holds in it.
+    #[test]
+    fn the_hide_menu_shows_the_value_of_every_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        press(&mut app, KeyCode::Char('H'));
+        let menu = hide_menu(&app);
+        assert_eq!(menu.fields[6], ("log_level".into(), "Trace".into()));
+        assert_eq!(menu.fields[7], ("error_code".into(), String::new()));
+        assert_eq!(
+            menu.fields[13],
+            (
+                "message".into(),
+                "Distribution Service Trigger: 0 queued".into()
+            )
+        );
+
+        let screen = render(&mut app, 110, 34);
+        assert!(screen.contains("7  log_level      Trace"), "{screen}");
+        assert!(screen.contains("8  error_code     (empty)"), "{screen}");
+        // A long value is cut to its first three words.
+        assert!(
+            screen.contains("d  message        Distribution Service Trigger: …"),
+            "{screen}"
+        );
+    }
+
+    /// Space picks fields; Enter turns two or more of them into one positional regex.
+    #[test]
+    fn picking_two_fields_ands_them_into_one_regex_over_the_raw_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("mixed.log");
+        std::fs::write(
+            &log,
+            "2026-06-16 10:09:01.000 [HOST:h][SERVER:S][PID:5][THR:9][Kernel][Trace][UID:0][SID:0][OID:0][D.cpp:1] kernel trace\n\
+             2026-06-16 10:09:02.000 [HOST:h][SERVER:S][PID:5][THR:9][Kernel][Error][UID:0][SID:0][OID:0][D.cpp:2] kernel error\n\
+             2026-06-16 10:09:03.000 [HOST:h][SERVER:S][PID:5][THR:9][Net][Trace][UID:0][SID:0][OID:0][D.cpp:3] net trace\n",
+        )
+        .unwrap();
+        let mut app = boot(Project::load(tmp.path()), &log);
+        assert_eq!(app.active_view().unwrap().visible.len(), 3);
+
+        press(&mut app, KeyCode::Char('H'));
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down); // log_module
+        }
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Down); // log_level
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(hide_menu(&app).chosen().len(), 2);
+
+        let screen = render(&mut app, 110, 34);
+        assert!(screen.contains("all 2 picked fields"), "{screen}");
+
+        press(&mut app, KeyCode::Enter);
+        let prompt = hide_prompt(&app);
+        assert_eq!(prompt.field, "raw");
+        assert!(
+            prompt.candidates.is_empty(),
+            "a combined regex has no ladder"
+        );
+        assert_eq!(
+            app.status,
+            "hide pattern from 2 fields: log_module and log_level"
+        );
+        // Only the line that is Kernel *and* Trace: neither field alone would do.
+        assert_eq!(app.hide_pattern_preview(&prompt.text, "raw").matched, 1);
+
+        press(&mut app, KeyCode::Enter);
+        let rule = &app.project.filters.rules[0];
+        assert_eq!((rule.field.as_str(), rule.op.as_str()), ("raw", "regex"));
+        assert_eq!(app.active_view().unwrap().visible.len(), 2);
+    }
+
+    /// One pick stays an `equals` rule: it reads better, and it holds on a line the
+    /// schema cannot fully parse.
+    #[test]
+    fn picking_one_field_stays_an_equals_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        press(&mut app, KeyCode::Char('H'));
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Down); // log_level
+        }
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.status, "hide rule added");
+        let rule = &app.project.filters.rules[0];
+        assert_eq!(rule.field, "log_level");
+        assert_eq!(rule.op, "equals");
+        assert_eq!(rule.value, "Trace");
+    }
+
+    /// Enter with nothing picked acts on the row under the cursor.
+    #[test]
+    fn enter_with_no_picks_hides_by_the_cursor_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Down); // host
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.project.filters.rules[0].field, "host");
+        assert_eq!(app.project.filters.rules[0].value, "h");
+    }
+
+    /// Tab flips the menu to keep-only, so a single field becomes an `include` rule that
+    /// shows only the matching lines.
+    #[test]
+    fn tab_makes_the_hide_menu_keep_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 6);
+
+        press(&mut app, KeyCode::Char('H'));
+        assert!(matches!(&app.mode, Mode::HideChoice(menu) if menu.exclude));
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(&app.mode, Mode::HideChoice(menu) if !menu.exclude));
+
+        let screen = render(&mut app, 110, 34);
+        assert!(screen.contains("Keep only logs where"), "{screen}");
+        assert!(screen.contains("Tab  switch to hide"), "{screen}");
+
+        // A field's own key now keeps by it.
+        for _ in 0..6 {
+            press(&mut app, KeyCode::Down); // log_level
+        }
+        press(&mut app, KeyCode::Char('7'));
+        assert_eq!(app.status, "keep rule added");
+        let rule = &app.project.filters.rules[0];
+        assert_eq!(
+            (rule.field.as_str(), rule.op.as_str(), rule.action.as_str()),
+            ("log_level", "equals", "include")
+        );
+        // Every line here is Trace, so keeping Trace shows them all -- and none vanish.
+        assert_eq!(app.active_view().unwrap().visible.len(), 6);
+    }
+
+    /// The keep direction carries through the combined-field regex too.
+    #[test]
+    fn tab_then_two_fields_builds_an_include_regex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("mixed.log");
+        std::fs::write(
+            &log,
+            "2026-06-16 10:09:01.000 [HOST:h][SERVER:S][PID:5][THR:9][Kernel][Trace][UID:0][SID:0][OID:0][D.cpp:1] kernel trace\n\
+             2026-06-16 10:09:02.000 [HOST:h][SERVER:S][PID:5][THR:9][Kernel][Error][UID:0][SID:0][OID:0][D.cpp:2] kernel error\n\
+             2026-06-16 10:09:03.000 [HOST:h][SERVER:S][PID:5][THR:9][Net][Trace][UID:0][SID:0][OID:0][D.cpp:3] net trace\n",
+        )
+        .unwrap();
+        let mut app = boot(Project::load(tmp.path()), &log);
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Tab); // keep only
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down); // log_module
+        }
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Down); // log_level
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+
+        let prompt = hide_prompt(&app);
+        assert!(!prompt.exclude, "the keep direction was lost");
+        assert!(
+            app.status.starts_with("keep pattern from 2 fields"),
+            "{}",
+            app.status
+        );
+
+        press(&mut app, KeyCode::Enter);
+        let rule = &app.project.filters.rules[0];
+        assert_eq!(
+            (rule.field.as_str(), rule.action.as_str()),
+            ("raw", "include")
+        );
+        // Only Kernel *and* Trace survives.
+        assert_eq!(app.active_view().unwrap().visible.len(), 1);
+    }
+
     /// The bug behind "select multiple lines, press H does not work": dissimilar
     /// messages produced no pattern and the popup never opened.
     #[test]
@@ -5358,9 +7779,10 @@ mod tests {
         press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
         press(&mut app, KeyCode::Char('H'));
 
-        let Mode::HidePattern(pattern) = app.mode.clone() else {
+        let Mode::HidePattern(prompt) = app.mode.clone() else {
             panic!("expected a HidePattern popup, got {:?}", app.mode);
         };
+        let pattern = prompt.text;
         // No shared template, so it matches the two lines literally rather than
         // generalising into something that would hide the file.
         assert_eq!(pattern, "(?:alpha beta|gamma delta)");
@@ -5377,10 +7799,255 @@ mod tests {
     fn an_invalid_edited_hide_pattern_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_lines(tmp.path(), 5);
-        app.open_input(Mode::HidePattern("(unclosed".to_string()));
+        app.open_input(Mode::HidePattern(PatternPrompt::new("(unclosed", true)));
         press(&mut app, KeyCode::Enter);
         assert!(app.status.starts_with("invalid regex:"), "{}", app.status);
         assert!(app.project.filters.rules.is_empty());
+    }
+
+    fn hide_prompt(app: &AppState) -> PatternPrompt {
+        let Mode::HidePattern(prompt) = app.mode.clone() else {
+            panic!("expected a HidePattern popup, got {:?}", app.mode);
+        };
+        prompt
+    }
+
+    /// `H` offers the whole ladder, ranked by what each rung actually takes out here.
+    #[test]
+    fn the_hide_popup_ranks_its_templates_by_the_rows_they_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('H'));
+        let prompt = hide_prompt(&app);
+
+        // Greediest first. Every rung but `exact` generalises the counter, so all ten
+        // rows fall to them; ties break towards the shorter regex.
+        let ladder: Vec<(&str, usize)> = prompt
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.option.name, candidate.matched))
+            .collect();
+        assert_eq!(
+            ladder,
+            [
+                ("prefix", 10),
+                ("loose", 10),
+                ("wildcard", 10),
+                ("typed", 10),
+                ("exact", 2),
+            ]
+        );
+        assert_eq!((prompt.scanned, prompt.total), (10, 10));
+        assert!(!prompt.capped());
+
+        // It opens on `typed` -- the template `H` produced before there was a ladder.
+        assert_eq!(prompt.selected, 3);
+        assert_eq!(
+            prompt.text,
+            r"Distribution\s+Service\s+Trigger:\s+\d+\s+queued"
+        );
+        assert!(!prompt.edited());
+
+        let screen = render(&mut app, 100, 34);
+        assert!(
+            screen.contains("prefix    leading words, then .*"),
+            "{screen}"
+        );
+        assert!(screen.contains("matches 10"), "{screen}");
+        assert!(screen.contains("matches 2"), "{screen}");
+        assert!(screen.contains("Up/Down pick a template"), "{screen}");
+    }
+
+    /// Up and Down walk the ladder, loading each rung into the editable field.
+    #[test]
+    fn up_and_down_step_the_template_ladder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('H'));
+
+        // Down from `typed` reaches the strictest rung: only the two selected lines.
+        press(&mut app, KeyCode::Down);
+        let prompt = hide_prompt(&app);
+        assert_eq!(prompt.selected, 4);
+        assert!(prompt.text.starts_with("(?:"), "{}", prompt.text);
+        assert_eq!(app.input_cursor, prompt.text.chars().count());
+        assert_eq!(app.hide_pattern_preview(&prompt.text, "message").matched, 2);
+
+        // Up three rungs reaches the greediest, and the preview follows.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Up);
+        }
+        let prompt = hide_prompt(&app);
+        assert_eq!(prompt.selected, 1);
+        assert_eq!(prompt.text, r"Distribution.*Service.*Trigger:.*queued");
+        press(&mut app, KeyCode::Up);
+        let prompt = hide_prompt(&app);
+        assert_eq!(prompt.selected, 0);
+        assert_eq!(prompt.text, r"Distribution\s+Service\s+Trigger:.*");
+
+        let screen = render(&mut app, 100, 34);
+        assert!(screen.contains("hides 10 of 10 shown rows"), "{screen}");
+
+        // Up at the top stays put, and Enter commits whatever rung is showing.
+        press(&mut app, KeyCode::Up);
+        assert_eq!(hide_prompt(&app).selected, 0);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.project.filters.rules[0].value,
+            r"Distribution\s+Service\s+Trigger:.*"
+        );
+    }
+
+    /// An edit detaches the field from its rung, and the popup says so.
+    #[test]
+    fn editing_the_pattern_marks_the_rung_as_edited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('H'));
+        assert!(!hide_prompt(&app).edited());
+
+        press(&mut app, KeyCode::Backspace);
+        assert!(hide_prompt(&app).edited());
+        let screen = render(&mut app, 100, 34);
+        assert!(screen.contains("(edited)"), "{screen}");
+
+        // Stepping the ladder discards the edit rather than half-keeping it.
+        press(&mut app, KeyCode::Up);
+        assert!(!hide_prompt(&app).edited());
+    }
+
+    /// The single-line ladder has no `wildcard` rung, but it is still a ladder.
+    #[test]
+    fn a_single_line_pattern_also_offers_a_ladder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press(&mut app, KeyCode::Char('H'));
+        press(&mut app, KeyCode::Char('H'));
+        let prompt = hide_prompt(&app);
+
+        // With one line there is nothing to diff, so `typed` is the only rung that
+        // generalises at all -- and ranking by rows matched puts it on top, where the
+        // strategy names alone would have buried it under `loose` and `prefix`.
+        let ladder: Vec<(&str, usize)> = prompt
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.option.name, candidate.matched))
+            .collect();
+        assert_eq!(
+            ladder,
+            [("typed", 10), ("loose", 1), ("exact", 1), ("prefix", 1)]
+        );
+        assert_eq!(prompt.selected, 0);
+        assert_eq!(
+            prompt.text,
+            r"Distribution\s+Service\s+Trigger:\s+\d+\s+queued"
+        );
+    }
+
+    /// The popup says what the pattern will do before it is allowed to do it.
+    #[test]
+    fn the_hide_pattern_popup_counts_the_rows_it_would_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('H'));
+
+        // The derived pattern generalises the counter, so it covers all ten rows.
+        let preview = app.hide_pattern_preview(
+            r"Distribution\s+Service\s+Trigger:\s+\d+\s+queued",
+            "message",
+        );
+        assert_eq!((preview.matched, preview.total), (10, 10));
+        assert!(!preview.capped());
+        assert_eq!(preview.samples.len(), PATTERN_PREVIEW_SAMPLES);
+        assert_eq!(preview_summary(&preview, true), "hides 10 of 10 shown rows");
+        assert_eq!(
+            preview_summary(&preview, false),
+            "keeps 10 of 10 shown rows"
+        );
+
+        // Narrowing it to one counter narrows the blast radius the popup reports.
+        let preview = app.hide_pattern_preview(r"Trigger:\s+7\s+queued", "message");
+        assert_eq!(preview.matched, 1);
+        assert_eq!(preview.samples, ["Distribution Service Trigger: 7 queued"]);
+
+        let preview = app.hide_pattern_preview("nothing matches this", "message");
+        assert_eq!(preview.matched, 0);
+        assert_eq!(
+            preview_summary(&preview, true),
+            "matches none of the 10 shown rows"
+        );
+
+        // A half-typed regex reports the error instead of a count.
+        let preview = app.hide_pattern_preview("Trigger: (", "message");
+        assert!(preview.error.is_some(), "{preview:?}");
+        assert_eq!(preview.matched, 0);
+
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("hides 10 of 10 shown rows"), "{screen}");
+        assert!(screen.contains("Tab hide/keep"), "{screen}");
+    }
+
+    /// Tab flips the rule's direction without re-deriving the pattern.
+    #[test]
+    fn tab_turns_a_hide_pattern_into_a_keep_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        // Select two lines, but tighten the pattern so it keeps only those two.
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('H'));
+        clear_input(&mut app);
+        type_text(&mut app, r"Trigger:\s+[01]\s+queued");
+
+        press(&mut app, KeyCode::Tab);
+        let Mode::HidePattern(prompt) = app.mode.clone() else {
+            panic!("expected a HidePattern popup, got {:?}", app.mode);
+        };
+        let exclude = prompt.exclude;
+        assert!(!exclude, "Tab did not flip the direction");
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("Keep Pattern"), "{screen}");
+        assert!(screen.contains("keeps 2 of 10 shown rows"), "{screen}");
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status, "keep pattern added");
+        assert_eq!(app.project.filters.rules[0].action, "include");
+        assert_eq!(app.active_view().unwrap().visible.len(), 2);
+    }
+
+    /// `H` twice: the choice menu, then a template derived from the one current line.
+    #[test]
+    fn hide_pattern_can_be_derived_from_a_single_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press(&mut app, KeyCode::Char('H'));
+        assert!(matches!(app.mode, Mode::HideChoice(_)));
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("H  message pattern"), "{screen}");
+
+        press(&mut app, KeyCode::Char('H'));
+        let Mode::HidePattern(prompt) = app.mode.clone() else {
+            panic!("expected a HidePattern popup, got {:?}", app.mode);
+        };
+        let (text, exclude) = (prompt.text, prompt.exclude);
+        assert!(exclude);
+        assert_eq!(app.status, "pattern from 1 line");
+        // The counter is the only volatile token, so the template covers all ten lines.
+        assert_eq!(text, r"Distribution\s+Service\s+Trigger:\s+\d+\s+queued");
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status, "hide pattern added");
+        assert_eq!(app.active_view().unwrap().visible.len(), 0);
     }
 
     fn type_text(app: &mut AppState, text: &str) {
@@ -5553,7 +8220,7 @@ mod tests {
 
     #[test]
     fn sidebar_width_grows_with_the_terminal_but_never_starves_the_panes() {
-        assert_eq!(sidebar_width(100), 34); // narrow: the old fixed width
+        assert_eq!(sidebar_width(100), 36); // narrow: enough for a nested filter row
         assert_eq!(sidebar_width(160), 40);
         assert_eq!(sidebar_width(400), 56); // capped
         assert_eq!(sidebar_width(50), 26); // tiny: panes keep 24 columns
@@ -5832,7 +8499,358 @@ mod tests {
         assert_eq!(rule.action, "include");
         assert_eq!(rule.value, "2026-06-16 10:09:03..2026-06-16 10:09:05");
         assert_eq!(selected_visible_line_numbers(&app), vec![4, 5, 6]);
-        assert!(app.status.starts_with("time range filter added:"));
+        assert!(
+            app.status.starts_with("time range: 2026-06-16 10:09:03"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// A log spanning two hours, one entry a minute, so the presets differ.
+    /// A bracketed line at `HH:MM` on 2026-06-16.
+    fn line_at(hour: u32, minute: u32, tag: &str) -> String {
+        format!(
+            "2026-06-16 {hour:02}:{minute:02}:00.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][x.cpp:1] {tag}\n"
+        )
+    }
+
+    /// "Last 15 minutes" counts back from the newest entry across *all* loaded sources,
+    /// not from the focused pane's. Two files an hour apart, focused on the earlier one:
+    /// the anchor must still be the later file's end.
+    #[test]
+    fn the_time_preset_anchors_to_the_newest_source_not_the_focused_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let early = tmp.path().join("early.log");
+        let late = tmp.path().join("late.log");
+        // early ends 10:00, late ends 11:00.
+        std::fs::write(
+            &early,
+            format!("{}{}", line_at(9, 50, "early a"), line_at(10, 0, "early b")),
+        )
+        .unwrap();
+        std::fs::write(
+            &late,
+            format!("{}{}", line_at(10, 50, "late a"), line_at(11, 0, "late b")),
+        )
+        .unwrap();
+
+        let mut project = Project::load(tmp.path());
+        project.add_file(&early, None);
+        project.add_file(&late, None);
+        let mut app = AppState::new(project);
+        app.queue_initial_loads();
+        app.finish_work();
+
+        // Focus the pane on the earlier file, whose own latest is 10:00.
+        let early_id = app.project.files[0].file_id.clone();
+        app.open_file_in_focused(&early_id);
+        app.finish_work();
+        assert_eq!(
+            AppState::file_time_bounds(&app.project.files[0]).unwrap().1,
+            parse_datetime("2026-06-16 10:00:00").unwrap(),
+        );
+
+        // Open the picker and take "Last 15 minutes" (the top preset).
+        press(&mut app, KeyCode::Char('t'));
+        while !matches!(&app.mode, Mode::TimePicker(picker) if picker.row == 0) {
+            press(&mut app, KeyCode::Up);
+        }
+        press(&mut app, KeyCode::Enter);
+
+        // 10:45..11:00, anchored to the later file -- not 09:45..10:00.
+        assert_eq!(
+            app.project.filters.time_rule().unwrap().value,
+            "2026-06-16 10:45:00.000..2026-06-16 11:00:00.000"
+        );
+    }
+
+    fn app_spanning_two_hours(root: &std::path::Path) -> AppState {
+        let log = root.join("span.log");
+        let body: String = (0..120)
+            .map(|i| {
+                format!(
+                    "2026-06-16 {:02}:{:02}:00.000 [HOST:h][SERVER:S][PID:5][THR:9][Kernel][Trace][UID:0][SID:0][OID:0][D.cpp:{i}] entry {i}\n",
+                    9 + i / 60,
+                    i % 60
+                )
+            })
+            .collect();
+        std::fs::write(&log, body).unwrap();
+        boot(Project::load(root), &log)
+    }
+
+    /// The reported bug: switching from `Last 1 hour` to `Last 15 minutes` left the view
+    /// showing the hour. Highlighting a preset did not fill Start and End, and Enter
+    /// commits those fields -- so it silently reapplied the range already in force.
+    #[test]
+    fn highlighting_a_preset_is_what_enter_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_spanning_two_hours(tmp.path());
+        assert_eq!(app.active_view().unwrap().visible.len(), 120);
+
+        // `t` opens on "Last 1 hour" (the default preset); Enter applies it.
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_view().unwrap().visible.len(), 61);
+
+        // Reopen on that range, walk up to "Last 15 minutes", and press Enter. No Space.
+        press(&mut app, KeyCode::Char('t'));
+        while !matches!(&app.mode, Mode::TimePicker(picker) if picker.row == 0) {
+            press(&mut app, KeyCode::Up);
+        }
+        let Mode::TimePicker(picker) = app.mode.clone() else {
+            panic!("expected the time picker, got {:?}", app.mode);
+        };
+        assert_eq!(TIME_PRESETS[picker.row].0, "Last 15 minutes");
+        // The fields already show the highlighted preset, so they cannot lie about it.
+        assert_eq!(picker.start, "2026-06-16 10:44:00.000");
+        assert_eq!(picker.end, "2026-06-16 10:59:00.000");
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_view().unwrap().visible.len(), 16);
+        assert_eq!(
+            app.project.filters.time_rule().unwrap().value,
+            "2026-06-16 10:44:00.000..2026-06-16 10:59:00.000"
+        );
+        assert_eq!(
+            app.project.filters.rules.len(),
+            1,
+            "a second range was added"
+        );
+    }
+
+    /// Moving off the End field must not wrap round onto a preset and overwrite the
+    /// range that was just typed there.
+    #[test]
+    fn the_picker_rows_clamp_rather_than_wrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_spanning_two_hours(tmp.path());
+
+        press(&mut app, KeyCode::Char('t'));
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Down); // onto End, then try to fall off it
+        }
+        press_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        for ch in "2026-06-16 09:30:00".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Down);
+
+        let Mode::TimePicker(picker) = app.mode.clone() else {
+            panic!("expected the time picker, got {:?}", app.mode);
+        };
+        assert_eq!(picker.row, TimePicker::END_ROW, "Down wrapped off the end");
+        assert_eq!(picker.end, "2026-06-16 09:30:00", "the typed end was lost");
+
+        // And Up off the first preset stays on it.
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Up);
+        }
+        let Mode::TimePicker(picker) = app.mode.clone() else {
+            panic!("expected the time picker");
+        };
+        assert_eq!(picker.row, 0);
+    }
+
+    /// Position of the first sidebar row of a given kind.
+    fn sidebar_row(app: &AppState, want: &str) -> usize {
+        app.sidebar_items()
+            .iter()
+            .position(|item| match (item, want) {
+                (SidebarItem::TimeFilter { .. }, "time") => true,
+                (SidebarItem::Filter { .. }, "text") => true,
+                (SidebarItem::Hint(label), "no-time") => label.trim() == "none - t",
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no {want} row in {:?}", app.sidebar_items()))
+    }
+
+    fn set_time_range(app: &mut AppState, start: &str, end: &str) {
+        press(app, KeyCode::Char('t'));
+        if let Mode::TimePicker(picker) = &mut app.mode {
+            picker.start = start.to_string();
+            picker.end = end.to_string();
+        }
+        press(app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn format_range_span_drops_the_units_it_does_not_need() {
+        let span = |ms: i64| format_range_span(ChronoDuration::milliseconds(ms));
+        assert_eq!(span(2_000), "2s");
+        assert_eq!(span(2_500), "2.500s");
+        assert_eq!(span(900_000), "15m");
+        assert_eq!(span(905_000), "15m05s");
+        assert_eq!(span(3_600_000), "1h");
+        assert_eq!(span(5_400_000), "1h30m");
+        assert_eq!(span(2 * 86_400_000), "2d");
+        assert_eq!(span(2 * 86_400_000 + 3_600_000), "2d01h");
+        assert_eq!(span(-5_000), "0s");
+    }
+
+    #[test]
+    fn a_time_range_reads_as_two_clock_times_when_it_stays_inside_a_day() {
+        let rule = |value: &str| FilterRule::new("timestamp", "range", value, "include");
+        assert_eq!(
+            describe_time_range(&rule("2026-06-16 10:09:03..2026-06-16 10:09:05")),
+            "10:09:03 → 10:09:05  (2s)"
+        );
+        // Crossing midnight brings the date back, on both ends.
+        assert_eq!(
+            describe_time_range(&rule("2026-06-16 23:00:00..2026-06-17 01:00:00")),
+            "06-16 23:00:00 → 06-17 01:00:00  (2h)"
+        );
+        // An open end is spelled out rather than left blank.
+        assert_eq!(
+            describe_time_range(&rule("2026-06-16 10:09:03..")),
+            "from 06-16 10:09:03"
+        );
+        assert_eq!(
+            describe_time_range(&rule("..2026-06-16 10:09:05")),
+            "until 06-16 10:09:05"
+        );
+        // A disabled range says so, and an unparseable one shows what is stored.
+        let mut off = rule("2026-06-16 10:09:03..2026-06-16 10:09:05");
+        off.enabled = false;
+        assert!(describe_time_range(&off).ends_with(" (off)"));
+        assert_eq!(describe_time_range(&rule("junk..junk")), "junk..junk");
+    }
+
+    /// `Filters` holds a `Text` list and a `Time` slot, each with its own rows.
+    #[test]
+    fn the_sidebar_groups_filters_into_text_and_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        // Empty: both sub-sections are present, each with its own hint.
+        let screen = render(&mut app, 110, 30);
+        assert!(screen.contains("Filters"), "{screen}");
+        assert!(screen.contains("  Text"), "{screen}");
+        assert!(screen.contains("    none - f or H"), "{screen}");
+        assert!(screen.contains("  Time"), "{screen}");
+        assert!(screen.contains("    none - t"), "{screen}");
+
+        app.mutate_filters(|filters| {
+            filters.add(FilterRule::new("level", "equals", "Trace", "exclude"))
+        });
+        set_time_range(&mut app, "2026-06-16 10:09:03", "2026-06-16 10:09:05");
+
+        // The time range is not listed among the text filters.
+        let text_rows = app
+            .sidebar_items()
+            .iter()
+            .filter(|item| matches!(item, SidebarItem::Filter { .. }))
+            .count();
+        assert_eq!(text_rows, 1);
+        let screen = render(&mut app, 110, 30);
+        assert!(
+            screen.contains("* exclude level equals 'Trace'"),
+            "{screen}"
+        );
+        assert!(screen.contains("* 10:09:03 → 10:09:05  (2s)"), "{screen}");
+        assert!(
+            !screen.contains("timestamp range"),
+            "raw grammar:\n{screen}"
+        );
+    }
+
+    /// Space on the Time row disables it, like any other filter.
+    #[test]
+    fn space_on_the_time_row_toggles_it_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        set_time_range(&mut app, "2026-06-16 10:09:03", "2026-06-16 10:09:05");
+        assert_eq!(app.active_view().unwrap().visible.len(), 3);
+
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = sidebar_row(&app, "time");
+        press(&mut app, KeyCode::Char(' '));
+
+        assert!(!app.project.filters.rules[0].enabled);
+        assert_eq!(app.active_view().unwrap().visible.len(), 10);
+        // The row's mark flips to `o`; the ` (off)` tail is clipped at this width, and
+        // the label itself carries it.
+        let screen = render(&mut app, 110, 30);
+        assert!(screen.contains("o 10:09:03 → 10:09:05  (2s)"), "{screen}");
+        let SidebarItem::TimeFilter { label, .. } = &app.sidebar_items()[sidebar_row(&app, "time")]
+        else {
+            panic!("expected the time row");
+        };
+        assert!(label.ends_with(" (off)"), "{label}");
+    }
+
+    /// Enter reopens the picker on the range in force, not on a fresh preset.
+    #[test]
+    fn enter_on_the_time_row_reopens_the_picker_on_that_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        set_time_range(&mut app, "2026-06-16 10:09:03", "2026-06-16 10:09:05");
+
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = sidebar_row(&app, "time");
+        press(&mut app, KeyCode::Enter);
+
+        let Mode::TimePicker(picker) = app.mode.clone() else {
+            panic!("expected the time picker, got {:?}", app.mode);
+        };
+        assert_eq!(picker.start, "2026-06-16 10:09:03");
+        assert_eq!(picker.end, "2026-06-16 10:09:05");
+        // On Start, so Space does not overwrite the range with a preset.
+        assert_eq!(picker.row, TimePicker::START_ROW);
+
+        // Narrowing it replaces the rule rather than adding a second one.
+        if let Mode::TimePicker(picker) = &mut app.mode {
+            picker.end = "2026-06-16 10:09:04".to_string();
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.project.filters.rules.len(), 1);
+        assert_eq!(app.active_view().unwrap().visible.len(), 2);
+    }
+
+    /// Enter on the `none - t` hint is the obvious way to make a range.
+    #[test]
+    fn enter_on_the_empty_time_row_opens_the_picker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = sidebar_row(&app, "no-time");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::TimePicker(_)), "{:?}", app.mode);
+    }
+
+    /// Delete drops the row under the cursor, whichever kind of filter it is.
+    #[test]
+    fn delete_removes_the_selected_filter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.mutate_filters(|filters| {
+            filters.add(FilterRule::new("level", "equals", "Trace", "exclude"))
+        });
+        set_time_range(&mut app, "2026-06-16 10:09:03", "2026-06-16 10:09:05");
+        assert_eq!(app.project.filters.rules.len(), 2);
+
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = sidebar_row(&app, "time");
+        press(&mut app, KeyCode::Delete);
+        assert!(
+            app.status.starts_with("filter removed: time range"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.project.filters.time_rule(), None);
+        assert_eq!(app.project.filters.rules.len(), 1);
+
+        app.sidebar_selected = sidebar_row(&app, "text");
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.project.filters.rules.len(), 0);
+        assert_eq!(app.active_view().unwrap().visible.len(), 10);
+
+        // The cursor does not run off the end of the shortened list.
+        assert!(app.sidebar_selected < app.sidebar_items().len());
+        // Delete on a section header is a no-op.
+        app.sidebar_selected = 0;
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.project.filters.rules.len(), 0);
     }
 
     /// Typing into Start must reach the field, not the preset list.
@@ -5963,10 +8981,7 @@ mod tests {
 
         let expected = user_filter_dir().unwrap();
         assert_eq!(app.default_filter_folder_path(), expected);
-        assert_eq!(
-            app.default_filter_folder_input(),
-            "~/.log-scouter/filters"
-        );
+        assert_eq!(app.default_filter_folder_input(), "~/.log-scouter/filters");
         // The prefilled `~` text round-trips back to the same absolute folder.
         assert_eq!(
             app.filter_folder_from_input(&app.default_filter_folder_input()),
@@ -6030,7 +9045,7 @@ mod tests {
         press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
         press(&mut app, KeyCode::Char('H'));
 
-        let Mode::HidePattern(original) = app.mode.clone() else {
+        let Mode::HidePattern(PatternPrompt { text: original, .. }) = app.mode.clone() else {
             panic!("expected HidePattern");
         };
         // Caret starts at the end of the prefilled text.
@@ -6038,7 +9053,7 @@ mod tests {
 
         // Typing appends; Backspace removes; Home/Delete edit the front.
         type_text(&mut app, "XY");
-        let Mode::HidePattern(edited) = app.mode.clone() else {
+        let Mode::HidePattern(PatternPrompt { text: edited, .. }) = app.mode.clone() else {
             panic!("expected HidePattern");
         };
         assert_eq!(edited, format!("{original}XY"));
@@ -6047,7 +9062,7 @@ mod tests {
         press(&mut app, KeyCode::Home);
         assert_eq!(app.input_cursor, 0);
         press(&mut app, KeyCode::Delete);
-        let Mode::HidePattern(edited) = app.mode.clone() else {
+        let Mode::HidePattern(PatternPrompt { text: edited, .. }) = app.mode.clone() else {
             panic!("expected HidePattern");
         };
         assert_eq!(edited, format!("{}X", &original[1..]));
@@ -6190,7 +9205,10 @@ mod tests {
         assert!(app.status.contains("with 2 text files"), "{}", app.status);
         app.finish_work();
 
-        assert_eq!(app.project.root, std::fs::canonicalize(logs.path()).unwrap());
+        assert_eq!(
+            app.project.root,
+            std::fs::canonicalize(logs.path()).unwrap()
+        );
         let names: Vec<&str> = app
             .project
             .files
@@ -6200,6 +9218,173 @@ mod tests {
         assert_eq!(names, ["a.log", "b.txt"]);
         assert!(app.project.files.iter().all(|file| file.loaded));
         assert_eq!(app.active_view().unwrap().visible.len(), 1);
+    }
+
+    /// The rows of the `o` browser, as rendered.
+    fn browser_rows(app: &AppState) -> Vec<String> {
+        let Mode::OpenFolder(browser) = &app.mode else {
+            panic!("expected the folder browser, got {:?}", app.mode);
+        };
+        browser.rows.iter().map(|row| browser.label(row)).collect()
+    }
+
+    fn browser(app: &AppState) -> &FolderBrowser {
+        let Mode::OpenFolder(browser) = &app.mode else {
+            panic!("expected the folder browser, got {:?}", app.mode);
+        };
+        browser
+    }
+
+    #[test]
+    fn o_browses_from_the_project_folder_and_lists_its_subfolders() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("archive")).unwrap();
+        std::fs::create_dir(root.path().join("Nested")).unwrap();
+        std::fs::create_dir(root.path().join(".hidden")).unwrap();
+        std::fs::write(root.path().join("a.log"), "one\n").unwrap();
+        std::fs::write(root.path().join("b.log"), "two\n").unwrap();
+
+        let mut app = AppState::new(Project::new(root.path()));
+        press(&mut app, KeyCode::Char('o'));
+
+        // Sorted case-insensitively, dot-folders hidden, and the current folder counted.
+        assert_eq!(
+            browser_rows(&app),
+            [
+                "./     open this folder",
+                "../    go up",
+                "archive/",
+                "Nested/",
+            ]
+        );
+        assert_eq!(browser(&app).file_count, 2);
+        assert_eq!(browser(&app).selected, 0);
+
+        // `.` reveals what was hidden, and puts the selection back on a known row.
+        press(&mut app, KeyCode::Char('.'));
+        assert!(browser_rows(&app).contains(&".hidden/".to_string()));
+        assert_eq!(browser(&app).selected, 0);
+        press(&mut app, KeyCode::Char('.'));
+        assert_eq!(browser_rows(&app).len(), 4);
+    }
+
+    #[test]
+    fn the_browser_walks_down_into_a_subfolder_and_back_up() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = root.path().join("archive").join("2026-06");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let mut app = AppState::new(Project::new(root.path()));
+        // `Project::new` canonicalises, so compare against what it settled on.
+        let base = app.project.root.clone();
+        let archive = base.join("archive");
+        press(&mut app, KeyCode::Char('o'));
+
+        // Down to `archive/`, then Enter descends rather than opening.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(browser(&app).selected, 2);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.mode, Mode::OpenFolder(_)),
+            "Enter opened a project"
+        );
+        assert_eq!(browser(&app).current, archive);
+        assert_eq!(browser(&app).selected, 0, "a new listing starts at the top");
+        assert_eq!(browser_rows(&app)[2], "2026-06/");
+
+        // Right descends too; Left comes back.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Right);
+        assert_eq!(browser(&app).current, archive.join("2026-06"));
+        assert!(deep.is_dir());
+        press(&mut app, KeyCode::Left);
+        assert_eq!(browser(&app).current, archive);
+
+        // `..` goes up as well, and the browser is still open.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(browser(&app).current, base);
+    }
+
+    /// Enter on the `./` row is the one row that leaves the browser.
+    #[test]
+    fn the_browser_opens_the_folder_it_is_showing() {
+        let start = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let logs = root.path().join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::write(logs.join("a.log"), "2026-06-16 10:00:01.000 INFO alpha\n").unwrap();
+
+        let mut app = AppState::new(Project::new(start.path()));
+        press(&mut app, KeyCode::Char('o'));
+        // The browser starts at the project's own folder.
+        assert_eq!(browser(&app).current, app.project.root);
+        app.mode = Mode::OpenFolder(FolderBrowser::open(root.path().to_path_buf()).unwrap());
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j')); // logs/
+        press(&mut app, KeyCode::Enter); // descend
+        press(&mut app, KeyCode::Enter); // ./ -> open it
+        app.finish_work();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status.contains("with 1 text file"), "{}", app.status);
+        assert_eq!(app.project.root, std::fs::canonicalize(&logs).unwrap());
+        assert_eq!(app.active_view().unwrap().visible.len(), 1);
+    }
+
+    #[test]
+    fn esc_closes_the_browser_without_changing_the_project() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("elsewhere")).unwrap();
+        let mut app = AppState::new(Project::new(root.path()));
+        let before = app.project.root.clone();
+
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Esc);
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.project.root, before);
+    }
+
+    /// A folder the browser cannot read leaves it exactly where it was. Vanishing stands
+    /// in for the permission error, which `root` would not hit.
+    #[test]
+    fn an_unreadable_folder_is_reported_and_does_not_move_the_browser() {
+        let root = tempfile::tempdir().unwrap();
+        let doomed = root.path().join("doomed");
+        std::fs::create_dir(&doomed).unwrap();
+
+        let mut app = AppState::new(Project::new(root.path()));
+        let base = app.project.root.clone();
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(browser_rows(&app)[2], "doomed/");
+
+        // It goes away after the listing was taken, as a folder on a network share might.
+        std::fs::remove_dir(&doomed).unwrap();
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+
+        assert!(app.status.starts_with("could not read"), "{}", app.status);
+        assert!(app.status.contains("doomed"), "{}", app.status);
+        assert_eq!(
+            browser(&app).current,
+            base,
+            "browser moved into a dead folder"
+        );
+    }
+
+    #[test]
+    fn truncate_head_keeps_the_tail_of_a_long_path() {
+        assert_eq!(truncate_head("/a/b/c", 10), "/a/b/c");
+        assert_eq!(truncate_head("/very/long/path", 6), "…/path");
+        assert_eq!(truncate_head("/very/long/path", 0), "/very/long/path");
     }
 
     #[test]
@@ -6326,6 +9511,57 @@ mod tests {
         let labels = file_labels(&app);
         assert!(labels[0].starts_with("* a.log"));
         assert!(labels[1].starts_with("  b.log"), "{:?}", labels[1]);
+    }
+
+    /// End to end, the way the bug was reported: open a folder whose logs are not all in
+    /// the same format, add both to the pane, and read the merged view top to bottom.
+    #[test]
+    fn merging_logs_of_different_formats_orders_them_by_timestamp() {
+        let start = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        std::fs::write(
+            logs.path().join("a.log"),
+            "2026-06-16 10:00:01.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] alpha one\n\
+             2026-06-16 10:00:03.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:2] alpha two\n",
+        )
+        .unwrap();
+        std::fs::write(
+            logs.path().join("b.log"),
+            "2026-06-16 10:00:02.000 INFO beta one\n2026-06-16 10:00:04.000 INFO beta two\n",
+        )
+        .unwrap();
+
+        let mut app = AppState::new(Project::new(start.path()));
+        app.submit_open_folder(logs.path().to_string_lossy().to_string())
+            .unwrap();
+        app.finish_work();
+
+        // Each log is read under a schema that can actually parse it, so neither arrives
+        // as one folded, timestamp-less entry.
+        assert_eq!(app.project.files[0].extractor_name, DEFAULT_EXTRACTOR_NAME);
+        assert_eq!(app.project.files[1].extractor_name, GENERIC_EXTRACTOR_NAME);
+        assert_eq!(app.project.files[1].entries.len(), 2);
+
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = 1; // a.log, already shown
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.status, "merged 2 logs by timestamp, 4 entries");
+
+        let view_id = app.active_view().unwrap().file_id.clone();
+        let merged = app.project.get_file(&view_id).unwrap();
+        let expected = ["alpha one", "beta one", "alpha two", "beta two"];
+        for (entry, want) in merged.entries.iter().zip(expected) {
+            assert!(
+                entry.raw.ends_with(want),
+                "{:?} should end with {want}",
+                entry.raw
+            );
+        }
+
+        // And the pane shows a timestamp for the plain log, sniffed off its own line.
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("2026-06-16 10:00:02.000"), "{screen}");
     }
 
     /// Click the `n`th sidebar row (0 = the "Files" header). Requires a prior render
@@ -6587,11 +9823,13 @@ mod tests {
             .unwrap();
         app.finish_work();
 
-        // The new file is open in the pane and parsed with the bracketed schema, so the
-        // level is empty: the line does not match that format at all.
+        // No schema explains the new file, so it lands on the catch-all: one entry per
+        // line, and an empty level, because that format names no level field.
         let view_file = app.active_view().unwrap().file_id.clone();
         let file = app.project.get_file(&view_file).unwrap();
         assert_eq!(file.display_name, "simple.log");
+        assert_eq!(file.extractor_name, GENERIC_EXTRACTOR_NAME);
+        assert_eq!(file.entries.len(), 1);
         assert_eq!(file.level(&file.entries[0]), "");
 
         // `e` prefills the focused file's current schema.
@@ -6599,10 +9837,7 @@ mod tests {
         let Mode::Extractor(prefill) = app.mode.clone() else {
             panic!("expected the schema popup, got {:?}", app.mode);
         };
-        assert!(
-            prefill.starts_with("Bracketed default | <timestamp> [HOST:"),
-            "{prefill}"
-        );
+        assert!(prefill.starts_with("Generic line | <message>"), "{prefill}");
 
         app.mode = Mode::Normal;
         app.submit_extractor("simple | <timestamp> <level>: <message> | %H:%M:%S".to_string());
@@ -6664,9 +9899,10 @@ mod tests {
             "compact service log"
         );
 
-        // Defining a schema does not implicitly re-parse the focused file.
+        // Defining a schema does not implicitly re-parse the focused file: it keeps the
+        // catch-all it was detected with.
         let file = app.project.get_file(&file_id).unwrap();
-        assert_eq!(file.extractor_name, "Bracketed default");
+        assert_eq!(file.extractor_name, GENERIC_EXTRACTOR_NAME);
         assert_eq!(file.level(&file.entries[0]), "");
 
         // Typing only the schema name in the file schema popup assigns an existing one.
@@ -7125,10 +10361,7 @@ mod tests {
 
         let expected = user_schema_dir().unwrap();
         assert_eq!(app.default_schema_folder_path(), expected);
-        assert_eq!(
-            app.default_schema_folder_input(),
-            "~/.log-scouter/schemas"
-        );
+        assert_eq!(app.default_schema_folder_input(), "~/.log-scouter/schemas");
         assert_eq!(
             app.schema_folder_from_input(&app.default_schema_folder_input()),
             expected
@@ -7154,7 +10387,8 @@ mod tests {
             "compact | <timestamp> <level>: <message> | %H:%M:%S | small",
         );
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.project.extractors.len(), 2);
+        // The two built-ins, plus `compact`.
+        assert_eq!(app.project.extractors.len(), 3);
 
         let folder = tmp.path().join("pack");
         press(&mut app, KeyCode::Char('X'));
@@ -7164,13 +10398,13 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(
             app.status,
-            format!("exported 2 log schema(s) to {}", folder.display())
+            format!("exported 3 log schema(s) to {}", folder.display())
         );
 
-        // A fresh project starts with only the built-in schema.
+        // A fresh project starts with only the built-in schemas.
         let other = tempfile::tempdir().unwrap();
         let mut app2 = app_with_log(other.path());
-        assert_eq!(app2.project.extractors.len(), 1);
+        assert_eq!(app2.project.extractors.len(), 2);
 
         press(&mut app2, KeyCode::Char('I'));
         assert!(matches!(app2.mode, Mode::ImportSchemas(_)));
@@ -7178,10 +10412,10 @@ mod tests {
         type_text(&mut app2, folder.to_str().unwrap());
         press(&mut app2, KeyCode::Enter);
 
-        // "Bracketed default" already existed, so only `compact` is new.
+        // Both built-ins already existed, so only `compact` is new.
         assert_eq!(
             app2.status,
-            "imported 1 log schema(s), skipped 1 already in this project"
+            "imported 1 log schema(s), skipped 2 already in this project"
         );
         assert!(app2.project.extractors.contains_key("compact"));
 

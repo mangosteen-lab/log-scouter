@@ -89,6 +89,18 @@ impl FilterRule {
         self
     }
 
+    /// A range over the timestamp: the "when" filter, which the sidebar keeps in a slot of
+    /// its own because a project only ever wants one answer to that question.
+    pub fn is_time_range(&self) -> bool {
+        self.op == "range" && matches!(self.field.as_str(), "timestamp" | "time" | "ts")
+    }
+
+    /// The two ends of a time range, either of which may be open.
+    pub fn time_bounds(&self) -> (&str, &str) {
+        let (start, end) = self.value.split_once("..").unwrap_or((&self.value, ""));
+        (start.trim(), end.trim())
+    }
+
     pub fn matches(&self, file: &LogFileModel, entry: &LogEntry) -> bool {
         self.applies_to_log_schema(file, entry)
             && self.matches_with(file, entry, self.compile_regex().as_ref())
@@ -275,12 +287,67 @@ impl FilterSet {
         self.prepare().visible(file, entry)
     }
 
+    /// Add a rule, except that a time range replaces the one already there. Two ranges
+    /// over the same field can only ever intersect, and the second one is what the user
+    /// just asked for -- so `set_time` is what "add another time filter" has to mean.
     pub fn add(&mut self, rule: FilterRule) {
+        if rule.is_time_range() {
+            self.set_time(rule);
+            return;
+        }
         self.rules.push(rule);
     }
 
     pub fn clear(&mut self) {
         self.rules.clear();
+    }
+
+    /// Where the single time range lives inside `rules`, if the project has one.
+    pub fn time_index(&self) -> Option<usize> {
+        self.rules.iter().position(FilterRule::is_time_range)
+    }
+
+    pub fn time_rule(&self) -> Option<&FilterRule> {
+        self.time_index().map(|index| &self.rules[index])
+    }
+
+    /// Install the project's one time range, in place of *every* earlier one.
+    ///
+    /// Removing all of them, not just the first, matters because two `include` ranges are
+    /// OR'd -- a stale `10:24..11:24` left beside a new `11:09..11:24` widens the window
+    /// back out, so the user still sees 10:24 lines. It also heals a `project.json` that a
+    /// previous build wrote with several ranges.
+    pub fn set_time(&mut self, rule: FilterRule) {
+        let at = self.time_index().unwrap_or(self.rules.len());
+        self.clear_time();
+        self.rules.insert(at.min(self.rules.len()), rule);
+    }
+
+    pub fn clear_time(&mut self) {
+        self.rules.retain(|rule| !rule.is_time_range());
+    }
+
+    /// Collapse any accumulation of time ranges to the last one -- the most recently
+    /// added, hence the user's latest intent. A no-op once the slot invariant holds, so it
+    /// is safe to run on every load.
+    pub fn dedupe_time_range(&mut self) {
+        let Some(last) = self.rules.iter().rposition(FilterRule::is_time_range) else {
+            return;
+        };
+        let mut index = 0;
+        self.rules.retain(|rule| {
+            let keep = !rule.is_time_range() || index == last;
+            index += 1;
+            keep
+        });
+    }
+
+    /// Every rule that is not the time range, with its index into `rules`.
+    pub fn text_rules(&self) -> impl Iterator<Item = (usize, &FilterRule)> {
+        self.rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| !rule.is_time_range())
     }
 
     pub fn has_enabled_rules(&self) -> bool {
@@ -293,20 +360,121 @@ pub fn hide_like(
     entry: &LogEntry,
     dimension: &str,
     keyword: &str,
+    exclude: bool,
 ) -> FilterRule {
+    let action = if exclude { "exclude" } else { "include" };
     if dimension == "keyword" {
-        return FilterRule::new("message", "contains", keyword, "exclude");
+        return FilterRule::new("message", "contains", keyword, action);
     }
     let value = file.get_field(entry, dimension);
-    FilterRule::new(dimension, "equals", value, "exclude")
+    FilterRule::new(dimension, "equals", value, action)
+}
+
+/// One token's regex, and whether it pins down any literal text. A template of nothing
+/// but wildcards matches far more than the lines it came from, so callers refuse one.
+struct TokenPattern {
+    regex: String,
+    anchored: bool,
+}
+
+/// A test for one value shape, and the regex that matches it.
+type ValueClass = (fn(&str) -> bool, &'static str);
+
+/// Value shapes that vary between two runs of the same log statement without changing
+/// what the statement *says*. Recognising them yields `Session \d+ opened` where a blanket
+/// wildcard would only manage `Session \S+ opened`.
+///
+/// Ordered most specific first: a UUID is also a run of hex, and `1.5` is also a decimal.
+const VALUE_CLASSES: &[ValueClass] = &[
+    (
+        is_uuid,
+        "[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+    ),
+    (is_ipv4, r"\d{1,3}(?:\.\d{1,3}){3}"),
+    (is_prefixed_hex, "0[xX][0-9a-fA-F]+"),
+    (is_integer, r"\d+"),
+    (is_decimal, r"\d+[.,]\d+"),
+    (is_bare_hex, "[0-9a-fA-F]+"),
+    (is_single_quoted, "'[^']*'"),
+    (is_double_quoted, r#""[^"]*""#),
+];
+
+/// Punctuation that clings to a value without being part of it: `id=42,` is a `42`.
+const AFFIX: &[char] = &[
+    ',', ';', ':', '=', '(', ')', '[', ']', '{', '}', '<', '>', '!', '?', '#',
+];
+
+/// One template `H` can offer for a selection, named by the strategy that built it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternOption {
+    pub name: &'static str,
+    pub hint: &'static str,
+    pub pattern: String,
+}
+
+/// Every template the selected messages support, from the loosest strategy to the
+/// strictest. How greedy each one *actually* is depends on the log, not on the strategy,
+/// so the caller measures them against real lines and ranks them by what they match.
+///
+/// Deduplicated: on a selection whose differing token has no value shape, the `wildcard`
+/// and `typed` strategies produce the same regex, and offering it twice teaches nothing.
+pub fn pattern_candidates(messages: &[&str]) -> Vec<PatternOption> {
+    let token_lists = tokenize(messages);
+    if token_lists.is_empty() || token_lists.iter().all(|tokens| tokens.is_empty()) {
+        return Vec::new();
+    }
+
+    let mut options: Vec<PatternOption> = Vec::new();
+    let mut offer = |name, hint, pattern: Option<String>| {
+        let Some(pattern) = pattern else { return };
+        if !options.iter().any(|option| option.pattern == pattern) {
+            options.push(PatternOption {
+                name,
+                hint,
+                pattern,
+            });
+        }
+    };
+
+    offer(
+        "loose",
+        "shared words, .* between",
+        subsequence_pattern(&token_lists),
+    );
+    offer(
+        "prefix",
+        "leading words, then .*",
+        prefix_pattern(&token_lists),
+    );
+    // With one message nothing differs, so `wildcard` would just be the line itself.
+    if token_lists.len() > 1 {
+        offer(
+            "wildcard",
+            r"\S+ where the lines differ",
+            aligned_pattern(&token_lists, false),
+        );
+    }
+    offer(
+        "typed",
+        "value shapes where they differ",
+        aligned_pattern(&token_lists, true),
+    );
+    offer(
+        "exact",
+        "just these lines",
+        Some(literal_alternation(messages)),
+    );
+    options
 }
 
 /// Derive a regex matching every one of `messages`, generalising the parts where they
 /// differ. Always yields a pattern that matches exactly the lines it was given (and
 /// their variants), so pressing `H` on any selection is never a dead end.
 ///
-/// Three strategies, most general first:
-/// 1. Same token count: differing tokens become `\S+`, keeping positions aligned.
+/// This is the template `H` starts on; `pattern_candidates` offers the looser ones
+/// alongside it. Three strategies, most general first:
+/// 1. Same token count: differing tokens collapse to the tightest class that covers them
+///    (`\d+`, a UUID, an IP), or `\S+` when they share no shape. Positions stay aligned.
 /// 2. Enough shared tokens: join the tokens common to all with `.*`.
 /// 3. Otherwise the lines are not variants of one template, so match them literally.
 ///    A near-empty token subsequence like `the` would otherwise hide half the file.
@@ -314,30 +482,13 @@ pub fn common_message_pattern(messages: &[&str]) -> Option<String> {
     if messages.len() < 2 {
         return None;
     }
-
-    let token_lists: Vec<Vec<&str>> = messages
-        .iter()
-        .map(|message| message.split_whitespace().collect())
-        .collect();
+    let token_lists = tokenize(messages);
     if token_lists.iter().all(|tokens| tokens.is_empty()) {
         return None;
     }
 
-    let width = token_lists[0].len();
-    if width > 0 && token_lists.iter().all(|tokens| tokens.len() == width) {
-        let parts: Vec<String> = (0..width)
-            .map(|index| {
-                let first = token_lists[0][index];
-                if token_lists.iter().all(|tokens| tokens[index] == first) {
-                    regex::escape(first)
-                } else {
-                    r"\S+".to_string()
-                }
-            })
-            .collect();
-        if parts.iter().any(|part| part != r"\S+") {
-            return Some(parts.join(r"\s+"));
-        }
+    if let Some(pattern) = aligned_pattern(&token_lists, true) {
+        return Some(pattern);
     }
 
     let shortest = token_lists
@@ -345,26 +496,316 @@ pub fn common_message_pattern(messages: &[&str]) -> Option<String> {
         .map(|tokens| tokens.len())
         .min()
         .unwrap_or(0);
-    if shortest > 0 {
-        let common = token_lists[1..]
+    // Require the shared tokens to carry at least half the shortest message, otherwise
+    // the "template" is mostly wildcard. `pattern_candidates` offers it anyway, but with
+    // a count beside it: there the user can see what it would cost.
+    if shortest > 0 && common_tokens(&token_lists).len() * 2 >= shortest {
+        return subsequence_pattern(&token_lists);
+    }
+    Some(literal_alternation(messages))
+}
+
+/// Generalise a *single* message into a template, for a selection of one line where there
+/// is no second line to diff against. Only tokens with a recognisable value shape give
+/// way; every other word stays literal, so the template still says what the line said.
+pub fn message_template(message: &str) -> Option<String> {
+    let tokens: Vec<&str> = message.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    // Nothing generalised, or nothing survived: the message itself is the pattern.
+    aligned_pattern(&[tokens], true).or_else(|| Some(regex::escape(message.trim())))
+}
+
+fn tokenize<'a>(messages: &[&'a str]) -> Vec<Vec<&'a str>> {
+    messages
+        .iter()
+        .map(|message| message.split_whitespace().collect())
+        .collect()
+}
+
+/// Every message read as the same template, token position by token position. `typed`
+/// picks the tightest class for a differing token; otherwise it becomes `\S+`.
+/// `None` when the messages have different token counts, or when the result would be
+/// nothing but wildcards.
+fn aligned_pattern(token_lists: &[Vec<&str>], typed: bool) -> Option<String> {
+    let width = token_lists.first()?.len();
+    if width == 0 || !token_lists.iter().all(|tokens| tokens.len() == width) {
+        return None;
+    }
+    let lone = token_lists.len() == 1;
+
+    let parts: Vec<TokenPattern> = (0..width)
+        .map(|index| {
+            let column: Vec<&str> = token_lists.iter().map(|tokens| tokens[index]).collect();
+            match (typed, lone) {
+                (true, true) => lone_token_pattern(column[0]),
+                (true, false) => column_pattern(&column),
+                (false, _) => wildcard_column(&column),
+            }
+        })
+        .collect();
+    join_tokens(&parts)
+}
+
+/// The tokens common to every message, in order. `None` shared means no template.
+fn common_tokens<'a>(token_lists: &[Vec<&'a str>]) -> Vec<&'a str> {
+    let Some(first) = token_lists.first() else {
+        return Vec::new();
+    };
+    token_lists[1..].iter().fold(first.clone(), |acc, tokens| {
+        common_subsequence(&acc, tokens)
+    })
+}
+
+fn subsequence_pattern(token_lists: &[Vec<&str>]) -> Option<String> {
+    let common = common_tokens(token_lists);
+    if common.is_empty() {
+        return None;
+    }
+    Some(
+        common
             .iter()
-            .fold(token_lists[0].clone(), |acc, tokens| {
-                common_subsequence(&acc, tokens)
-            });
-        // Require the shared tokens to carry at least half the shortest message,
-        // otherwise the "template" is mostly wildcard.
-        if common.len() * 2 >= shortest {
-            return Some(
-                common
-                    .iter()
-                    .map(|token| regex::escape(token))
-                    .collect::<Vec<_>>()
-                    .join(".*"),
-            );
-        }
+            .map(|token| regex::escape(token))
+            .collect::<Vec<_>>()
+            .join(".*"),
+    )
+}
+
+/// The run of leading tokens every message opens with, then anything. Survives messages
+/// of different lengths, which the aligned strategies cannot.
+fn prefix_pattern(token_lists: &[Vec<&str>]) -> Option<String> {
+    let first = token_lists.first()?;
+    let mut shared = 0;
+    while shared < first.len()
+        && token_lists
+            .iter()
+            .all(|tokens| tokens.get(shared) == first.get(shared))
+    {
+        shared += 1;
+    }
+    if shared == 0 {
+        return None;
+    }
+    let head = first[..shared]
+        .iter()
+        .map(|token| regex::escape(token))
+        .collect::<Vec<_>>()
+        .join(r"\s+");
+    Some(format!("{head}.*"))
+}
+
+/// The regex for one token column when no value shape is wanted: the literal, or `\S+`.
+fn wildcard_column(column: &[&str]) -> TokenPattern {
+    let first = column[0];
+    if column.iter().all(|token| *token == first) {
+        return TokenPattern {
+            regex: regex::escape(first),
+            anchored: true,
+        };
+    }
+    TokenPattern {
+        regex: r"\S+".to_string(),
+        anchored: false,
+    }
+}
+
+/// `\s+` between the token patterns, but only if at least one holds literal text.
+fn join_tokens(parts: &[TokenPattern]) -> Option<String> {
+    if !parts.iter().any(|part| part.anchored) {
+        return None;
+    }
+    Some(
+        parts
+            .iter()
+            .map(|part| part.regex.as_str())
+            .collect::<Vec<_>>()
+            .join(r"\s+"),
+    )
+}
+
+/// The regex for one token position across every selected line.
+fn column_pattern(column: &[&str]) -> TokenPattern {
+    let first = column[0];
+    if column.iter().all(|token| *token == first) {
+        return TokenPattern {
+            regex: regex::escape(first),
+            anchored: true,
+        };
     }
 
-    Some(literal_alternation(messages))
+    // Whole tokens first. `0x800424FB` and `0x8004010C` share the prefix `0x8004`, and
+    // splitting on it would hide the `0x` that makes them hex in the first place.
+    if let Some(class) = value_class(column) {
+        return TokenPattern {
+            regex: class.to_string(),
+            anchored: false,
+        };
+    }
+
+    // `id=1` and `id=2` are not values, but they differ only in a tail that is one.
+    let head = common_prefix_len(column);
+    let tails: Vec<&str> = column.iter().map(|token| &token[head..]).collect();
+    let foot = common_suffix_len(&tails);
+    let cores: Vec<&str> = tails
+        .iter()
+        .map(|tail| &tail[..tail.len() - foot])
+        .collect();
+
+    let Some(class) = value_class(&cores) else {
+        // No shared shape. An affix alone would only over-fit the lines at hand.
+        return TokenPattern {
+            regex: r"\S+".to_string(),
+            anchored: false,
+        };
+    };
+    let prefix = regex::escape(&first[..head]);
+    let suffix = regex::escape(&tails[0][tails[0].len() - foot..]);
+    TokenPattern {
+        anchored: !prefix.is_empty() || !suffix.is_empty(),
+        regex: format!("{prefix}{class}{suffix}"),
+    }
+}
+
+/// The regex for one token of a lone line: the value inside it gives way, the rest stays.
+///
+/// The value is the *longest* tail of the token that has a shape and begins where a value
+/// plausibly could -- at the token's start, or after punctuation. So `retry=4;` yields
+/// `retry=\d+;` while `30s,` is left alone: `s,` is not a value and `30s` is not a shape.
+fn lone_token_pattern(token: &str) -> TokenPattern {
+    let literal = TokenPattern {
+        regex: regex::escape(token),
+        anchored: true,
+    };
+
+    let lead = token.len() - token.trim_start_matches(AFFIX).len();
+    let body = token[lead..].trim_end_matches(AFFIX);
+    if body.is_empty() {
+        return literal;
+    }
+
+    for (offset, _) in body.char_indices() {
+        let core = &body[offset..];
+        // A value starts the token or follows punctuation; `y=1`'s `1` qualifies, `1`
+        // inside `x1` does not.
+        let after_affix = offset == 0 || body[..offset].ends_with(AFFIX);
+        if !after_affix {
+            continue;
+        }
+        let Some(class) = value_class(&[core]) else {
+            continue;
+        };
+        let head = regex::escape(&token[..lead + offset]);
+        let tail = regex::escape(&token[lead + offset + core.len()..]);
+        return TokenPattern {
+            anchored: !head.is_empty() || !tail.is_empty(),
+            regex: format!("{head}{class}{tail}"),
+        };
+    }
+    literal
+}
+
+/// The tightest class covering every value, or `None` when they share no shape.
+fn value_class(values: &[&str]) -> Option<&'static str> {
+    if values.iter().any(|value| value.is_empty()) {
+        return None;
+    }
+    VALUE_CLASSES
+        .iter()
+        .find(|(belongs, _)| values.iter().all(|value| belongs(value)))
+        .map(|(_, class)| *class)
+}
+
+fn is_integer(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_decimal(value: &str) -> bool {
+    match value.split_once(['.', ',']) {
+        Some((whole, fraction)) => is_integer(whole) && is_integer(fraction),
+        None => false,
+    }
+}
+
+fn is_prefixed_hex(value: &str) -> bool {
+    let Some(digits) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A bare hex id such as `800424FB`. Short runs and pure words (`decade`) are excluded:
+/// they are far more likely to be real text than an identifier.
+fn is_bare_hex(value: &str) -> bool {
+    value.len() >= 6
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().any(|byte| byte.is_ascii_digit())
+        && value.bytes().any(|byte| byte.is_ascii_alphabetic())
+}
+
+fn is_uuid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    if groups.len() != 5 {
+        return false;
+    }
+    groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, width)| {
+        group.len() == width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn is_ipv4(value: &str) -> bool {
+    let octets: Vec<&str> = value.split('.').collect();
+    octets.len() == 4
+        && octets.iter().all(|octet| {
+            is_integer(octet) && octet.parse::<u16>().is_ok_and(|number| number <= 255)
+        })
+}
+
+fn is_single_quoted(value: &str) -> bool {
+    value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'')
+}
+
+fn is_double_quoted(value: &str) -> bool {
+    value.len() >= 2 && value.starts_with('"') && value.ends_with('"')
+}
+
+/// Byte length of the longest prefix shared by every value, on a char boundary.
+fn common_prefix_len(values: &[&str]) -> usize {
+    let first = values[0];
+    let mut shared = 0;
+    for (offset, ch) in first.char_indices() {
+        let end = offset + ch.len_utf8();
+        let agrees = values[1..].iter().all(|value| {
+            value.len() >= end && value.is_char_boundary(end) && value[..end] == first[..end]
+        });
+        if !agrees {
+            break;
+        }
+        shared = end;
+    }
+    shared
+}
+
+/// Byte length of the longest suffix shared by every value, on a char boundary.
+fn common_suffix_len(values: &[&str]) -> usize {
+    let first = values[0];
+    let mut shared = 0;
+    for (offset, _) in first.char_indices().rev() {
+        let take = first.len() - offset;
+        let agrees = values[1..].iter().all(|value| {
+            value.len() >= take
+                && value.is_char_boundary(value.len() - take)
+                && value[value.len() - take..] == first[offset..]
+        });
+        if !agrees {
+            break;
+        }
+        shared = take;
+    }
+    shared
 }
 
 /// `(?:one|two)` over the distinct messages, in first-seen order.
