@@ -1,6 +1,9 @@
+use crate::ai::config::AiConfig;
+use crate::ai::message::{ChatMsg, ToolResult};
+use crate::ai::{tools as ai_tools, AgentRequest, AiWorker};
 use crate::core::extractor::{
     export_schemas_to_folder, load_schemas_from_folder, user_schema_dir, Extractor,
-    DEFAULT_TIMESTAMP_FORMAT, BRACKETED_DEFAULT_FORMAT, USER_SCHEMAS_SUBDIR,
+    BRACKETED_DEFAULT_FORMAT, DEFAULT_TIMESTAMP_FORMAT, USER_SCHEMAS_SUBDIR,
 };
 use crate::core::filters::{
     common_message_pattern, expand_tilde, export_filters_to_folder, hide_like,
@@ -39,6 +42,7 @@ enum Focus {
     Sidebar,
     Pane,
     Results,
+    Chat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +54,70 @@ enum SplitMode {
 #[derive(Debug, Clone)]
 struct PaneState {
     view: ViewModel,
+}
+
+/// One rendered line in the chat transcript.
+#[derive(Debug, Clone)]
+enum ChatLine {
+    User(String),
+    Assistant(String),
+    /// A tool the assistant ran, and what it reported.
+    Action(String),
+    Error(String),
+    /// Status text such as "thinking…".
+    Info(String),
+}
+
+/// The AI chat panel: the worker, the conversation the model sees, and what to draw.
+///
+/// `conversation` is the model's view (system + user + assistant + tool turns);
+/// `transcript` is the human's view. They are kept in step but are not the same list --
+/// a tool result is a full turn for the model but a one-line `[ran …]` for the reader.
+struct AiChat {
+    worker: AiWorker,
+    config: AiConfig,
+    /// Keys typed in the chat with `/key`, per provider. Kept in memory only -- they are
+    /// never written to disk, so nothing sensitive lands in `ai.json`.
+    keys: std::collections::HashMap<crate::ai::Provider, String>,
+    conversation: Vec<ChatMsg>,
+    transcript: Vec<ChatLine>,
+    input: String,
+    /// Bumped on every question and on Esc, so a stale reply is ignored.
+    generation: u64,
+    /// A turn is in flight (waiting on the model or running its tools).
+    pending: bool,
+    scroll: usize,
+    /// How many turns this exchange has taken, to stop a runaway tool loop.
+    turns: usize,
+}
+
+/// Cap the tool-calling loop so a confused model cannot spin forever.
+const AI_MAX_TURNS: usize = 12;
+
+impl AiChat {
+    fn new() -> Self {
+        Self {
+            worker: AiWorker::spawn(),
+            config: AiConfig::load(),
+            keys: std::collections::HashMap::new(),
+            conversation: Vec::new(),
+            transcript: Vec::new(),
+            input: String::new(),
+            generation: 0,
+            pending: false,
+            scroll: 0,
+            turns: 0,
+        }
+    }
+
+    /// The key to use for the current provider: one typed with `/key` if present, else the
+    /// environment variable.
+    fn resolved_key(&self) -> Option<String> {
+        self.keys
+            .get(&self.config.provider)
+            .cloned()
+            .or_else(|| self.config.api_key())
+    }
 }
 
 /// Rows the hide-pattern preview will read before it stops counting. Large enough that a
@@ -666,6 +734,9 @@ pub fn run(project: Project) -> anyhow::Result<()> {
     app.queue_initial_loads();
 
     loop {
+        // A reply from the AI worker may have arrived; run any tools it asked for.
+        app.drain_ai_events();
+
         // Long work runs in slices between frames, so the progress bar animates and
         // Esc still gets through. Everything else waits until the work is done.
         if app.work_pending() {
@@ -682,7 +753,14 @@ pub fn run(project: Project) -> anyhow::Result<()> {
         }
 
         terminal.draw(|frame| app.draw(frame))?;
-        if event::poll(Duration::from_millis(100))? {
+        // A chat turn in flight arrives asynchronously, so poll briefly instead of blocking
+        // a whole 100ms -- the "thinking…" state and the reply then land promptly.
+        let poll = if app.ai_busy() {
+            Duration::from_millis(30)
+        } else {
+            Duration::from_millis(100)
+        };
+        if event::poll(poll)? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
@@ -778,6 +856,9 @@ struct AppState {
     /// timestamp, so it cannot be rebuilt until those files have finished loading;
     /// `finish_load` drains this once they have.
     pending_merges: Vec<(usize, Vec<String>)>,
+    /// The AI chat panel. Created lazily on first use so the worker thread and its runtime
+    /// only exist for a session that asks for them.
+    ai: Option<AiChat>,
 }
 
 impl AppState {
@@ -809,6 +890,7 @@ impl AppState {
             progress: None,
             input_cursor: 0,
             pending_merges: Vec::new(),
+            ai: None,
         };
         app.restore_session();
         app
@@ -944,6 +1026,11 @@ impl AppState {
 
     fn work_pending(&self) -> bool {
         !self.work.is_empty()
+    }
+
+    /// True while an AI chat turn is waiting on the model or running its tools.
+    fn ai_busy(&self) -> bool {
+        self.ai.as_ref().map(|ai| ai.pending).unwrap_or(false)
     }
 
     fn cancel_work(&mut self) {
@@ -1318,17 +1405,31 @@ impl AppState {
                 Constraint::Min(1),
             ])
             .split(rows[1]);
-        let detail_height = detail_panel_height(body[0].height);
+        // The chat panel, when open, takes the bottom of the left column, below the detail
+        // panel. It grows when focused so there is room to read and type.
+        let chat_height = self.chat_panel_height(body[0].height);
+        let left = if chat_height > 0 {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(chat_height)])
+                .split(body[0]);
+            self.draw_chat(frame, split[1]);
+            split[0]
+        } else {
+            body[0]
+        };
+
+        let detail_height = detail_panel_height(left.height);
         if detail_height > 0 {
             let column = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(4), Constraint::Length(detail_height)])
-                .split(body[0]);
+                .split(left);
             self.draw_sidebar(frame, column[0]);
             self.draw_detail(frame, column[1]);
         } else {
             self.detail_area = Rect::default();
-            self.draw_sidebar(frame, body[0]);
+            self.draw_sidebar(frame, left);
         }
         self.draw_panes(frame, body[1]);
         if show_results {
@@ -1499,6 +1600,128 @@ impl AppState {
 
     /// Full, word-wrapped content of the selected entry. Log lines are routinely wider
     /// than the pane, so this is where you read one without scrolling sideways.
+    /// Height of the chat panel in the left column, or 0 when it is closed. It gets more of
+    /// the column while focused, so a conversation is comfortable to read.
+    fn chat_panel_height(&self, column_height: u16) -> u16 {
+        if self.ai.is_none() {
+            return 0;
+        }
+        let want = if self.focus == Focus::Chat {
+            column_height.saturating_sub(6)
+        } else {
+            8
+        };
+        // Always leave the sidebar at least a few rows.
+        want.min(column_height.saturating_sub(6))
+    }
+
+    /// The chat transcript above a one-line input. Kept scrolled to the tail unless the
+    /// user has paged up.
+    fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Chat;
+        let pending = self.ai.as_ref().map(|ai| ai.pending).unwrap_or(false);
+        let title = match (focused, pending) {
+            (_, true) => "AI  (thinking…)",
+            (true, false) => "AI  (Enter send · Esc leave)",
+            (false, false) => "AI",
+        };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(if focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            });
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height < 2 {
+            return;
+        }
+
+        let width = inner.width as usize;
+        let transcript_rows = (inner.height as usize).saturating_sub(1);
+
+        // Wrap every transcript line to the panel width, tagging each wrapped row with its
+        // colour, then show the tail (respecting the user's scroll-back).
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if let Some(ai) = &self.ai {
+            for entry in &ai.transcript {
+                let (prefix, style) = match entry {
+                    ChatLine::User(_) => (
+                        "you ",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    ChatLine::Assistant(_) => ("ai  ", Style::default().fg(Color::Cyan)),
+                    ChatLine::Action(_) => ("  » ", Style::default().fg(Color::Green)),
+                    ChatLine::Error(_) => ("  ! ", Style::default().fg(Color::Red)),
+                    ChatLine::Info(_) => ("  · ", Style::default().fg(Color::DarkGray)),
+                };
+                let body = match entry {
+                    ChatLine::User(text)
+                    | ChatLine::Assistant(text)
+                    | ChatLine::Action(text)
+                    | ChatLine::Error(text)
+                    | ChatLine::Info(text) => text,
+                };
+                for (index, chunk) in chunk_chars(&format!("{prefix}{body}"), width)
+                    .into_iter()
+                    .enumerate()
+                {
+                    // Continuation rows line up under the message, not the tag.
+                    let text = if index == 0 {
+                        chunk
+                    } else {
+                        format!("    {}", chunk.trim_start())
+                    };
+                    lines.push(Line::from(Span::styled(text, style)));
+                }
+            }
+        }
+
+        let scroll = self.ai.as_ref().map(|ai| ai.scroll).unwrap_or(0);
+        let max_start = lines.len().saturating_sub(transcript_rows);
+        let start = max_start.saturating_sub(scroll);
+        let shown: Vec<Line<'static>> = lines
+            .into_iter()
+            .skip(start)
+            .take(transcript_rows)
+            .collect();
+
+        let transcript_area = Rect {
+            height: transcript_rows as u16,
+            ..inner
+        };
+        frame.render_widget(Paragraph::new(Text::from(shown)), transcript_area);
+
+        // The input line at the bottom.
+        let input_area = Rect {
+            y: inner.y + transcript_rows as u16,
+            height: 1,
+            ..inner
+        };
+        let input = self.ai.as_ref().map(|ai| ai.input.as_str()).unwrap_or("");
+        // The input scrolls horizontally to keep the caret in view, so a long question is
+        // always visible where you are typing it. Two columns go to the "> " prompt.
+        let field_width = width.saturating_sub(2).max(1);
+        let caret = self.input_cursor;
+        let offset = caret.saturating_sub(field_width.saturating_sub(1));
+        let shown: String = input.chars().skip(offset).take(field_width).collect();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::raw(format!("> {shown}")))),
+            input_area,
+        );
+        if focused {
+            let column = 2 + (caret - offset);
+            frame.set_cursor_position((
+                input_area.x + column.min(width.saturating_sub(1)) as u16,
+                input_area.y,
+            ));
+        }
+    }
+
     fn draw_detail(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .title("Detail")
@@ -2839,6 +3062,17 @@ impl AppState {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        // The chat panel is a focus, not a mode: when it has focus, keystrokes are its
+        // input. `A` from anywhere else opens and focuses it.
+        if self.focus == Focus::Chat {
+            return self.handle_chat_key(key);
+        }
+        if key.code == KeyCode::Char('A') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_ai_chat();
+            self.input_cursor = 0;
+            return Ok(false);
+        }
+
         // Ctrl+<motion> never disturbs the selection, so you can travel to a distant
         // line and Space it in without losing what you already picked.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3045,6 +3279,7 @@ impl AppState {
                 Focus::Sidebar => self.activate_sidebar_item(),
                 Focus::Results => self.jump_to_selected_result(),
                 Focus::Pane => self.open_entry_detail_popup(),
+                Focus::Chat => {}
             },
             _ => {}
         }
@@ -3511,6 +3746,611 @@ impl AppState {
         let label = summarize_time_range(&rule);
         self.mutate_filters(|filters| filters.set_time(rule));
         self.status = format!("time range: {label}");
+    }
+
+    // ---- AI assistant ----------------------------------------------------------------
+
+    /// Open the chat panel and focus it, creating it (and its worker) on first use.
+    fn open_ai_chat(&mut self) {
+        if self.ai.is_none() {
+            self.ai = Some(AiChat::new());
+        }
+        self.focus = Focus::Chat;
+        // A first-run hint about the key, shown only while the transcript is empty.
+        if let Some(ai) = &mut self.ai {
+            if ai.transcript.is_empty() {
+                let provider = ai.config.provider;
+                if ai.resolved_key().is_none() {
+                    ai.transcript.push(ChatLine::Error(format!(
+                        "No API key. Type /key <your-key> here, or set {} in the environment. \
+                         Switch provider with /provider openai|anthropic|deepseek.",
+                        provider.key_var()
+                    )));
+                } else {
+                    ai.transcript.push(ChatLine::Info(format!(
+                        "Ask me to troubleshoot these logs. Using {} ({}).",
+                        provider.label(),
+                        ai.config.model()
+                    )));
+                }
+            }
+        }
+    }
+
+    /// The project context handed to the model as a system prompt. Rebuilt each turn so it
+    /// always reflects the current sources, filters, search, and focused view.
+    fn ai_system_prompt(&self) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "You are a log-troubleshooting assistant embedded in log-scouter, a terminal log \
+             browser. Help the user find and understand problems in their server logs. Use the \
+             tools to inspect the logs and to apply filters, searches, and time ranges on their \
+             behalf; the UI updates as you do. Prefer inspecting (sample_lines, count_matches, \
+             level_breakdown) before changing anything. Keep replies short and concrete.\n\n",
+        );
+        out.push_str(&format!(
+            "Project folder: {}\n",
+            self.project.root.display()
+        ));
+
+        out.push_str("Log sources:\n");
+        let real: Vec<&LogFileModel> = self
+            .project
+            .files
+            .iter()
+            .filter(|file| !file.is_merged())
+            .collect();
+        if real.is_empty() {
+            out.push_str("  (none loaded)\n");
+        } else {
+            for file in real {
+                let state = if !file.error.is_empty() {
+                    format!("error: {}", file.error)
+                } else if file.loaded {
+                    format!("{} entries", file.entries.len())
+                } else {
+                    "loading".to_string()
+                };
+                out.push_str(&format!(
+                    "  - {} [schema {}] {state}\n",
+                    file.display_name, file.extractor_name
+                ));
+            }
+        }
+
+        if let Some((file, view)) = self.active_file_view() {
+            out.push_str(&format!(
+                "\nFocused log: {} — showing {} of {} entries\n",
+                file.display_name,
+                view.visible.len(),
+                file.entries.len()
+            ));
+            if let Some(entry) = file.entries.first() {
+                if let Some(extractor) = file.extractor_for(entry) {
+                    out.push_str(&format!("Fields: {}\n", extractor.field_names.join(", ")));
+                }
+            }
+            if !view.query_text.trim().is_empty() {
+                out.push_str(&format!("Active search: {}\n", view.query_text));
+            }
+        }
+
+        out.push_str("\nFilters:\n");
+        if self.project.filters.rules.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for rule in &self.project.filters.rules {
+                out.push_str(&format!("  - {}\n", rule.describe()));
+            }
+        }
+        out
+    }
+
+    /// Run one tool the model asked for, against the live project. Returns text the model
+    /// reads next, and (as a side effect) mutates the UI through the normal paths.
+    fn dispatch_ai_tool(&mut self, name: &str, args: &serde_json::Value) -> Result<String, String> {
+        let string = |key: &str| {
+            args.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        match name {
+            ai_tools::LIST_SOURCES => Ok(self.ai_list_sources()),
+            ai_tools::LIST_FILTERS => Ok(self.ai_list_filters()),
+            ai_tools::LEVEL_BREAKDOWN => self.ai_level_breakdown(),
+            ai_tools::SAMPLE_LINES => {
+                let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(10);
+                self.ai_sample_lines(count.clamp(1, 50) as usize)
+            }
+            ai_tools::COUNT_MATCHES => self.ai_count_matches(&string("query")),
+            ai_tools::ADD_FILTER => self.ai_add_filter(
+                &string("field"),
+                &string("op"),
+                &string("value"),
+                &string("action"),
+            ),
+            ai_tools::SET_TIME_RANGE => self.ai_set_time_range(&string("start"), &string("end")),
+            ai_tools::SEARCH => {
+                let query = string("query");
+                if query.trim().is_empty() {
+                    return Err("search needs a non-empty query".to_string());
+                }
+                self.submit_search(query.clone());
+                let shown = self.active_view().map(|v| v.visible.len()).unwrap_or(0);
+                Ok(format!("searched for {query:?}; {shown} rows now shown"))
+            }
+            ai_tools::ADD_SOURCE => self.ai_add_source(&string("path")),
+            other => Err(format!("unknown tool: {other}")),
+        }
+    }
+
+    fn ai_list_sources(&self) -> String {
+        let mut out = String::new();
+        for file in self.project.files.iter().filter(|f| !f.is_merged()) {
+            let state = if !file.error.is_empty() {
+                format!("error: {}", file.error)
+            } else if file.loaded {
+                format!("{} entries", file.entries.len())
+            } else {
+                "loading".to_string()
+            };
+            out.push_str(&format!(
+                "{} | schema {} | {state}\n",
+                file.display_name, file.extractor_name
+            ));
+        }
+        if out.is_empty() {
+            "no log sources loaded".to_string()
+        } else {
+            out
+        }
+    }
+
+    fn ai_list_filters(&self) -> String {
+        if self.project.filters.rules.is_empty() {
+            return "no filters applied".to_string();
+        }
+        self.project
+            .filters
+            .rules
+            .iter()
+            .map(|rule| rule.describe())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn ai_sample_lines(&self, count: usize) -> Result<String, String> {
+        let (file, view) = self.active_file_view().ok_or("no log is open")?;
+        let mut out = String::new();
+        for position in 0..view.visible.len().min(count) {
+            if let Some(global) = view.visible.get(position) {
+                if let Some(entry) = file.entries.get(global) {
+                    let line = entry.raw.lines().next().unwrap_or("");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        if out.is_empty() {
+            Ok("the focused view is empty".to_string())
+        } else {
+            Ok(out)
+        }
+    }
+
+    fn ai_count_matches(&self, query: &str) -> Result<String, String> {
+        if query.trim().is_empty() {
+            return Err("count_matches needs a non-empty query".to_string());
+        }
+        let (file, _) = self.active_file_view().ok_or("no log is open")?;
+        let compiled = compile_query(query);
+        let matched = file
+            .entries
+            .iter()
+            .filter(|entry| compiled.matches(file, entry))
+            .count();
+        Ok(format!(
+            "{matched} of {} entries match {query:?}",
+            file.entries.len()
+        ))
+    }
+
+    fn ai_level_breakdown(&self) -> Result<String, String> {
+        let (file, _) = self.active_file_view().ok_or("no log is open")?;
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for entry in &file.entries {
+            let level = file.level(entry);
+            let key = if level.trim().is_empty() {
+                "(none)".to_string()
+            } else {
+                level
+            };
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        if counts.is_empty() {
+            return Ok("no entries".to_string());
+        }
+        Ok(counts
+            .into_iter()
+            .map(|(level, n)| format!("{level}: {n}"))
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn ai_add_filter(
+        &mut self,
+        field: &str,
+        op: &str,
+        value: &str,
+        action: &str,
+    ) -> Result<String, String> {
+        if field.trim().is_empty() || value.is_empty() {
+            return Err("add_filter needs a field and a value".to_string());
+        }
+        if !matches!(op, "equals" | "contains" | "regex") {
+            return Err(format!(
+                "op must be equals, contains, or regex (got {op:?})"
+            ));
+        }
+        if !matches!(action, "exclude" | "include") {
+            return Err(format!(
+                "action must be exclude or include (got {action:?})"
+            ));
+        }
+        if op == "regex" && regex::Regex::new(value).is_err() {
+            return Err(format!("invalid regex: {value}"));
+        }
+        let before = self.ai_visible_count();
+        let rule = FilterRule::new(field, op, value, action);
+        let describe = rule.describe();
+        self.mutate_filters(|filters| filters.add(rule));
+        let after = self.ai_visible_count();
+        Ok(format!(
+            "added filter [{describe}]; {before} -> {after} rows"
+        ))
+    }
+
+    fn ai_set_time_range(&mut self, start: &str, end: &str) -> Result<String, String> {
+        let start = start.trim();
+        let end = end.trim();
+        if start.is_empty() && end.is_empty() {
+            return Err("set_time_range needs a start, an end, or both".to_string());
+        }
+        if !start.is_empty() && parse_datetime(start).is_none() {
+            return Err(format!("start is not a timestamp: {start}"));
+        }
+        if !end.is_empty() && parse_datetime(end).is_none() {
+            return Err(format!("end is not a timestamp: {end}"));
+        }
+        let before = self.ai_visible_count();
+        self.apply_time_range(format!("{start}..{end}"));
+        let after = self.ai_visible_count();
+        Ok(format!(
+            "time range {start}..{end}; {before} -> {after} rows"
+        ))
+    }
+
+    fn ai_add_source(&mut self, path: &str) -> Result<String, String> {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err("add_source needs a path".to_string());
+        }
+        if !std::path::Path::new(path).is_file() {
+            return Err(format!("no file at {path}"));
+        }
+        let file_id = self.project.add_file(path, None).file_id.clone();
+        self.queue_load(&file_id);
+        let name = self
+            .project
+            .get_file(&file_id)
+            .map(|f| f.display_name.clone())
+            .unwrap_or_default();
+        Ok(format!("added source {name}; it is loading now"))
+    }
+
+    /// Count the entries the current filters admit in the focused log, computed directly so
+    /// it is accurate before the async view recompute catches up.
+    fn ai_visible_count(&self) -> usize {
+        let Some((file, _)) = self.active_file_view() else {
+            return 0;
+        };
+        if !self.project.filters.has_enabled_rules() {
+            return file.entries.len();
+        }
+        let prepared = self.project.filters.prepare();
+        file.entries
+            .iter()
+            .filter(|entry| prepared.visible(file, entry))
+            .count()
+    }
+
+    /// Enter in the chat input: run a slash command, or ask the model a question.
+    fn submit_ai_input(&mut self) {
+        let text = match &self.ai {
+            Some(ai) => ai.input.trim().to_string(),
+            None => return,
+        };
+        if text.is_empty() {
+            return;
+        }
+        if let Some(rest) = text.strip_prefix('/') {
+            self.ai_command(rest);
+            if let Some(ai) = &mut self.ai {
+                ai.input.clear();
+            }
+            self.input_cursor = 0;
+            return;
+        }
+
+        if let Some(ai) = &mut self.ai {
+            ai.transcript.push(ChatLine::User(text.clone()));
+            ai.conversation.push(ChatMsg::user(text));
+            ai.turns = 0;
+            ai.input.clear();
+            // Follow the newest lines as the answer streams in.
+            ai.scroll = 0;
+        }
+        self.input_cursor = 0;
+        self.ai_send_turn();
+    }
+
+    /// A `/`-prefixed line: set the key, pick the provider or model, or clear the chat.
+    fn ai_command(&mut self, rest: &str) {
+        let mut words = rest.split_whitespace();
+        let command = words.next().unwrap_or("");
+        let argument = words.next().unwrap_or("");
+        // The rest of the line verbatim, for a value that keeps its spacing (a key).
+        let tail = rest[command.len()..].trim();
+        let Some(ai) = &mut self.ai else { return };
+        match command {
+            "key" => {
+                if tail.is_empty() {
+                    ai.transcript
+                        .push(ChatLine::Error("usage: /key <api-key>".to_string()));
+                } else {
+                    let provider = ai.config.provider;
+                    ai.keys.insert(provider, tail.to_string());
+                    // Never echo the key back into the transcript.
+                    ai.transcript.push(ChatLine::Info(format!(
+                        "key set for {} (this session only, not saved to disk)",
+                        provider.label()
+                    )));
+                }
+            }
+            "provider" => match crate::ai::Provider::from_label(argument) {
+                Some(provider) => {
+                    ai.config.provider = provider;
+                    let _ = ai.config.save();
+                    let has_key = ai.resolved_key().is_some();
+                    ai.transcript.push(ChatLine::Info(format!(
+                        "provider set to {} ({}){}",
+                        provider.label(),
+                        ai.config.model(),
+                        if has_key {
+                            String::new()
+                        } else {
+                            format!(" — set {}", provider.key_var())
+                        }
+                    )));
+                }
+                None => ai.transcript.push(ChatLine::Error(
+                    "usage: /provider openai|anthropic|deepseek".to_string(),
+                )),
+            },
+            "model" => {
+                if argument.is_empty() {
+                    ai.transcript
+                        .push(ChatLine::Error("usage: /model <name>".to_string()));
+                } else {
+                    ai.config.model = argument.to_string();
+                    let _ = ai.config.save();
+                    ai.transcript
+                        .push(ChatLine::Info(format!("model set to {argument}")));
+                }
+            }
+            "clear" => {
+                ai.conversation.clear();
+                ai.transcript.clear();
+                ai.transcript
+                    .push(ChatLine::Info("conversation cleared".to_string()));
+            }
+            other => ai.transcript.push(ChatLine::Error(format!(
+                "unknown command /{other}; try /key, /provider, /model, /clear"
+            ))),
+        }
+    }
+
+    /// Send the conversation (with a fresh system prompt) to the worker for one completion.
+    fn ai_send_turn(&mut self) {
+        let prompt = self.ai_system_prompt();
+        let Some(ai) = &mut self.ai else { return };
+
+        let Some(key) = ai.resolved_key() else {
+            ai.transcript.push(ChatLine::Error(format!(
+                "No API key. Type /key <your-key>, or set {} in the environment.",
+                ai.config.provider.key_var()
+            )));
+            ai.pending = false;
+            return;
+        };
+
+        let mut conversation = Vec::with_capacity(ai.conversation.len() + 1);
+        conversation.push(ChatMsg::system(prompt));
+        conversation.extend(ai.conversation.iter().cloned());
+
+        ai.generation += 1;
+        ai.turns += 1;
+        ai.pending = true;
+
+        let request = AgentRequest {
+            generation: ai.generation,
+            config: ai.config.clone(),
+            key,
+            conversation,
+            tools: ai_tools::specs(),
+        };
+        if let Err(error) = ai.worker.send(request) {
+            ai.transcript.push(ChatLine::Error(error));
+            ai.pending = false;
+        }
+    }
+
+    /// Drain the worker's replies, run any tools the model asked for, and continue the loop
+    /// until it stops calling tools. Called once per frame.
+    fn drain_ai_events(&mut self) {
+        loop {
+            let event = match &self.ai {
+                Some(ai) if ai.pending => ai.worker.poll(),
+                _ => None,
+            };
+            let Some(event) = event else { break };
+            if self.apply_ai_event(event) {
+                self.ai_send_turn();
+            }
+        }
+    }
+
+    /// Handle one worker reply. Records the assistant turn, runs any tools it asked for
+    /// against the live project, and returns `true` when a follow-up turn should be sent.
+    /// Split out from the drain loop so the whole agentic cycle can be tested by feeding
+    /// scripted events, with no network.
+    fn apply_ai_event(&mut self, event: crate::ai::AgentEvent) -> bool {
+        // A reply to a superseded or cancelled question: drop it.
+        let generation = self.ai.as_ref().map(|ai| ai.generation).unwrap_or(0);
+        if event.generation != generation {
+            return false;
+        }
+
+        let assistant = match event.result {
+            Err(error) => {
+                if let Some(ai) = &mut self.ai {
+                    ai.transcript.push(ChatLine::Error(error));
+                    ai.pending = false;
+                }
+                return false;
+            }
+            Ok(assistant) => assistant,
+        };
+
+        if let Some(ai) = &mut self.ai {
+            ai.conversation.push(ChatMsg::assistant(
+                assistant.text.clone(),
+                assistant.tool_calls.clone(),
+            ));
+            if !assistant.text.trim().is_empty() {
+                ai.transcript
+                    .push(ChatLine::Assistant(assistant.text.clone()));
+            }
+        }
+
+        if assistant.tool_calls.is_empty() {
+            if let Some(ai) = &mut self.ai {
+                ai.pending = false;
+            }
+            return false;
+        }
+
+        let turns = self.ai.as_ref().map(|ai| ai.turns).unwrap_or(0);
+        if turns >= AI_MAX_TURNS {
+            if let Some(ai) = &mut self.ai {
+                ai.transcript
+                    .push(ChatLine::Error("stopped: too many tool calls".to_string()));
+                ai.pending = false;
+            }
+            return false;
+        }
+
+        // Run the tools against the live project (this mutates panels), gather results.
+        let mut results = Vec::with_capacity(assistant.tool_calls.len());
+        for call in &assistant.tool_calls {
+            let (content, line) = match self.dispatch_ai_tool(&call.name, &call.arguments) {
+                Ok(text) => {
+                    let summary = text.lines().next().unwrap_or("").to_string();
+                    (text, format!("ran {}: {summary}", call.name))
+                }
+                Err(error) => (
+                    format!("error: {error}"),
+                    format!("ran {}: error: {error}", call.name),
+                ),
+            };
+            if let Some(ai) = &mut self.ai {
+                ai.transcript.push(ChatLine::Action(line));
+            }
+            results.push(ToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                content,
+            });
+        }
+        if let Some(ai) = &mut self.ai {
+            ai.conversation.push(ChatMsg::tool_results(results));
+        }
+        true
+    }
+
+    /// Keystrokes while the chat panel has focus.
+    fn handle_chat_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel an in-flight turn (drop its reply), else leave the panel.
+                let pending = self.ai.as_ref().map(|ai| ai.pending).unwrap_or(false);
+                if pending {
+                    if let Some(ai) = &mut self.ai {
+                        ai.generation += 1;
+                        ai.pending = false;
+                        ai.transcript.push(ChatLine::Info("cancelled".to_string()));
+                    }
+                } else {
+                    self.focus = Focus::Pane;
+                }
+            }
+            KeyCode::Enter => self.submit_ai_input(),
+            KeyCode::Backspace => {
+                let caret = self.input_cursor;
+                if caret > 0 {
+                    if let Some(ai) = &mut self.ai {
+                        remove_char(&mut ai.input, caret - 1);
+                    }
+                    self.input_cursor = caret - 1;
+                }
+            }
+            KeyCode::Left => self.input_cursor = self.input_cursor.saturating_sub(1),
+            KeyCode::Right => {
+                let len = self
+                    .ai
+                    .as_ref()
+                    .map(|ai| ai.input.chars().count())
+                    .unwrap_or(0);
+                self.input_cursor = (self.input_cursor + 1).min(len);
+            }
+            KeyCode::Up | KeyCode::PageUp => {
+                if let Some(ai) = &mut self.ai {
+                    ai.scroll = ai.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                if let Some(ai) = &mut self.ai {
+                    ai.scroll = ai.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(ai) = &mut self.ai {
+                    ai.input.clear();
+                }
+                self.input_cursor = 0;
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let caret = self.input_cursor;
+                if let Some(ai) = &mut self.ai {
+                    insert_char(&mut ai.input, caret, ch);
+                }
+                self.input_cursor = caret + 1;
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     /// Delete on a sidebar filter row drops that rule. Without it the only way out of a
@@ -4605,6 +5445,8 @@ impl AppState {
                 }
             }
             Focus::Results => self.move_result_selection(delta),
+            // Chat handles its own keys; arrows there scroll the transcript.
+            Focus::Chat => {}
         }
     }
 
@@ -4626,6 +5468,8 @@ impl AppState {
                 }
                 Focus::Pane => Focus::Sidebar,
                 Focus::Results => Focus::Pane,
+                // Tab leaves the chat panel rather than cycling through it.
+                Focus::Chat => Focus::Pane,
             };
             return;
         }
@@ -4647,6 +5491,7 @@ impl AppState {
                 self.focused_pane = 0;
                 Focus::Sidebar
             }
+            Focus::Chat => Focus::Pane,
         };
     }
 
@@ -6034,6 +6879,15 @@ Layout
   A star marks files open in a pane, enabled filters, and the running search
   Quitting records the panes, their logs and their searches; reopening restores them
 
+AI assistant
+  A open the AI chat panel (bottom left); type a question and Enter to ask
+  It can inspect the logs and apply filters, searches, and time ranges for you;
+  the panels update as it works, and each action is noted in the transcript
+  Esc cancels a reply in flight, then leaves the panel; Up/Down scroll the transcript
+  Keys come from the environment: OPENAI_API_KEY / ANTHROPIC_API_KEY / DEEPSEEK_API_KEY
+  /key <api-key> sets the key here (session only); /provider openai|anthropic|deepseek,
+  /model <name>, /clear are the other chat commands
+
 Log schema
   <field> is required, <field?> is optional and may be missing from a line
   An optional field takes the separator in front of it: [<level>][<code?>][UID:<id>]
@@ -6161,6 +7015,167 @@ mod tests {
             .collect();
         std::fs::write(&log, body).unwrap();
         boot(Project::load(root), &log)
+    }
+
+    // ---- AI assistant ----------------------------------------------------------------
+
+    use crate::ai::message::{Assistant, ToolCall};
+    use crate::ai::AgentEvent;
+
+    /// An assistant reply carrying one tool call.
+    fn tool_call_event(generation: u64, name: &str, args: serde_json::Value) -> AgentEvent {
+        AgentEvent {
+            generation,
+            result: Ok(Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: name.into(),
+                    arguments: args,
+                }],
+            }),
+        }
+    }
+
+    fn text_event(generation: u64, text: &str) -> AgentEvent {
+        AgentEvent {
+            generation,
+            result: Ok(Assistant {
+                text: text.into(),
+                tool_calls: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn ai_read_tools_report_the_focused_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        // count_matches uses the same query language as the search box.
+        let count = app
+            .dispatch_ai_tool("count_matches", &serde_json::json!({"query": "queued"}))
+            .unwrap();
+        assert!(count.starts_with("5 of 5"), "{count}");
+        let none = app
+            .dispatch_ai_tool("count_matches", &serde_json::json!({"query": "nope"}))
+            .unwrap();
+        assert!(none.starts_with("0 of 5"), "{none}");
+
+        // level_breakdown sums to the entry count.
+        let levels = app
+            .dispatch_ai_tool("level_breakdown", &serde_json::json!({}))
+            .unwrap();
+        assert!(levels.contains("Trace: 5"), "{levels}");
+
+        // sample_lines returns real log text.
+        let sample = app
+            .dispatch_ai_tool("sample_lines", &serde_json::json!({"count": 2}))
+            .unwrap();
+        assert_eq!(sample.lines().count(), 2);
+        assert!(sample.contains("Distribution Service Trigger"), "{sample}");
+    }
+
+    #[test]
+    fn ai_add_filter_tool_narrows_the_view_and_reports_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        assert_eq!(app.active_view().unwrap().visible.len(), 10);
+
+        let result = app
+            .dispatch_ai_tool(
+                "add_filter",
+                &serde_json::json!({
+                    "field": "level", "op": "equals", "value": "Trace", "action": "exclude"
+                }),
+            )
+            .unwrap();
+        assert!(result.contains("10 -> 0 rows"), "{result}");
+        assert_eq!(app.project.filters.rules.len(), 1);
+        app.finish_work();
+        assert_eq!(app.active_view().unwrap().visible.len(), 0);
+
+        // A bad regex is rejected rather than added.
+        let err = app
+            .dispatch_ai_tool(
+                "add_filter",
+                &serde_json::json!({"field": "message", "op": "regex", "value": "(", "action": "exclude"}),
+            )
+            .unwrap_err();
+        assert!(err.contains("invalid regex"), "{err}");
+        assert_eq!(app.project.filters.rules.len(), 1);
+    }
+
+    /// The whole agentic cycle, driven with scripted replies instead of a live model:
+    /// a tool call runs and asks for a follow-up; a text reply ends the turn.
+    #[test]
+    fn ai_event_loop_runs_tools_then_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.open_ai_chat();
+        // Stand in for a turn already sent: a matching generation, mid-flight.
+        {
+            let ai = app.ai.as_mut().unwrap();
+            ai.generation = 7;
+            ai.turns = 1;
+            ai.pending = true;
+        }
+
+        // A stale reply (wrong generation) is ignored entirely.
+        assert!(!app.apply_ai_event(tool_call_event(1, "level_breakdown", serde_json::json!({}))));
+        assert!(app.ai.as_ref().unwrap().conversation.is_empty());
+
+        // The model asks to hide Trace: the tool runs and a follow-up is requested.
+        let needs_more = app.apply_ai_event(tool_call_event(
+            7,
+            "add_filter",
+            serde_json::json!({"field": "level", "op": "equals", "value": "Trace", "action": "exclude"}),
+        ));
+        assert!(needs_more, "a tool call should ask for another turn");
+        assert_eq!(app.project.filters.rules.len(), 1);
+        app.finish_work();
+        assert_eq!(app.active_view().unwrap().visible.len(), 0);
+        // The conversation now has the assistant turn and the tool result turn.
+        let ai = app.ai.as_ref().unwrap();
+        assert_eq!(ai.conversation.len(), 2);
+        assert!(matches!(ai.conversation[1].role, crate::ai::Role::Tool));
+        assert!(ai
+            .transcript
+            .iter()
+            .any(|line| matches!(line, ChatLine::Action(_))));
+
+        // A plain text reply ends the turn.
+        let needs_more = app.apply_ai_event(text_event(7, "Hidden the Trace noise."));
+        assert!(!needs_more);
+        let ai = app.ai.as_ref().unwrap();
+        assert!(!ai.pending);
+        assert!(ai
+            .transcript
+            .iter()
+            .any(|line| matches!(line, ChatLine::Assistant(text) if text.contains("Trace"))));
+    }
+
+    #[test]
+    fn ai_error_reply_stops_the_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 3);
+        app.open_ai_chat();
+        {
+            let ai = app.ai.as_mut().unwrap();
+            ai.generation = 2;
+            ai.pending = true;
+        }
+        let needs_more = app.apply_ai_event(AgentEvent {
+            generation: 2,
+            result: Err("provider error 401: bad key".into()),
+        });
+        assert!(!needs_more);
+        let ai = app.ai.as_ref().unwrap();
+        assert!(!ai.pending);
+        assert!(ai
+            .transcript
+            .iter()
+            .any(|line| matches!(line, ChatLine::Error(text) if text.contains("401"))));
     }
 
     fn selected_line_numbers(app: &AppState) -> Vec<usize> {
@@ -7966,10 +8981,7 @@ mod tests {
 
         let expected = user_filter_dir().unwrap();
         assert_eq!(app.default_filter_folder_path(), expected);
-        assert_eq!(
-            app.default_filter_folder_input(),
-            "~/.log-scouter/filters"
-        );
+        assert_eq!(app.default_filter_folder_input(), "~/.log-scouter/filters");
         // The prefilled `~` text round-trips back to the same absolute folder.
         assert_eq!(
             app.filter_folder_from_input(&app.default_filter_folder_input()),
@@ -8193,7 +9205,10 @@ mod tests {
         assert!(app.status.contains("with 2 text files"), "{}", app.status);
         app.finish_work();
 
-        assert_eq!(app.project.root, std::fs::canonicalize(logs.path()).unwrap());
+        assert_eq!(
+            app.project.root,
+            std::fs::canonicalize(logs.path()).unwrap()
+        );
         let names: Vec<&str> = app
             .project
             .files
@@ -9346,10 +10361,7 @@ mod tests {
 
         let expected = user_schema_dir().unwrap();
         assert_eq!(app.default_schema_folder_path(), expected);
-        assert_eq!(
-            app.default_schema_folder_input(),
-            "~/.log-scouter/schemas"
-        );
+        assert_eq!(app.default_schema_folder_input(), "~/.log-scouter/schemas");
         assert_eq!(
             app.schema_folder_from_input(&app.default_schema_folder_input()),
             expected

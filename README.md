@@ -72,6 +72,10 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 - **Vim-style navigation.** Supports `j/k`, `gg`, `G`, `[count]j`,
   `[count]G`, paging, and horizontal scroll.
 - **Split panes.** Use `|` for columns and `-` for rows.
+- **AI assistant.** Press `A` for a chat panel that troubleshoots the logs for you — it
+  inspects the sources and drives filters, searches, and time ranges through the same
+  operations you would, iterating until the issue is understood. Works with OpenAI,
+  Anthropic, and DeepSeek; the key comes from the environment.
 
 ## Quick Start
 
@@ -217,6 +221,7 @@ User-level saved searches are not implemented yet.
 | `S` | define a reusable log format |
 | `e` | assign or edit the focused file's log format |
 | `|` / `-` / `w` | split columns / split rows / close pane |
+| `A` | open the AI chat panel (Enter to send, Esc to cancel/leave) |
 | `Tab` / `Shift+Tab` | cycle sidebar, panes, and search results |
 | `Enter` (pane) | open a larger detail popup for the selected log row |
 | `Enter` (results) | jump to selected search result |
@@ -475,6 +480,48 @@ unfinished regex reports its error there rather than a count. On a pane of more 
 Press `Tab` to flip the rule between **hide** (`exclude`) and **keep** (`include`), so the
 same derived pattern serves "drop this noise" and "show me only these". Press Enter to add
 it, saved with the project like any other filter.
+
+## AI Assistant
+
+Press `A` to open a chat panel at the bottom-left, below the Detail panel. Ask it to
+troubleshoot the logs — "why did sessions start timing out?", "hide the noise and show me
+errors in the last 15 minutes" — and it works through the problem using the same operations
+you would:
+
+```text
+┌AI  (Enter send · Esc leave)──────────────────────┐
+│you hide the trace noise and show me errors        │
+│ai  Let me look at the level mix first.            │
+│  » ran level_breakdown: Error: 12, Trace: 903 …   │
+│ai  Trace dominates. Hiding it.                    │
+│  » ran add_filter: exclude level='Trace'; 8,201 → │
+│    3,140 rows                                      │
+│ai  Done. 12 errors remain — want the last 15 min? │
+│>                                                  │
+└───────────────────────────────────────────────────┘
+```
+
+The assistant is given the project's context (folder, sources, their schemas and counts,
+current filters, the focused view) and a set of tools that map onto log-scouter's own
+operations:
+
+- **Inspect** — list sources, list filters, sample lines, count matches for a query, level
+  breakdown.
+- **Act** — add a filter, set a time range, run a search, add a log source.
+
+It runs an **agentic loop**: it calls a tool, sees the result, and keeps going until it has
+an answer — so one question can play out as several steps, with the panels updating live and
+each action noted in the transcript. `Esc` cancels a reply in flight, then leaves the panel;
+`↑`/`↓` scroll the transcript; write actions apply immediately (a removed source still
+confirms).
+
+**Setup.** No key is stored on disk — the assistant reads it from the environment:
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `DEEPSEEK_API_KEY`. If the selected provider's
+variable is unset, the panel says so — you can type `/key <your-key>` right in the chat
+instead (kept in memory for the session, never written to disk). Choose the provider and model from the
+chat with `/provider openai|anthropic|deepseek` and `/model <name>` (saved to
+`~/.log-scouter/ai.json`); `/clear` resets the conversation. `LOGSCOUT_AI_BASE_URL`
+overrides the endpoint for a corporate gateway or a compatible self-hosted model.
 
 ## Opening a Folder
 
