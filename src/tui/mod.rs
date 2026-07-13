@@ -79,6 +79,9 @@ struct AiChat {
     /// Keys typed in the chat with `/key`, per provider. Kept in memory only -- they are
     /// never written to disk, so nothing sensitive lands in `ai.json`.
     keys: std::collections::HashMap<crate::ai::Provider, String>,
+    /// Skills switched on with `/skill`, by name. Their text is appended to the system
+    /// prompt each turn.
+    active_skills: Vec<String>,
     conversation: Vec<ChatMsg>,
     transcript: Vec<ChatLine>,
     input: String,
@@ -100,6 +103,7 @@ impl AiChat {
             worker: AiWorker::spawn(),
             config: AiConfig::load(),
             keys: std::collections::HashMap::new(),
+            active_skills: Vec::new(),
             conversation: Vec::new(),
             transcript: Vec::new(),
             input: String::new(),
@@ -296,6 +300,12 @@ enum Mode {
     /// Enter on a saved search: edit that query in place.
     EditSearch {
         index: usize,
+        text: String,
+    },
+    /// `r` on a log source: give it a short label and description, `label | description`,
+    /// so the assistant and the sidebar can tell what the file is.
+    SourceLabel {
+        file_id: String,
         text: String,
     },
     /// `H` on a single line: hide by one of that line's fields, or by several at once.
@@ -1620,11 +1630,31 @@ impl AppState {
     fn draw_chat(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Chat;
         let pending = self.ai.as_ref().map(|ai| ai.pending).unwrap_or(false);
-        let title = match (focused, pending) {
-            (_, true) => "AI  (thinking…)",
-            (true, false) => "AI  (Enter send · Esc leave)",
-            (false, false) => "AI",
+        // Show which model we talk to and whether it is usable, so the user can see the
+        // provider is configured without sending a message. `no key` means neither the env
+        // var, ai.json, nor a `/key` in this session has supplied one.
+        let model = self
+            .ai
+            .as_ref()
+            .map(|ai| {
+                let status = if ai.resolved_key().is_some() {
+                    String::new()
+                } else {
+                    " · no key".to_string()
+                };
+                format!(
+                    "{} {}{status}",
+                    ai.config.provider.label(),
+                    ai.config.model()
+                )
+            })
+            .unwrap_or_default();
+        let hint = match (focused, pending) {
+            (_, true) => "thinking…",
+            (true, false) => "Enter send · Esc leave",
+            (false, false) => "A to focus",
         };
+        let title = format!("AI · {model} · {hint}");
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -2206,6 +2236,13 @@ impl AppState {
                 "text | \"phrase\" | /regex/ | field=value | after:<ts>",
                 &text,
             ),
+            Mode::SourceLabel { text, .. } => self.draw_input_popup(
+                frame,
+                root,
+                "Label Source",
+                "short label | description   (helps the AI understand this source)",
+                &text,
+            ),
             Mode::HideChoice(menu) => self.draw_hide_choice_popup(frame, root, &menu),
             Mode::HidePattern(prompt) => self.draw_hide_pattern_popup(frame, root, &prompt),
             Mode::EntryDetail { scroll } => self.draw_entry_detail_popup(frame, root, scroll),
@@ -2655,6 +2692,7 @@ impl AppState {
             | Mode::LogSchema(_)
             | Mode::EditFilter { .. }
             | Mode::EditSearch { .. }
+            | Mode::SourceLabel { .. }
             | Mode::HidePattern(_) => 1,
             Mode::HideChoice(_) => 2,
             Mode::EntryDetail { .. } => 3,
@@ -3275,6 +3313,7 @@ impl AppState {
             KeyCode::Char('w') => self.close_active_pane(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('e') => self.open_schema_input(),
+            KeyCode::Char('r') => self.open_source_label(),
             KeyCode::Enter => match self.focus {
                 Focus::Sidebar => self.activate_sidebar_item(),
                 Focus::Results => self.jump_to_selected_result(),
@@ -3369,7 +3408,8 @@ impl AppState {
             | Mode::Extractor(text)
             | Mode::LogSchema(text)
             | Mode::EditFilter { text, .. }
-            | Mode::EditSearch { text, .. } => text.chars().count(),
+            | Mode::EditSearch { text, .. }
+            | Mode::SourceLabel { text, .. } => text.chars().count(),
             Mode::HidePattern(prompt) => prompt.text.chars().count(),
             _ => 0,
         };
@@ -3494,7 +3534,8 @@ impl AppState {
             | Mode::Extractor(input)
             | Mode::LogSchema(input)
             | Mode::EditFilter { text: input, .. }
-            | Mode::EditSearch { text: input, .. } => Some(input),
+            | Mode::EditSearch { text: input, .. }
+            | Mode::SourceLabel { text: input, .. } => Some(input),
             Mode::HidePattern(prompt) => Some(&mut prompt.text),
             _ => None,
         }
@@ -3514,6 +3555,7 @@ impl AppState {
             Mode::LogSchema(text) => self.submit_schema_definition(text),
             Mode::EditFilter { index, text } => self.submit_edit_filter(index, text),
             Mode::EditSearch { index, text } => self.submit_edit_search(index, text),
+            Mode::SourceLabel { file_id, text } => self.submit_source_label(file_id, text),
             Mode::HidePattern(prompt) => {
                 self.submit_hide_pattern(prompt.text, prompt.field, prompt.exclude)
             }
@@ -3762,8 +3804,9 @@ impl AppState {
                 let provider = ai.config.provider;
                 if ai.resolved_key().is_none() {
                     ai.transcript.push(ChatLine::Error(format!(
-                        "No API key. Type /key <your-key> here, or set {} in the environment. \
-                         Switch provider with /provider openai|anthropic|deepseek.",
+                        "No API key. Type /key <your-key> here, set {} in the environment, or \
+                         add \"api_key\" to ~/.log-scouter/ai.json. Switch provider with \
+                         /provider openai|anthropic|deepseek.",
                         provider.key_var()
                     )));
                 } else {
@@ -3811,10 +3854,18 @@ impl AppState {
                 } else {
                     "loading".to_string()
                 };
+                let label = if file.label.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (\"{}\")", file.label)
+                };
                 out.push_str(&format!(
-                    "  - {} [schema {}] {state}\n",
+                    "  - {}{label} [schema {}] {state}\n",
                     file.display_name, file.extractor_name
                 ));
+                if !file.description.is_empty() {
+                    out.push_str(&format!("      note: {}\n", file.description));
+                }
             }
         }
 
@@ -3841,6 +3892,20 @@ impl AppState {
         } else {
             for rule in &self.project.filters.rules {
                 out.push_str(&format!("  - {}\n", rule.describe()));
+            }
+        }
+
+        // Any skills the user has switched on with `/skill`, re-read each turn so edits to
+        // the file take effect without reopening the chat.
+        if let Some(ai) = &self.ai {
+            for name in &ai.active_skills {
+                if let Some(skill) = crate::ai::skills::load(name) {
+                    out.push_str(&format!(
+                        "\n--- Skill: {} ---\n{}\n",
+                        skill.name,
+                        skill.body.trim()
+                    ));
+                }
             }
         }
         out
@@ -3895,8 +3960,18 @@ impl AppState {
             } else {
                 "loading".to_string()
             };
+            let label = if file.label.is_empty() {
+                String::new()
+            } else {
+                format!(" | label \"{}\"", file.label)
+            };
+            let note = if file.description.is_empty() {
+                String::new()
+            } else {
+                format!(" | {}", file.description)
+            };
             out.push_str(&format!(
-                "{} | schema {} | {state}\n",
+                "{} | schema {} | {state}{label}{note}\n",
                 file.display_name, file.extractor_name
             ));
         }
@@ -4150,6 +4225,29 @@ impl AppState {
                         .push(ChatLine::Info(format!("model set to {argument}")));
                 }
             }
+            "skills" => Self::list_skills_into(ai),
+            "skill" => {
+                if argument.is_empty() {
+                    Self::list_skills_into(ai);
+                } else {
+                    let available = crate::ai::skills::list();
+                    if !available.iter().any(|skill| skill.name == argument) {
+                        ai.transcript.push(ChatLine::Error(format!(
+                            "no skill named {argument:?}; /skills lists what is available"
+                        )));
+                    } else if let Some(pos) =
+                        ai.active_skills.iter().position(|name| name == argument)
+                    {
+                        ai.active_skills.remove(pos);
+                        ai.transcript
+                            .push(ChatLine::Info(format!("skill {argument:?} off")));
+                    } else {
+                        ai.active_skills.push(argument.to_string());
+                        ai.transcript
+                            .push(ChatLine::Info(format!("skill {argument:?} on")));
+                    }
+                }
+            }
             "clear" => {
                 ai.conversation.clear();
                 ai.transcript.clear();
@@ -4157,8 +4255,37 @@ impl AppState {
                     .push(ChatLine::Info("conversation cleared".to_string()));
             }
             other => ai.transcript.push(ChatLine::Error(format!(
-                "unknown command /{other}; try /key, /provider, /model, /clear"
+                "unknown command /{other}; try /key, /provider, /model, /skill, /skills, /clear"
             ))),
+        }
+    }
+
+    /// List the skills the user has authored, marking any that are switched on. A no-op-ish
+    /// helper shared by `/skills` and a bare `/skill`.
+    fn list_skills_into(ai: &mut AiChat) {
+        let available = crate::ai::skills::list();
+        if available.is_empty() {
+            ai.transcript.push(ChatLine::Info(
+                "no skills found. Create one at ~/.log-scouter/skills/<name>.md".to_string(),
+            ));
+            return;
+        }
+        ai.transcript.push(ChatLine::Info(
+            "skills (/skill <name> to toggle):".to_string(),
+        ));
+        for skill in available {
+            let mark = if ai.active_skills.contains(&skill.name) {
+                "[on] "
+            } else {
+                ""
+            };
+            let desc = if skill.description.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", skill.description)
+            };
+            ai.transcript
+                .push(ChatLine::Info(format!("  {mark}{}{desc}", skill.name)));
         }
     }
 
@@ -4169,7 +4296,8 @@ impl AppState {
 
         let Some(key) = ai.resolved_key() else {
             ai.transcript.push(ChatLine::Error(format!(
-                "No API key. Type /key <your-key>, or set {} in the environment.",
+                "No API key. Type /key <your-key>, set {} in the environment, or add \
+                 \"api_key\" to ~/.log-scouter/ai.json.",
                 ai.config.provider.key_var()
             )));
             ai.pending = false;
@@ -5014,6 +5142,48 @@ impl AppState {
             }
         }
         self.active_view().map(|view| view.file_id.clone())
+    }
+
+    /// `r` on a source: edit its label and description. Prefilled with the current values as
+    /// `label | description`. Merged views are derived, not real sources, so they are skipped.
+    fn open_source_label(&mut self) {
+        let Some(file_id) = self.schema_target() else {
+            return;
+        };
+        let Some(file) = self.project.get_file(&file_id) else {
+            return;
+        };
+        if file.is_merged() {
+            self.status = "a merged view has no source label".to_string();
+            return;
+        }
+        let text = if file.description.is_empty() {
+            file.label.clone()
+        } else {
+            format!("{} | {}", file.label, file.description)
+        };
+        self.open_input(Mode::SourceLabel { file_id, text });
+    }
+
+    /// Store a source's label and description from `label | description`, then persist.
+    fn submit_source_label(&mut self, file_id: String, text: String) {
+        let (label, description) = match text.split_once('|') {
+            Some((label, description)) => {
+                (label.trim().to_string(), description.trim().to_string())
+            }
+            None => (text.trim().to_string(), String::new()),
+        };
+        if let Some(file) = self.project.get_file_mut(&file_id) {
+            file.label = label.clone();
+            file.description = description;
+            let name = file.display_name.clone();
+            self.save_project();
+            self.status = if label.is_empty() {
+                format!("cleared label for {name}")
+            } else {
+                format!("labelled {name} as {label:?}")
+            };
+        }
     }
 
     fn open_schema_input(&mut self) {
@@ -6403,6 +6573,12 @@ fn file_detail_lines(file: &LogFileModel, width: usize) -> Vec<Line<'static>> {
     let plain = Style::default();
     let mut lines = Vec::new();
     push_detail(&mut lines, "file", &file.display_name, value_width, plain);
+    if !file.label.is_empty() {
+        push_detail(&mut lines, "label", &file.label, value_width, plain);
+    }
+    if !file.description.is_empty() {
+        push_detail(&mut lines, "note", &file.description, value_width, plain);
+    }
     push_detail(
         &mut lines,
         "path",
@@ -6823,6 +6999,7 @@ fn help_text() -> &'static str {
   In the folder browser: j/k or arrows move, Enter opens './' or enters a subfolder,
                          Right enters, Left/Backspace goes up, '.' shows hidden folders
   e apply/edit this file's schema (schema name, or full format template)
+  r label this source (short label | description, so the AI can tell what it is)
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
   In the sidebar: Space on a log adds/removes it, merging the logs by timestamp
                   Space on a filter enables/disables it; Delete removes it
@@ -6884,9 +7061,12 @@ AI assistant
   It can inspect the logs and apply filters, searches, and time ranges for you;
   the panels update as it works, and each action is noted in the transcript
   Esc cancels a reply in flight, then leaves the panel; Up/Down scroll the transcript
-  Keys come from the environment: OPENAI_API_KEY / ANTHROPIC_API_KEY / DEEPSEEK_API_KEY
-  /key <api-key> sets the key here (session only); /provider openai|anthropic|deepseek,
-  /model <name>, /clear are the other chat commands
+  The panel title shows the provider and model, and 'no key' until one is configured
+  A key comes from OPENAI_API_KEY / ANTHROPIC_API_KEY / DEEPSEEK_API_KEY, from the
+  api_key field in ~/.log-scouter/ai.json, or from /key <api-key> (this session only)
+  /provider openai|anthropic|deepseek and /model <name> pick the model (saved to ai.json)
+  /skills lists skills in ~/.log-scouter/skills/*.md; /skill <name> toggles one on/off
+  /clear resets the conversation
 
 Log schema
   <field> is required, <field?> is optional and may be missing from a line

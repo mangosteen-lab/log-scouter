@@ -6,7 +6,7 @@
 use crate::core::filters::{home_dir, USER_DIR};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -74,6 +74,11 @@ pub struct AiConfig {
     /// Empty means "use the provider's default model".
     #[serde(default)]
     pub model: String,
+    /// A key stored in the config file for the configured provider. Optional -- the
+    /// environment variable takes precedence, and `/key` in the chat overrides both for the
+    /// session. Always written (even blank) so it is easy to fill in with an editor.
+    #[serde(default)]
+    pub api_key: String,
 }
 
 impl Default for AiConfig {
@@ -81,6 +86,7 @@ impl Default for AiConfig {
         Self {
             provider: Provider::OpenAi,
             model: String::new(),
+            api_key: String::new(),
         }
     }
 }
@@ -95,12 +101,17 @@ impl AiConfig {
         }
     }
 
-    /// The key from the environment, or `None` when the variable is unset or blank.
+    /// The key for the configured provider: the environment variable if set, otherwise the
+    /// one stored in `ai.json`. `None` when neither is present.
     pub fn api_key(&self) -> Option<String> {
-        std::env::var(self.provider.key_var())
+        let from_env = std::env::var(self.provider.key_var())
             .ok()
             .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty())
+            .filter(|key| !key.is_empty());
+        from_env.or_else(|| {
+            let stored = self.api_key.trim();
+            (!stored.is_empty()).then(|| stored.to_string())
+        })
     }
 
     /// The base URL to POST to. `LOGSCOUT_AI_BASE_URL` overrides the provider default, for
@@ -128,9 +139,23 @@ impl AiConfig {
             fs::create_dir_all(dir)?;
         }
         let body = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        fs::write(path, body)
+        fs::write(&path, body)?;
+        // The file can hold an API key, so keep it readable only by the owner.
+        restrict_permissions(&path);
+        Ok(())
     }
 }
+
+/// Best-effort `chmod 600` on the config file. A failure here is not worth surfacing: the
+/// file was still written, and not every filesystem models Unix permissions.
+#[cfg(unix)]
+fn restrict_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path) {}
 
 /// `~/.log-scouter/ai.json`, or `None` when `$HOME` is unset.
 fn config_path() -> Option<PathBuf> {

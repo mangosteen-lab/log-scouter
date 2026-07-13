@@ -10,6 +10,7 @@
 pub mod config;
 pub mod message;
 pub mod provider;
+pub mod skills;
 pub mod tools;
 pub mod worker;
 

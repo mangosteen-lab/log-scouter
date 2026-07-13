@@ -89,6 +89,10 @@ struct FileData {
     extractor_name: String,
     #[serde(default)]
     display_name: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    description: String,
 }
 
 impl Project {
@@ -435,13 +439,16 @@ impl Project {
             };
             let extractor_name = file_data.extractor_name;
             let extractor = Some(self.get_extractor(&extractor_name));
-            self.files.push(LogFileModel::new(
+            let mut model = LogFileModel::new(
                 file_data.file_id,
                 absolute_path(path),
                 extractor_name,
                 file_data.display_name,
                 extractor,
-            ));
+            );
+            model.label = file_data.label;
+            model.description = file_data.description;
+            self.files.push(model);
         }
     }
 
@@ -459,6 +466,8 @@ impl Project {
                     path: self.rel(&file.path),
                     extractor_name: file.extractor_name.clone(),
                     display_name: file.display_name.clone(),
+                    label: file.label.clone(),
+                    description: file.description.clone(),
                 })
                 .collect(),
             extractors: self.extractors.values().cloned().collect(),

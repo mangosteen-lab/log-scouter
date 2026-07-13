@@ -29,6 +29,10 @@ pub struct LogFileModel {
     pub path: PathBuf,
     pub extractor_name: String,
     pub display_name: String,
+    /// An optional short name and free-text note the user gives a source so the assistant
+    /// (and the sidebar) can tell what it is. Both empty by default; persisted per project.
+    pub label: String,
+    pub description: String,
     pub extractor: Option<Extractor>,
     pub entries: Vec<LogEntry>,
     pub loaded: bool,
@@ -67,6 +71,8 @@ impl LogFileModel {
             path,
             extractor_name: extractor_name.into(),
             display_name,
+            label: String::new(),
+            description: String::new(),
             extractor,
             entries: Vec::new(),
             loaded: false,

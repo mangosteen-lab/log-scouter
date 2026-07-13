@@ -160,6 +160,7 @@ fn config_model_defaults_and_key_from_env() {
     let mut config = AiConfig {
         provider: Provider::Anthropic,
         model: String::new(),
+        api_key: String::new(),
     };
     // Empty model falls back to the provider default.
     assert_eq!(config.model(), "claude-opus-4-8");
@@ -172,4 +173,41 @@ fn config_model_defaults_and_key_from_env() {
     std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
     assert_eq!(config.api_key().as_deref(), Some("sk-test"));
     std::env::remove_var("ANTHROPIC_API_KEY");
+
+    // With no env var, the key stored in ai.json is the fallback.
+    config.api_key = "sk-from-file".into();
+    assert_eq!(config.api_key().as_deref(), Some("sk-from-file"));
+    // The environment still wins over the stored key when both are present.
+    std::env::set_var("ANTHROPIC_API_KEY", "sk-from-env");
+    assert_eq!(config.api_key().as_deref(), Some("sk-from-env"));
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+#[test]
+fn skill_parse_uses_first_heading_as_description() {
+    use log_scouter::ai::skills::{list_in, parse_skill};
+
+    let skill = parse_skill("triage", "# OOM triage\n\nLook at memory first.\n");
+    assert_eq!(skill.name, "triage");
+    assert_eq!(skill.description, "OOM triage");
+    assert!(skill.body.contains("Look at memory first."));
+
+    // A body with no heading falls back to the first non-empty line.
+    let plain = parse_skill("notes", "\n\ncheck the disk\nthen the network\n");
+    assert_eq!(plain.description, "check the disk");
+
+    // list_in reads *.md from a directory, sorted, and ignores everything else.
+    let dir = std::env::temp_dir().join(format!("logscout-skills-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("b.md"), "# Beta\nbody b").unwrap();
+    std::fs::write(dir.join("a.md"), "# Alpha\nbody a").unwrap();
+    std::fs::write(dir.join("ignore.txt"), "not a skill").unwrap();
+    let found = list_in(&dir);
+    assert_eq!(
+        found.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+    assert_eq!(found[0].description, "Alpha");
+    let _ = std::fs::remove_dir_all(&dir);
 }

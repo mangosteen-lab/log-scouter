@@ -7,6 +7,16 @@ parsing/filtering path native.
 
 Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 
+**Contents:** [Features](#features) · [Quick Start](#quick-start) ·
+[Concept Model](#concept-model) · [Architecture](#architecture) · [Keys](#keys) ·
+[Filters](#filters-text-and-time) · [Search](#search-query-language) ·
+[Hiding by Example](#hiding-by-example) · [AI Assistant](#ai-assistant) ·
+[Log Formats](#log-formats) · [Building from Source](#building-from-source) ·
+[Development](#development) · [Releasing](#releasing)
+
+New to the code? Read [Concept Model](#concept-model) then [Architecture](#architecture) —
+together they explain what the app is built out of and how the pieces fit and run.
+
 ## Features
 
 - **Folder = project.** State persists to `<folder>/.logscouter/project.json`.
@@ -75,7 +85,15 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 - **AI assistant.** Press `A` for a chat panel that troubleshoots the logs for you — it
   inspects the sources and drives filters, searches, and time ranges through the same
   operations you would, iterating until the issue is understood. Works with OpenAI,
-  Anthropic, and DeepSeek; the key comes from the environment.
+  Anthropic, and DeepSeek; the panel title shows the active provider and model. The key
+  comes from the environment, from the `api_key` field of `~/.log-scouter/ai.json`, or from
+  `/key` typed in the chat for the session only.
+- **AI skills.** Drop a markdown file in `~/.log-scouter/skills/` and switch it on with
+  `/skill <name>` in the chat; its text is appended to the assistant's instructions, so you
+  can teach it how your team triages a class of incident. `/skills` lists what you have.
+- **Source labels.** Press `r` on a log source to give it a short label and a note. They
+  show in the sidebar detail and are handed to the assistant, so it knows that `app.log` is,
+  say, "auth service — handles login". Saved with the project.
 
 ## Quick Start
 
@@ -151,7 +169,8 @@ The app currently uses these persisted concepts:
 - **Log source**: one concrete log file added to the project. A source can live
   anywhere on disk; paths are saved relative to the project when possible. A
   `<project>/logs` folder is a useful convention, but it is not required or
-  enforced by the current implementation.
+  enforced by the current implementation. A source can carry a user **label** and
+  **description** (press `r`), saved with the project and handed to the AI assistant.
 - **Log format**: the parser definition for a log source. It has a name,
   description, expression, timestamp field, and timestamp format. Internally this
   is still named `Extractor`; some UI prompts say "schema". In user-facing terms,
@@ -185,6 +204,76 @@ User-level reuse is implemented for filter packs and schema packs:
 ```
 
 User-level saved searches are not implemented yet.
+
+## Architecture
+
+The codebase is a Cargo binary plus a library crate. `src/main.rs` is a thin `clap` CLI that
+builds a `Project` and hands it to `tui::run`; everything testable lives in the library.
+
+```text
+src/
+  main.rs        CLI entry point (arg parsing, then tui::run)
+  lib.rs         pub mod ai / core / tui
+  core/          engine — no terminal, no I/O beyond reading log files
+    parser.rs      read a file into raw LogEntry records, folding multi-line records
+    extractor.rs   an Extractor (a.k.a. "log format"/"schema"): <field> expression → fields
+    models.rs      LogFileModel (one source or a merged view), LogEntry, ViewModel
+    filters.rs     FilterRule / FilterSet, the include/exclude engine, user dirs
+    search.rs      the query language: compile a string to a Query, then match entries
+    project.rs     the Project: sources, formats, filters, searches, session; JSON persist
+  tui/           Ratatui application — one big AppState in mod.rs
+  ai/            the AI assistant (see below)
+tests/           integration tests: core.rs, ai.rs, bench_manual.rs
+```
+
+**Separation.** `core` knows nothing about the terminal: it parses, extracts, filters,
+searches, and (de)serializes project state. `tui` owns an `AppState` that holds the
+`Project`, the panes, the focus, the current input `Mode`, and the AI panel, and drives all
+rendering. This split is what makes the engine unit-testable without a TTY.
+
+**The render loop is synchronous.** `tui::run` runs a normal event loop: draw a frame, wait
+for a crossterm event, mutate `AppState`, repeat. There is no async runtime in the loop.
+Because a big log makes loading, filtering, and searching slow, those passes run in **slices
+between frames** — each does a bounded chunk of work, updates a progress bar, and yields so
+the UI stays responsive and `Esc` can cancel. Filtering is the expensive pass, so its result
+is cached against the filter set; a later search walks only the surviving lines.
+
+**Data flow for one pane.** A raw file becomes `LogEntry` records (`parser`), each entry is
+parsed into named fields by its file's `Extractor` (`extractor`), the project `FilterSet`
+narrows the entries to a visible set (`filters`, cached), and an optional `Query` narrows
+further (`search`). The result is a `ViewModel` — the visible row indices, cursor, scroll,
+and selection — which the pane renders. A **merged view** interleaves several sources by
+timestamp into one synthetic `LogFileModel`; each entry remembers its origin so it is still
+parsed by its own format.
+
+**The AI assistant bridges sync and async.** The chat cannot block the render loop on a
+network call, so the model request is the *only* thing that leaves the main thread:
+
+```text
+main thread (TUI, owns all state)          worker thread (owns a tokio runtime + reqwest)
+  submit question ── AgentRequest ─────────►  provider::complete(conversation, tools).await
+  drain events each frame ◄─ AgentEvent ───   Assistant { text, tool_calls } | Err(String)
+  run tool_calls on AppState via the
+  normal mutators (filters/search/…),
+  append results ── AgentRequest ──────────►  next turn
+  … loop until the reply has no tool calls
+```
+
+`ai/worker.rs` owns the thread, a current-thread tokio runtime, a shared `reqwest::Client`,
+and the `std::sync::mpsc` channels. All `AppState` mutation stays on the main thread, so tool
+execution reuses the existing mutators and the panels refresh for free. Every request carries
+a **generation counter**; a reply tagged with a superseded generation (the user asked
+something else, or pressed `Esc`) is dropped on arrival. `ai/provider.rs` translates the
+neutral `ChatMsg`/`ToolSpec` types (`ai/message.rs`) into each provider's wire format and
+parses the response — those builders and parsers are pure functions, round-tripped against
+captured JSON in `tests/ai.rs` with no network. `ai/tools.rs` declares the tool schemas the
+model sees; `ai/config.rs` handles provider/model/key resolution and `~/.log-scouter/ai.json`;
+`ai/skills.rs` reads the user's markdown skills.
+
+**Persistence** is centralized in `<project>/.logscouter/project.json` (sources, formats,
+filters, saved searches, settings, last session), with user-level libraries under
+`~/.log-scouter/` for filter packs (`filters/`), schema packs (`schemas/`), AI config
+(`ai.json`), and AI skills (`skills/`).
 
 ## Keys
 
@@ -220,6 +309,7 @@ User-level saved searches are not implemented yet.
 | `Enter` (sidebar search) | edit that saved search |
 | `S` | define a reusable log format |
 | `e` | assign or edit the focused file's log format |
+| `r` | label the focused source (`short label \| description`, shown in Detail and given to the AI) |
 | `|` / `-` / `w` | split columns / split rows / close pane |
 | `A` | open the AI chat panel (Enter to send, Esc to cancel/leave) |
 | `Tab` / `Shift+Tab` | cycle sidebar, panes, and search results |
@@ -489,7 +579,7 @@ errors in the last 15 minutes" — and it works through the problem using the sa
 you would:
 
 ```text
-┌AI  (Enter send · Esc leave)──────────────────────┐
+┌AI · openai gpt-4o · Enter send · Esc leave────────┐
 │you hide the trace noise and show me errors        │
 │ai  Let me look at the level mix first.            │
 │  » ran level_breakdown: Error: 12, Trace: 903 …   │
@@ -501,9 +591,12 @@ you would:
 └───────────────────────────────────────────────────┘
 ```
 
-The assistant is given the project's context (folder, sources, their schemas and counts,
-current filters, the focused view) and a set of tools that map onto log-scouter's own
-operations:
+The panel title always shows the active provider and model, and ` · no key` until one is
+configured, so you can see the assistant is ready without sending a message.
+
+The assistant is given the project's context (folder, sources with their schemas, counts,
+and any label/note you added, the current filters, and the focused view) and a set of tools
+that map onto log-scouter's own operations:
 
 - **Inspect** — list sources, list filters, sample lines, count matches for a query, level
   breakdown.
@@ -511,17 +604,31 @@ operations:
 
 It runs an **agentic loop**: it calls a tool, sees the result, and keeps going until it has
 an answer — so one question can play out as several steps, with the panels updating live and
-each action noted in the transcript. `Esc` cancels a reply in flight, then leaves the panel;
-`↑`/`↓` scroll the transcript; write actions apply immediately (a removed source still
-confirms).
+each action noted in the transcript. The loop is capped at 12 turns so a confused model
+cannot spin forever. `Esc` cancels a reply in flight, then leaves the panel; `↑`/`↓` scroll
+the transcript; write actions apply immediately (a removed source still confirms).
 
-**Setup.** No key is stored on disk — the assistant reads it from the environment:
-`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `DEEPSEEK_API_KEY`. If the selected provider's
-variable is unset, the panel says so — you can type `/key <your-key>` right in the chat
-instead (kept in memory for the session, never written to disk). Choose the provider and model from the
-chat with `/provider openai|anthropic|deepseek` and `/model <name>` (saved to
-`~/.log-scouter/ai.json`); `/clear` resets the conversation. `LOGSCOUT_AI_BASE_URL`
-overrides the endpoint for a corporate gateway or a compatible self-hosted model.
+**Providers and keys.** Works with OpenAI, Anthropic, and DeepSeek (OpenAI and DeepSeek
+share the `/chat/completions` wire format; Anthropic uses the Messages API). The key is
+resolved in this order:
+
+1. a `/key <your-key>` typed in the chat — kept in memory for the session only, never
+   written to disk and never echoed into the transcript;
+2. the provider's environment variable — `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or
+   `DEEPSEEK_API_KEY`;
+3. the `api_key` field of `~/.log-scouter/ai.json`, which you can set with an editor (the
+   file is chmod `600` on save because it can hold a secret).
+
+Pick the provider and model from the chat with `/provider openai|anthropic|deepseek` and
+`/model <name>` (both saved to `~/.log-scouter/ai.json`, which stores only the non-secret
+provider and model unless you add a key yourself); `/clear` resets the conversation.
+`LOGSCOUT_AI_BASE_URL` overrides the endpoint for a corporate gateway, a compatible
+self-hosted model, or a test double.
+
+**Skills.** Drop a markdown file in `~/.log-scouter/skills/<name>.md` and switch it on with
+`/skill <name>`; its text is appended to the assistant's system prompt (re-read each turn,
+so edits take effect live), which is how you teach it your team's playbook for a class of
+incident. `/skills` lists what you have written and marks the ones that are on.
 
 ## Opening a Folder
 
@@ -826,18 +933,52 @@ before:"2026-06-16 10:10"
 date:[2026-06-16T10:09..2026-06-16T10:10]
 ```
 
-## Development
+## Building from Source
+
+Requirements: a stable Rust toolchain (Rust 2021 edition; install via [rustup](https://rustup.rs))
+and a terminal. The AI networking uses `rustls`, so no OpenSSL is needed. Linux release
+artifacts are built against musl for portability.
 
 ```bash
-cargo test
+git clone https://github.com/mangosteen-lab/log-scouter
+cd log-scouter
+cargo build --release          # binary at target/release/logscout
 cargo run --release -- examples
 ```
 
-Layout:
+`./run.sh [folder] [files...]` is a convenience wrapper around `cargo run --release`.
+
+## Development
+
+```bash
+cargo test                     # unit + integration tests (core.rs, ai.rs)
+cargo clippy --all-targets     # lint; CI expects it clean
+cargo fmt                      # format
+cargo run --release -- examples
+```
+
+Tests are deterministic and need no network. The AI provider adapters are exercised by
+round-tripping captured request/response JSON (`tests/ai.rs`), and the agentic loop is
+driven by feeding scripted `AgentEvent`s, so a full turn is testable offline. To exercise a
+real endpoint without a paid key, point `LOGSCOUT_AI_BASE_URL` at a local OpenAI-compatible
+mock. See [Architecture](#architecture) for the module map and the threading model.
 
 ```text
-src/core/   extractor, parser, filters, search, project, models
-src/tui/    Ratatui application
+src/core/   extractor, parser, filters, search, project, models — the engine, no TTY
+src/tui/    Ratatui application (one AppState in mod.rs)
+src/ai/     assistant: config, message, provider, tools, skills, worker
 src/main.rs CLI entry point
 tests/      Rust integration tests
 ```
+
+## Releasing
+
+Version lives in `Cargo.toml`. Bump it, commit, push `master`, then let the Makefile tag it:
+
+```bash
+make publish-release           # tags v<version> and pushes the tag
+make release-status
+```
+
+Pushing the tag triggers the GitHub Actions release workflow, which builds and attaches the
+platform binaries the install scripts download.
