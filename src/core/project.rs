@@ -1,6 +1,6 @@
 use crate::core::extractor::{
-    default_extractor, detect, extractor_from_project, Extractor, DEFAULT_EXTRACTOR_NAME,
-    DETECT_LINES, BRACKETED_DEFAULT_FORMAT, BRACKETED_LEGACY_FORMAT,
+    builtin_extractors, default_extractor, detect, extractor_from_project, Extractor,
+    BRACKETED_DEFAULT_FORMAT, BRACKETED_LEGACY_FORMAT, DEFAULT_EXTRACTOR_NAME, DETECT_LINES,
 };
 use crate::core::filters::FilterSet;
 use crate::core::models::{display_name, merge_files, LogFileModel};
@@ -93,7 +93,7 @@ struct FileData {
 
 impl Project {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
+        let mut project = Self {
             root: absolute_path(root.into()),
             files: Vec::new(),
             extractors: HashMap::new(),
@@ -102,7 +102,9 @@ impl Project {
             session: None,
             settings: default_settings(),
             file_counter: 0,
-        }
+        };
+        project.ensure_builtin_extractors();
+        project
     }
 
     pub fn load(root: impl Into<PathBuf>) -> Self {
@@ -115,11 +117,21 @@ impl Project {
                 }
             }
         }
-        if project.extractors.is_empty() {
-            let extractor = default_extractor();
-            project.extractors.insert(extractor.name.clone(), extractor);
-        }
+        // A project saved before `Generic line` existed does not list it, and `detect`
+        // can only choose among the schemas it is handed.
+        project.ensure_builtin_extractors();
         project
+    }
+
+    /// Add any built-in schema the project does not already define. A schema the user has
+    /// edited under a built-in name wins: it is theirs, and repointing files at a fresh
+    /// copy would silently change how those files parse.
+    fn ensure_builtin_extractors(&mut self) {
+        for extractor in builtin_extractors() {
+            self.extractors
+                .entry(extractor.name.clone())
+                .or_insert(extractor);
+        }
     }
 
     pub fn config_dir(&self) -> PathBuf {
@@ -327,7 +339,51 @@ impl Project {
         fs::rename(tmp, self.config_path())
     }
 
+    /// Re-detect any not-yet-loaded file whose schema explains none of its opening lines.
+    ///
+    /// A schema that matches nothing is never a deliberate choice, and it is not merely
+    /// unhelpful: under it no line starts a record, so every line folds into the one above
+    /// and the file loads as a single timestamp-less entry. Projects written before
+    /// `Generic line` existed pinned the bracketed schema on exactly the files it could
+    /// not read, so heal them on the way in rather than making the user notice.
+    pub fn redetect_mismatched_schemas(&mut self) {
+        let candidates: Vec<(usize, PathBuf)> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| !file.is_merged() && !file.loaded)
+            .map(|(index, file)| (index, file.path.clone()))
+            .collect();
+
+        for (index, path) in candidates {
+            let Ok(lines) = parser::read_first_lines(&path, DETECT_LINES) else {
+                continue;
+            };
+            if lines.iter().all(|line| line.trim().is_empty()) {
+                continue;
+            }
+            let explains = self.files[index]
+                .extractor
+                .as_ref()
+                .map(|extractor| extractor.match_score(&lines) > 0)
+                .unwrap_or(false);
+            if explains {
+                continue;
+            }
+
+            let Some(better) = detect(self.extractors.values(), &lines).cloned() else {
+                continue;
+            };
+            if better.name == self.files[index].extractor_name {
+                continue;
+            }
+            self.files[index].extractor_name = better.name.clone();
+            self.files[index].refresh_extractor(Some(better));
+        }
+    }
+
     pub fn load_all_files(&mut self) {
+        self.redetect_mismatched_schemas();
         let extractor_names: Vec<String> = self
             .files
             .iter()
@@ -354,6 +410,9 @@ impl Project {
         self.file_counter = data.file_counter;
         self.saved_searches = data.saved_searches;
         self.filters = data.filters;
+        // A project written before the time slot was enforced can hold several ranges;
+        // OR'd together they widen the window. Keep only the last.
+        self.filters.dedupe_time_range();
         self.session = data.session;
         self.settings = data.settings;
 

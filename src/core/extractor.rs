@@ -1,11 +1,12 @@
 use crate::core::filters::{home_dir, json_file_paths, sanitize_file_component, USER_DIR};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const BRACKETED_DEFAULT_FORMAT: &str = "<timestamp> [HOST:<host>][SERVER:<server>][PID:<process_id>][THR:<thread_id>][<log_module>][<log_level>][<error_code?>][UID:<user_id>][SID:<session_id>][OID:<object_id>][<file_name>:<line_number>] <message>";
 
@@ -19,6 +20,16 @@ pub const DEFAULT_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S.%f";
 /// Name of the built-in bracketed-field schema. Used as the deterministic fallback when
 /// no schema matches a file.
 pub const DEFAULT_EXTRACTOR_NAME: &str = "Bracketed default";
+
+/// Name of the built-in catch-all schema, and the format behind it.
+///
+/// It asserts nothing beyond "a line is a record", which is exactly what makes it safe as
+/// the last resort: `detect` orders candidates by specificity, so it only wins when no
+/// real schema explains the file. Before it existed that file was handed to the bracketed
+/// format instead, whose `is_start` probe never matched -- so every line folded into the
+/// one above it and the whole file arrived as a single, timestamp-less entry.
+pub const GENERIC_EXTRACTOR_NAME: &str = "Generic line";
+pub const GENERIC_FORMAT: &str = "<message>";
 
 /// How many of a file's leading lines `detect` reads before deciding on a schema.
 pub const DETECT_LINES: usize = 200;
@@ -313,6 +324,71 @@ impl Extractor {
         }
     }
 
+    /// A regex over a whole raw line that pins each field in `chosen` to its value and
+    /// lets every other field be anything.
+    ///
+    /// This is how the hide menu ANDs fields. `regex` has no lookaround, so "host is h1
+    /// *and* level is Trace" cannot be written as two independent tests over one string.
+    /// The format template already says where each field sits, so the conjunction becomes
+    /// a single positional pattern instead.
+    ///
+    /// `(?s)` because an entry's raw text carries its continuation lines, and a `.*` that
+    /// stopped at the first newline would refuse every multi-line record.
+    pub fn field_pattern(&self, chosen: &[(String, String)]) -> Option<String> {
+        let placeholders = placeholders(&self.format).ok()?;
+        if placeholders.is_empty() {
+            return None;
+        }
+
+        let mut pattern = String::from("(?s)^");
+        let mut pos = 0;
+        for (index, ph) in placeholders.iter().enumerate() {
+            let literal = regex::escape(&self.format[pos..ph.start]);
+            let pinned = chosen
+                .iter()
+                .find(|(name, _)| *name == ph.name)
+                .map(|(_, value)| value.as_str());
+            let last = index + 1 == placeholders.len();
+            let free = self
+                .field_patterns
+                .get(&ph.name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if last {
+                        ".*".to_string()
+                    } else {
+                        ".*?".to_string()
+                    }
+                });
+
+            match (pinned, ph.optional) {
+                // An optional field the source line did not have. Its separator lives
+                // inside the group, so dropping the group outright forbids the field --
+                // which is exactly what "hide lines with no error code" means.
+                (Some(""), true) => {}
+                // Pinned: the field must be there, holding this value.
+                (Some(value), _) => {
+                    pattern.push_str(&literal);
+                    pattern.push_str(&regex::escape(value));
+                }
+                // Free, and may be absent.
+                (None, true) => {
+                    pattern.push_str("(?:");
+                    pattern.push_str(&literal);
+                    pattern.push_str(&free);
+                    pattern.push_str(")?");
+                }
+                (None, false) => {
+                    pattern.push_str(&literal);
+                    pattern.push_str(&free);
+                }
+            }
+            pos = ph.end;
+        }
+        pattern.push_str(&regex::escape(&self.format[pos..]));
+        Some(pattern)
+    }
+
     pub fn is_start(&self, line: &str) -> bool {
         self.start_regex()
             .map(|regex| regex.is_match(line))
@@ -363,6 +439,60 @@ pub fn default_extractor() -> Extractor {
         .with_description("Bracketed server log format")
         .with_samples(bracketed_samples())
         .expect("built-in samples parse under the built-in format")
+}
+
+/// The catch-all schema: one record per line, no fields but the text itself.
+///
+/// It names no timestamp field, so a merge reads times off the raw line with
+/// `sniff_timestamp` instead.
+pub fn generic_extractor() -> Extractor {
+    Extractor::new(GENERIC_EXTRACTOR_NAME, GENERIC_FORMAT)
+        .expect("built-in generic extractor is valid")
+        .with_description("One record per line, for logs no other schema explains")
+}
+
+/// The schemas every project has, whether or not its `project.json` mentions them.
+pub fn builtin_extractors() -> Vec<Extractor> {
+    vec![default_extractor(), generic_extractor()]
+}
+
+/// A timestamp at the head of a line, read without help from a schema.
+///
+/// Merging interleaves entries by time, so an entry with no time has nowhere to go. That
+/// happens whenever the schema names no timestamp field (`Generic line`) or names one its
+/// `timestamp_format` cannot read. Sniffing the line directly rescues both cases.
+///
+/// Only the ISO-8601 family is recognised, because a wrong timestamp reorders the merge
+/// more damagingly than a missing one: `2026-06-16 10:09:43.288`, `2026-06-16T10:09:43,288Z`
+/// and `2026/06/16 10:09:43` all parse, each optionally behind `[` or leading space.
+pub fn sniff_timestamp(line: &str) -> Option<NaiveDateTime> {
+    static HEAD: OnceLock<Regex> = OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        Regex::new(
+            r"^[\s\[]*(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T ](\d{1,2}):(\d{2}):(\d{2})(?:[.,](\d{1,9}))?",
+        )
+        .expect("built-in timestamp sniffer is valid")
+    });
+
+    let captures = head.captures(line)?;
+    let number = |index: usize| -> Option<u32> { captures.get(index)?.as_str().parse().ok() };
+    let year: i32 = captures.get(1)?.as_str().parse().ok()?;
+    let date = NaiveDate::from_ymd_opt(year, number(2)?, number(3)?)?;
+
+    // A fraction is written to whatever precision the writer felt like; right-pad to nanos.
+    let nanos = match captures.get(7) {
+        Some(fraction) => {
+            let digits = fraction.as_str();
+            let mut padded = String::with_capacity(9);
+            padded.push_str(digits);
+            for _ in digits.len()..9 {
+                padded.push('0');
+            }
+            padded.parse().ok()?
+        }
+        None => 0,
+    };
+    date.and_hms_nano_opt(number(4)?, number(5)?, number(6)?, nanos)
 }
 
 /// The two shapes of an bracketed error line, plus an ordinary one. The middle sample is the

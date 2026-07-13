@@ -16,7 +16,8 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
   `<field?>` for a field that is only present on some lines. A bracketed-field
   server log format is built in.
 - **Schema detection.** Adding a file matches its first lines against the project's log
-  formats and picks the one that explains them, most specific first.
+  formats and picks the one that explains them, most specific first. A log no format
+  explains falls back to `Generic line`: one entry per line, timestamp read off the line.
 - **Validated schemas.** A log format can carry sample lines with their expected level.
   A format that matches a sample but extracts the wrong value is rejected when it is
   defined or imported, rather than quietly mis-parsing your logs.
@@ -31,12 +32,13 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
   `field=value`, `field~contains`, `after:`, `before:`, and `date:[a..b]`.
 - **Search results panel.** Searches open a bottom panel of matched lines. Click
   a result or focus it and press Enter to jump to the source line.
-- **Filters.** Include/exclude by field equality, substring, regex, or range.
-  Filters apply to the whole project and are saved automatically, so they are
-  still in effect the next time you open the folder.
+- **Filters.** Include/exclude by field equality, substring, regex, or range. The sidebar
+  splits them into **Text** (as many as you like) and **Time** (at most one, replaced by
+  each new range). Filters apply to the whole project and are saved automatically, so they
+  are still in effect the next time you open the folder.
 - **Time range picker.** Press `t` for a picker with an editable start and end plus
   quick ranges (`Last 1 hour`, `Last 24 hours`, `Last 7 days`, ...). Quick ranges
-  count back from the newest entry in the log, not from the current time.
+  count back from the newest entry across all loaded logs, not the current time.
 - **Filter packs.** Export the project's filters to a folder as one JSON file
   per filter, then import a folder to merge those filters back. Defaults to the
   user-level library at `~/.log-scouter/filters`, shared across projects.
@@ -62,8 +64,11 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 - **Copy.** `y` or right-click puts the selected raw lines on your clipboard via
   OSC 52, so it works over SSH. Right-click in a detail panel copies selected
   detail text, or the whole detail content when nothing is selected there.
-- **Hide by example.** Press `H` on one line to hide by one of that line's log
-  format fields, or select several similar lines to derive a regex.
+- **Hide by example.** Press `H` on one line to hide by one of its fields -- each shown
+  with the value that line holds -- or pick several fields to AND them into one regex.
+  `Tab` flips the menu to **keep only**, building `include` rules instead. Select several
+  similar lines and `H` offers a ladder of templates from greedy to strict, each with the
+  rows it would remove, again with `Tab` to keep-only.
 - **Vim-style navigation.** Supports `j/k`, `gg`, `G`, `[count]j`,
   `[count]G`, paging, and horizontal scroll.
 - **Split panes.** Use `|` for columns and `-` for rows.
@@ -79,7 +84,7 @@ logscout /path/to/logs
 
 Run `logscout .` inside a log folder to add every direct text file in that folder as
 a log source. Run `logscout` with no arguments to start an empty project, then press
-`o` to open a folder and add its text files.
+`o` to browse for a folder and add its text files.
 
 Upgrade or uninstall with the matching scripts:
 
@@ -181,7 +186,7 @@ User-level saved searches are not implemented yet.
 
 | Key | Action |
 |---|---|
-| `a` / `o` / `d` | add file / open folder text files / remove focused file from project |
+| `a` / `o` / `d` | add file / browse for a folder / remove focused file from project |
 | `j k` or arrows | move selection |
 | `gg` / `G` / `[count]G` | top / bottom / go to visible row |
 | `Ctrl+d` / `Ctrl+u` | half page down/up |
@@ -194,10 +199,15 @@ User-level saved searches are not implemented yet.
 | `y` / right-click | copy selected raw lines (cursor line if nothing selected) |
 | `Esc` | clear the selection, then the search |
 | `f` / `t` / `F` | add filter / open the time range picker / clear filters |
+| `Delete` (sidebar) | remove the filter under the cursor |
 | `T` | measure elapsed time from the current line (again to turn off) |
 | `x` / `L` | export filters / import filters from a folder |
 | `X` / `I` | export log schemas / import log schemas from a folder |
 | `H` | hide logs like the selection, using fields from the log format |
+| `Space` (hide menu) | pick a field; `Enter` ANDs the picks into one regex |
+| `H` (hide menu) | derive a pattern from the single current line |
+| `↑` / `↓` (pattern popup) | pick a template, greediest first |
+| `Tab` (pattern popup) | flip the derived pattern between hide and keep |
 | `Space` (sidebar log) | add/remove that log from the view, merged by timestamp |
 | `Space` (sidebar filter) | enable/disable that filter |
 | `Space` (sidebar search) | run that saved search, or clear it if it is running |
@@ -217,6 +227,34 @@ view of the thing under the cursor*. In the sidebar those detail views are edita
 the log format for a source, the rule for a filter, the query for a saved search.
 A star in the sidebar marks what is currently selected — the logs feeding the pane,
 the enabled filters, the running search.
+
+## Filters: Text and Time
+
+The sidebar keeps the two kinds apart, because they behave differently:
+
+```text
+Filters
+  Text
+    * exclude log_level equals 'Trace'
+    * exclude raw regex '(?s)^.*? \[HOST:…'
+  Time
+    * 10:09:03 → 10:09:05  (2s)
+```
+
+**Text** filters are a list: add as many as you like, and they compose. **Time** is a
+single slot. Two ranges over the same field can only ever intersect, and the second one is
+what you just asked for -- so a new range *replaces* the old rather than narrowing it. That
+holds however the range arrives: the `t` picker, the `f` popup, or an imported filter pack.
+
+On any filter row, `Space` enables or disables it and `Delete` removes it. On the `Time`
+row -- or on the `none - t` under it -- `Enter` reopens the picker on the range in force,
+with the caret on `Start`, so changing "when" never means retyping it. Nobody should have
+to hand-edit `timestamp range 'a..b'`, so that row does not open the filter text editor.
+
+The row itself is written for reading, not for parsing: two clock times when the range
+stays inside a day, `06-16 23:00:00 → 06-17 01:00:00` when it does not, `from …` or
+`until …` for an open end, and the span in brackets. The detail panel below spells out the
+full start, end and span.
 
 ## Filter Input
 
@@ -253,18 +291,28 @@ Press `t` for a picker instead of typing a range by hand:
 │  End     2026-06-16 10:12:15.744                           │
 │                                                            │
 │log spans 2026-06-16 10:09:43.288 .. 2026-06-16 10:12:15.744│
-│Up/Down move  Space pick preset  Enter apply  Esc cancel    │
+│Up/Down move (a preset fills the fields)  Enter apply       │
 └────────────────────────────────────────────────────────────┘
 ```
 
-`Up`/`Down` move between the presets and the two fields, `Space` picks the preset
-under the cursor and fills the fields from it, and `Enter` adds the range as an
-`include` filter on `timestamp`. The fields are editable, so a preset is a starting
-point rather than the only choice. Leaving a field blank makes that end open, and a
-bad timestamp keeps the picker open rather than discarding what you typed.
+`Up`/`Down` move between the presets and the two fields. **Landing on a preset fills
+`Start` and `End` from it**, so the fields always show the range `Enter` will apply --
+highlight `Last 15 minutes` and press `Enter` and you get fifteen minutes. `Enter`
+installs that range as the project's one `include` filter on `timestamp`, replacing any
+earlier one.
 
-Quick ranges count back from the **newest entry in the log**, not from the current
-time. A log written three weeks ago still answers "last 1 hour" with its own final
+The fields are editable, so a preset is a starting point rather than the only choice.
+Moving between rows clamps rather than wraps, so `Down` off `End` cannot land on a preset
+and overwrite what you just typed. Leaving a field blank makes that end open, and a bad
+timestamp keeps the picker open rather than discarding what you typed.
+
+Reopening the picker on an existing range (`t`, or `Enter` on the sidebar's `Time` row)
+starts on `Start` rather than on a preset, so `Space` cannot overwrite the range you came
+to adjust.
+
+Quick ranges count back from the **newest entry across all loaded logs**, not from
+the current time -- so with several sources loaded, `Last 15 minutes` is the last fifteen
+minutes of the whole project, whichever pane has focus. A log written three weeks ago still answers "last 1 hour" with its own final
 hour, instead of an empty pane.
 
 ## Selecting and Copying
@@ -303,10 +351,66 @@ do by default; `xterm` needs `disallowedWindowOps` adjusted and `tmux` needs
 
 ## Hiding by Example
 
-Press `H` on one line to choose a field from that line's log format and add an
-exclude filter for the current value. For the built-in bracketed format, choices
-include `timestamp`, `host`, `log_module`, `log_level`, `error_code`, `file_name`,
-`line_number`, and `message`. Choices are keyed `1`-`9`, `0`, then `a`, `b`, `c`, ...
+Press `H` on one line to open its field menu. Every field of that line's log format is
+listed with the value the line actually carries, shortened to its first three words:
+
+```text
+┌Hide───────────────────────────────────────────────────────┐
+│Hide logs matching all 2 picked fields                     │
+│                                                           │
+│   1  timestamp      2026-06-16 10:09:43.288               │
+│   2  host           h1                                    │
+│ + 6  log_module     Kernel                                │
+│>+ 7  log_level      Trace                                 │
+│   8  error_code     (empty)                               │
+│   d  message        NetChannel : Channel …                │
+│                                                           │
+│Space picks a field   Enter combines the picks with AND    │
+│Tab  switch to keep only                                   │
+│H  message pattern, with the ids and counters generalised  │
+└───────────────────────────────────────────────────────────┘
+```
+
+A field's own key -- `1`-`9`, `0`, then `a`, `b`, `c`, ... -- hides by it in one press, as
+an `exclude <field> equals <value>` rule. Or move with `↑`/`↓`, pick fields with `Space`,
+and press `Enter` to combine them.
+
+**Hide or keep.** The menu defaults to hiding, since that is what `H` is for, but `Tab`
+flips the whole menu to **keep only** -- the title, the heading and the direction all
+change. Every action then builds an `include` rule instead of an `exclude` one, so a field
+key, an `Enter`-combined regex, and the derived message pattern all narrow the view to the
+matching lines rather than dropping them.
+
+### Combining Fields with AND
+
+Two independent `exclude` rules are an OR: each hides on its own. To hide the lines that
+are `Kernel` **and** `Trace`, picking both fields builds a single regex over the whole log
+line and opens it in the pattern popup:
+
+```text
+(?s)^.*? \[HOST:.*?\]\[SERVER:.*?\]\[PID:.*?\]\[THR:.*?\]\[Kernel\]\[Trace(?:\]\[.*?)?\] ...
+```
+
+The chosen fields are pinned to their values and every other field is left free. It has to
+be one positional pattern because Rust's regex engine has no lookaround, so an unordered
+conjunction over one string cannot be written any other way -- but the log format already
+says where each field sits, which is exactly what makes the conjunction expressible.
+
+Pinning an optional field to the value the line had works in both directions: `error_code`
+set to `0x800424FB` demands that code, and `error_code` shown as `(empty)` demands its
+absence. Multi-line records match too, continuation lines included.
+
+The rule is saved as `exclude raw regex '...'`, and the popup counts what it will remove
+before you commit it. One field alone stays an `equals` rule: it reads better in the
+sidebar, and it still holds on a line the schema cannot fully parse.
+
+Press `H` again in the menu to derive a pattern from the one line instead, generalising
+the values inside it while every word stays put:
+
+```text
+Session 900 created for user analyst
+->  Session\s+\d+\s+created\s+for\s+user\s+analyst
+```
 
 Select several similar lines and press `H`. Instead of the single-line field menu, it
 derives a regex shared by all of them and opens it in an editable popup:
@@ -314,18 +418,97 @@ derives a regex shared by all of them and opens it in an editable popup:
 ```text
 Distribution Service Trigger: 5 subscriptions queued
 Distribution Service Trigger: 7 subscriptions queued
-->  Distribution\s+Service\s+Trigger:\s+\S+\s+subscriptions\s+queued
+->  Distribution\s+Service\s+Trigger:\s+\d+\s+subscriptions\s+queued
 ```
 
-It picks the most general pattern the lines support, and never a catch-all:
+### Choosing How Greedy to Be
 
-1. Same token count: differing tokens become `\S+`.
-2. Enough shared tokens: the tokens common to all, joined by `.*`.
-3. Otherwise the lines are not variants of one template, so they are matched
-   literally as `(?:one|two)`. Generalising from, say, a banner line and two stack
-   traces would hide half the file.
+One derived pattern is a guess about how much you meant to hide. The popup offers the
+whole ladder instead, and counts what each rung would take out of the rows on screen:
 
-Press Enter to add it as an `exclude` filter, saved with the project like any other.
+```text
+┌Hide Pattern─────────────────────────────────────────────────────────┐
+│Regex over the message field - Up/Down pick a template, or edit it   │
+│                                                                     │
+│> Session\s+\d+\s+created\s+for\s+user\s+\S+                         │
+│                                                                     │
+│    prefix    leading words, then .*           matches 30            │
+│    loose     shared words, .* between         matches 20            │
+│    wildcard  \S+ where the lines differ       matches 20            │
+│  ▸ typed     value shapes where they differ   matches 20            │
+│    exact     just these lines                 matches 2             │
+│                                                                     │
+│  hides 20 of 40 shown rows                                          │
+│    Session 900 created for user analyst                             │
+│    Session 901 created for user admin                               │
+│                                                                     │
+│  Tab hide/keep   Enter apply   Esc cancel                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+`Up`/`Down` move between templates, loading each into the editable field. The five
+strategies:
+
+| Template | What it does |
+| --- | --- |
+| `loose` | the tokens common to every line, joined by `.*` |
+| `prefix` | the leading tokens every line opens with, then `.*` |
+| `wildcard` | same token count: `\S+` wherever the lines differ |
+| `typed` | same token count: the tightest shape covering every version of a differing token -- `\d+`, a UUID, an IP, `0x...` hex, a quoted string. A token differing only in its tail keeps its head, so `id=1` and `id=2` give `id=\d+` |
+| `exact` | the selected lines, literally, as `(?:one\|two)` |
+
+The list is ordered by how many rows each template matches **in your log**, not by which
+strategy built it, because that is the only honest measure of greedy. A template two
+strategies both arrive at is offered once. A template of nothing but wildcards is never
+offered: it would match far more than the lines it came from. Templates the selection
+cannot support are absent -- `wildcard` and `typed` need equal token counts, and a lone
+line has nothing to diff against.
+
+It opens on `typed`, the tightest generalising rung, so the looser ones are a deliberate
+step rather than a default.
+
+The header counts what the field's *current* regex would do -- `hides 412 of 8,201 shown
+rows` -- and lists the first few lines it would remove, so an edit is measured too. An
+unfinished regex reports its error there rather than a count. On a pane of more than
+50,000 rows the counts are a floor, shown as `matches 412+`.
+
+Press `Tab` to flip the rule between **hide** (`exclude`) and **keep** (`include`), so the
+same derived pattern serves "drop this noise" and "show me only these". Press Enter to add
+it, saved with the project like any other filter.
+
+## Opening a Folder
+
+Press `o` to browse for a folder, starting from the one the project is already in. The
+popup lists the subfolders of wherever you are, plus how many files sit directly in it:
+
+```text
+┌Open Folder──────────────────────────────────┐
+│…/var/log/appserver                          │
+│12 files here                                │
+│                                             │
+│> ./     open this folder                    │
+│  ../    go up                               │
+│  archive/                                   │
+│  nested/                                    │
+│                                             │
+│j/k move   Enter select   Right in   Left up │
+└─────────────────────────────────────────────┘
+```
+
+| Key | Action |
+| --- | --- |
+| `j` / `k`, `↑` / `↓` | move the selection |
+| `PgUp` / `PgDn`, `Ctrl+u` / `Ctrl+d` | move by ten |
+| `g` / `G` | first / last row |
+| `Enter` | do what the selected row says: open `./`, go up on `../`, otherwise enter the subfolder |
+| `→` / `l` | enter the selected subfolder |
+| `←` / `h` / `Backspace` | go up one folder |
+| `.` | show or hide dot-folders |
+| `Esc` | cancel without changing the project |
+
+`Enter` only ever does the one thing its row names, so the `./` row is where opening
+happens. Opening a folder adds every direct text file in it, exactly as `logscout <folder>`
+would. A folder that cannot be read leaves the browser where it was and says so.
 
 ## Merging Logs
 
@@ -338,11 +521,17 @@ Give the sidebar focus (`Tab`), then:
 - `Enter` on a log opens its **log format** for editing rather than changing the view.
 
 Lines with no parseable timestamp (banners, continuations) stay next to the line
-they belong with rather than sinking to the top.
+they belong with rather than sinking to the top. A file's *leading* untimestamped lines
+have no earlier line to sit beside, so they borrow that file's first known timestamp.
 
 Each line keeps the log format of the file it came from, so merging a bracketed log with a
 differently-formatted one still extracts both correctly. The Detail panel shows a
 `from` row naming the origin file, and `source` is available as a search field.
+
+When a log's format names no timestamp field -- as `Generic line` does not -- the time is
+read straight off the head of each line, so it still merges in order. The ISO-8601 family
+is recognised: `2026-06-16 10:09:43.288`, `2026-06-16T10:09:43,288Z`, `2026/06/16 10:09:43`,
+each optionally behind a `[`.
 
 A merge is a property of the pane, not a new log: it never appears in the file
 list and is never written to `project.json`. Changing a source file's log format, or
@@ -354,6 +543,13 @@ A log format is the parser definition that turns a raw line into named fields.
 It has a name, expression, optional description, timestamp field, and timestamp
 format. Users define formats in the project; a format is then assigned **per
 file**, so one project can hold logs of different shapes.
+
+Two formats are built in. `Bracketed default` reads the bracketed server log. `Generic line`
+reads anything: its expression is a bare `<message>`, so every line is its own entry and
+nothing is extracted. Detection tries formats most specific first, so `Generic line` only
+wins a file no other format explains -- which is the point, because under a format that
+matches nothing at all, no line starts a record and the whole file folds into one entry.
+A file whose stored format explains none of its opening lines is re-detected on load.
 
 Press `S` to provide a reusable log format:
 

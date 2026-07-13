@@ -1,11 +1,13 @@
 use chrono::{NaiveDate, Timelike};
 use log_scouter::core::extractor::{
-    default_extractor, detect, export_schemas_to_folder, load_schemas_from_folder,
-    preview_extraction, user_schema_dir, Extractor, SampleLine, BRACKETED_LEGACY_FORMAT,
+    default_extractor, detect, export_schemas_to_folder, generic_extractor,
+    load_schemas_from_folder, preview_extraction, sniff_timestamp, user_schema_dir, Extractor,
+    SampleLine, BRACKETED_LEGACY_FORMAT, GENERIC_EXTRACTOR_NAME,
 };
 use log_scouter::core::filters::{
     common_message_pattern, expand_tilde, export_filters_to_folder, hide_like,
-    load_filters_from_folder, user_filter_dir, FilterFile, FilterRule, FilterSet,
+    load_filters_from_folder, message_template, pattern_candidates, user_filter_dir, FilterFile,
+    FilterRule, FilterSet,
 };
 use log_scouter::core::models::{merge_files, LogFileModel, ViewModel, VisibleIndices};
 use log_scouter::core::project::{text_files_in_dir, Project};
@@ -310,6 +312,7 @@ fn filters_include_exclude_and_hide_like() {
         &model.entries[kernel_index],
         "module",
         "",
+        true,
     ));
     let visible: Vec<_> = model
         .entries
@@ -406,9 +409,10 @@ fn common_pattern_generalises_differing_tokens_in_place() {
         "Distribution Service Trigger: 7 subscriptions queued",
     ])
     .unwrap();
+    // Both differing tokens are integers, so the wildcard is tightened to their shape.
     assert_eq!(
         pattern,
-        r"Distribution\s+Service\s+Trigger:\s+\S+\s+subscriptions\s+queued"
+        r"Distribution\s+Service\s+Trigger:\s+\d+\s+subscriptions\s+queued"
     );
 
     // The derived regex must match every line it was derived from.
@@ -416,6 +420,8 @@ fn common_pattern_generalises_differing_tokens_in_place() {
     assert!(regex.is_match("Distribution Service Trigger: 5 subscriptions queued"));
     assert!(regex.is_match("Distribution Service Trigger: 7 subscriptions queued"));
     assert!(!regex.is_match("Cache miss for session 12"));
+    // ... and only lines of that shape: a non-numeric count is a different statement.
+    assert!(!regex.is_match("Distribution Service Trigger: many subscriptions queued"));
 }
 
 #[test]
@@ -494,6 +500,10 @@ fn common_pattern_still_generalises_when_one_line_is_an_outlier_free_header() {
 #[test]
 fn common_pattern_keeps_a_literal_when_only_some_tokens_differ() {
     let pattern = common_message_pattern(&["a 1 c", "a 2 c", "a 3 c"]).unwrap();
+    assert_eq!(pattern, r"a\s+\d+\s+c");
+
+    // Nothing ties the differing tokens together, so the wildcard stays a wildcard.
+    let pattern = common_message_pattern(&["a x1 c", "a 2y c"]).unwrap();
     assert_eq!(pattern, r"a\s+\S+\s+c");
 }
 
@@ -628,7 +638,9 @@ fn merge_applies_each_files_own_schema() {
 
 #[test]
 fn merge_keeps_untimestamped_lines_next_to_their_own_file() {
-    // A banner with no timestamp must not sink to the top of the merge.
+    // A banner with no timestamp of its own has nowhere to sort, so it borrows the first
+    // timestamp its own file does have and sits just above it -- rather than ahead of
+    // every other file's records, which is where the sentinel would put it.
     let left = bracketed_model(
         "f1",
         &[
@@ -647,8 +659,8 @@ fn merge_keeps_untimestamped_lines_next_to_their_own_file() {
         .iter()
         .map(|entry| merged.message(entry))
         .collect();
-    assert_eq!(messages[0], "# Server Log version 2.0");
-    assert_eq!(messages[1], "early");
+    assert_eq!(messages[0], "early");
+    assert_eq!(messages[1], "# Server Log version 2.0");
     assert_eq!(messages[2], "late");
 }
 
@@ -1377,4 +1389,601 @@ fn samples_round_trip_through_a_schema_pack() {
     let loaded = load_schemas_from_folder(&folder).unwrap();
     assert_eq!(loaded[0].schema.samples.len(), 3);
     assert_eq!(loaded[0].schema.samples[1].level.as_deref(), Some("Error"));
+}
+
+// ---- generic fallback schema, timestamp sniffing, and the merge they rescue ----------
+
+#[test]
+fn sniff_reads_the_iso_timestamp_family_off_a_raw_line() {
+    let expect = NaiveDate::from_ymd_opt(2026, 6, 16)
+        .unwrap()
+        .and_hms_milli_opt(10, 9, 43, 288)
+        .unwrap();
+
+    assert_eq!(
+        sniff_timestamp("2026-06-16 10:09:43.288 INFO x"),
+        Some(expect)
+    );
+    assert_eq!(
+        sniff_timestamp("2026-06-16T10:09:43,288Z INFO x"),
+        Some(expect)
+    );
+    assert_eq!(
+        sniff_timestamp("[2026/06/16 10:09:43.288] INFO x"),
+        Some(expect)
+    );
+    // Sub-millisecond precision is padded, not truncated.
+    assert_eq!(
+        sniff_timestamp("2026-06-16 10:09:43.2880000 x"),
+        Some(expect)
+    );
+
+    // No leading timestamp, an impossible date, and a bare time all decline.
+    assert_eq!(sniff_timestamp("        at Foo.bar(Foo.java:12)"), None);
+    assert_eq!(sniff_timestamp("2026-13-45 10:09:43.288 x"), None);
+    assert_eq!(sniff_timestamp("10:09:43 WARN disk full"), None);
+}
+
+#[test]
+fn a_log_no_schema_explains_falls_back_to_one_entry_per_line() {
+    // Under the bracketed schema no line starts a record, so the whole file used to fold
+    // into a single entry. The catch-all keeps the lines apart.
+    let lines = [
+        "2026-06-16 10:00:01,000 INFO alpha".to_string(),
+        "2026-06-16 10:00:02,000 INFO beta".to_string(),
+    ];
+    let bracketed = default_extractor();
+    let generic = generic_extractor();
+
+    let chosen = detect([&bracketed, &generic], &lines).expect("a schema always wins");
+    assert_eq!(chosen.name, GENERIC_EXTRACTOR_NAME);
+    // The bracketed schema is more specific, so it still wins a file it can read.
+    let bracketed_lines = [SAMPLE.lines().next().unwrap().to_string()];
+    let chosen = detect([&bracketed, &generic], &bracketed_lines).unwrap();
+    assert_eq!(chosen.name, bracketed.name);
+}
+
+#[test]
+fn the_generic_schema_carries_a_sniffed_timestamp() {
+    let extractor = generic_extractor();
+    let mut model = LogFileModel::new(
+        "f1",
+        "plain.log",
+        extractor.name.clone(),
+        "",
+        Some(extractor),
+    );
+    model.load_from_lines(["2026-06-16 10:00:02,500 INFO beta one"]);
+
+    assert_eq!(model.entries.len(), 1);
+    assert_eq!(
+        model.message(&model.entries[0]),
+        "2026-06-16 10:00:02,500 INFO beta one"
+    );
+    assert_eq!(
+        model.timestamp(&model.entries[0]),
+        NaiveDate::from_ymd_opt(2026, 6, 16)
+            .unwrap()
+            .and_hms_milli_opt(10, 0, 2, 500)
+    );
+}
+
+#[test]
+fn a_folder_of_mixed_formats_merges_in_timestamp_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bracketed = tmp.path().join("a.log");
+    let plain = tmp.path().join("b.log");
+    std::fs::write(
+        &bracketed,
+        "2026-06-16 10:00:01.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:1] alpha one\n\
+         2026-06-16 10:00:03.000 [HOST:h][SERVER:S][PID:1][THR:2][Kernel][Trace][UID:0][SID:0][OID:0][a.cpp:2] alpha two\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &plain,
+        "2026-06-16 10:00:02.000 INFO beta one\n2026-06-16 10:00:04.000 INFO beta two\n",
+    )
+    .unwrap();
+
+    let mut project = Project::load(tmp.path());
+    project.add_file(&bracketed, None);
+    project.add_file(&plain, None);
+    project.load_all_files();
+    assert_eq!(project.files[1].extractor_name, GENERIC_EXTRACTOR_NAME);
+
+    let sources: Vec<&LogFileModel> = project.files.iter().collect();
+    let merged = merge_files("m1", &sources);
+    assert_eq!(merged.entries.len(), 4);
+
+    // The two schemas interleave: each file's lines land where their timestamps say.
+    let expected = ["alpha one", "beta one", "alpha two", "beta two"];
+    for (entry, want) in merged.entries.iter().zip(expected) {
+        assert!(
+            entry.raw.ends_with(want),
+            "{:?} should end with {want}",
+            entry.raw
+        );
+    }
+    let stamps: Vec<_> = merged
+        .entries
+        .iter()
+        .map(|entry| merged.timestamp(entry).expect("every line carries a time"))
+        .collect();
+    assert!(
+        stamps.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{stamps:?}"
+    );
+}
+
+#[test]
+fn a_stored_schema_that_explains_nothing_is_re_detected_on_load() {
+    // A project.json written before the catch-all existed pinned the bracketed schema on
+    // a file it cannot read. Loading heals it rather than serving one giant entry.
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain.log");
+    std::fs::write(
+        &plain,
+        "2026-06-16 10:00:02,000 INFO beta one\nsecond line\n",
+    )
+    .unwrap();
+
+    let mut project = Project::new(tmp.path());
+    project.add_file(&plain, Some("Bracketed default".to_string()));
+    assert_eq!(project.files[0].extractor_name, "Bracketed default");
+
+    project.load_all_files();
+    assert_eq!(project.files[0].extractor_name, GENERIC_EXTRACTOR_NAME);
+    assert_eq!(project.files[0].entries.len(), 2);
+}
+
+#[test]
+fn a_deliberate_schema_that_does_explain_the_file_survives_load() {
+    // Healing must only fire on a schema that matches nothing at all.
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("compact.log");
+    std::fs::write(&log, COMPACT_LOG).unwrap();
+
+    let mut project = Project::new(tmp.path());
+    let compact =
+        Extractor::with_timestamp_format("compact", "<timestamp> <level>: <message>", "%H:%M:%S")
+            .unwrap();
+    project.add_extractor(compact).unwrap();
+    project.add_file(&log, Some("compact".to_string()));
+
+    project.load_all_files();
+    assert_eq!(project.files[0].extractor_name, "compact");
+    assert_eq!(project.files[0].level(&project.files[0].entries[0]), "WARN");
+}
+
+// ---- pattern derivation -------------------------------------------------------------
+
+#[test]
+fn differing_tokens_collapse_to_the_tightest_shared_shape() {
+    let class = |left: &str, right: &str| {
+        common_message_pattern(&[&format!("x {left} y"), &format!("x {right} y")]).unwrap()
+    };
+
+    assert_eq!(
+        class("0x800424FB", "0x8004010C"),
+        r"x\s+0[xX][0-9a-fA-F]+\s+y"
+    );
+    assert_eq!(
+        class("10.0.0.5", "10.0.0.6"),
+        r"x\s+\d{1,3}(?:\.\d{1,3}){3}\s+y"
+    );
+    assert_eq!(class("1.25", "3.5"), r"x\s+\d+[.,]\d+\s+y");
+    assert_eq!(
+        class(
+            "8ea1c0de-1111-2222-3333-444455556666",
+            "9fb2d1ef-7777-8888-9999-aaaabbbbcccc"
+        ),
+        r"x\s+[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\s+y"
+    );
+    // Words are not identifiers, however hex-looking.
+    assert_eq!(class("alpha", "gamma"), r"x\s+\S+\s+y");
+}
+
+#[test]
+fn a_differing_token_keeps_the_part_every_line_agrees_on() {
+    let pattern = common_message_pattern(&["session id=1 opened", "session id=27 opened"]).unwrap();
+    assert_eq!(pattern, r"session\s+id=\d+\s+opened");
+
+    let regex = regex::Regex::new(&pattern).unwrap();
+    assert!(regex.is_match("session id=99 opened"));
+    assert!(!regex.is_match("session id=x opened"));
+}
+
+#[test]
+fn a_column_of_pure_wildcards_never_becomes_the_template() {
+    // "5" and "7" share a shape but no literal text; a bare `\d+` would hide every line
+    // holding a number, so the lines are matched literally instead.
+    let pattern = common_message_pattern(&["5", "7"]).unwrap();
+    assert_eq!(pattern, "(?:5|7)");
+}
+
+#[test]
+fn a_single_line_generalises_its_value_shapes_and_keeps_its_words() {
+    let pattern = message_template("Session 900 created for user analyst").unwrap();
+    assert_eq!(pattern, r"Session\s+\d+\s+created\s+for\s+user\s+analyst");
+
+    let regex = regex::Regex::new(&pattern).unwrap();
+    assert!(regex.is_match("Session 41 created for user analyst"));
+    assert!(!regex.is_match("Session 41 destroyed for user analyst"));
+
+    // Punctuation clinging to a value is kept; the value itself gives way.
+    assert_eq!(
+        message_template("timeout after 30s, retry=4;").unwrap(),
+        r"timeout\s+after\s+30s,\s+retry=\d+;"
+    );
+    // A message with nothing to generalise is still a usable literal pattern.
+    assert_eq!(message_template("cache miss").unwrap(), r"cache\s+miss");
+    // ... and one with nothing *but* a value falls back to the value itself, rather than
+    // to a bare `\d+` that would hide every line holding a number.
+    assert_eq!(message_template("900").unwrap(), "900");
+    assert_eq!(message_template("   "), None);
+}
+
+// ---- the ladder of templates `H` offers ---------------------------------------------
+
+/// Names of the offered templates, in the order the derivation produced them.
+fn candidate_names(messages: &[&str]) -> Vec<&'static str> {
+    pattern_candidates(messages)
+        .iter()
+        .map(|option| option.name)
+        .collect()
+}
+
+fn candidate(messages: &[&str], name: &str) -> String {
+    pattern_candidates(messages)
+        .into_iter()
+        .find(|option| option.name == name)
+        .unwrap_or_else(|| panic!("no {name} template among {:?}", candidate_names(messages)))
+        .pattern
+}
+
+#[test]
+fn the_ladder_runs_from_the_loosest_strategy_to_the_strictest() {
+    let lines = ["a 1 c", "a 2 c"];
+    assert_eq!(
+        candidate_names(&lines),
+        ["loose", "prefix", "wildcard", "typed", "exact"]
+    );
+    assert_eq!(candidate(&lines, "loose"), r"a.*c");
+    assert_eq!(candidate(&lines, "prefix"), r"a.*");
+    assert_eq!(candidate(&lines, "wildcard"), r"a\s+\S+\s+c");
+    assert_eq!(candidate(&lines, "typed"), r"a\s+\d+\s+c");
+    assert_eq!(candidate(&lines, "exact"), "(?:a 1 c|a 2 c)");
+
+    // Every template must still match the lines it was derived from.
+    for option in pattern_candidates(&lines) {
+        let regex = regex::Regex::new(&option.pattern).unwrap();
+        for line in lines {
+            assert!(regex.is_match(line), "{} misses {line:?}", option.name);
+        }
+    }
+}
+
+#[test]
+fn a_template_is_offered_once_however_many_strategies_reach_it() {
+    // The differing tokens share no value shape, so `typed` lands on `wildcard`'s regex.
+    let lines = ["a x1 c", "a 2y c"];
+    let names = candidate_names(&lines);
+    assert!(names.contains(&"wildcard"), "{names:?}");
+    assert!(!names.contains(&"typed"), "duplicate offered: {names:?}");
+    assert_eq!(candidate(&lines, "wildcard"), r"a\s+\S+\s+c");
+}
+
+#[test]
+fn lines_of_different_lengths_still_get_the_loose_rungs() {
+    // The aligned strategies need equal token counts; `loose` and `prefix` do not.
+    let lines = [
+        "Cache miss for session 12",
+        "Cache miss for user bob in session 13",
+    ];
+    assert_eq!(candidate_names(&lines), ["loose", "prefix", "exact"]);
+    assert_eq!(candidate(&lines, "loose"), r"Cache.*miss.*for.*session");
+    assert_eq!(candidate(&lines, "prefix"), r"Cache\s+miss\s+for.*");
+}
+
+#[test]
+fn a_lone_line_is_not_offered_a_wildcard_it_cannot_derive() {
+    // With nothing to diff against, `\S+ where the lines differ` would be the line itself.
+    let lines = ["Session 900 created for user analyst"];
+    let names = candidate_names(&lines);
+    assert!(!names.contains(&"wildcard"), "{names:?}");
+    assert_eq!(
+        candidate(&lines, "typed"),
+        r"Session\s+\d+\s+created\s+for\s+user\s+analyst"
+    );
+    assert_eq!(
+        candidate(&lines, "prefix"),
+        r"Session\s+900\s+created\s+for\s+user\s+analyst.*"
+    );
+
+    assert!(pattern_candidates(&[]).is_empty());
+    assert!(pattern_candidates(&["  ", "   "]).is_empty());
+}
+
+/// Whatever else the ladder offers, the rung `H` opens on is one of its own.
+#[test]
+fn the_default_template_is_one_of_the_offered_rungs() {
+    for lines in [
+        vec!["a 1 c", "a 2 c"],
+        vec!["alpha beta", "gamma delta"],
+        vec!["Cache miss for session 12", "Cache miss for user bob in 13"],
+        vec!["5", "7"],
+    ] {
+        let default = common_message_pattern(&lines).unwrap();
+        let patterns: Vec<String> = pattern_candidates(&lines)
+            .into_iter()
+            .map(|option| option.pattern)
+            .collect();
+        assert!(
+            patterns.contains(&default),
+            "default {default:?} missing from {patterns:?}"
+        );
+    }
+
+    let default = message_template("Session 900 created").unwrap();
+    let patterns: Vec<String> = pattern_candidates(&["Session 900 created"])
+        .into_iter()
+        .map(|option| option.pattern)
+        .collect();
+    assert!(patterns.contains(&default), "{patterns:?}");
+}
+
+// ---- ANDing a line's fields into one regex -------------------------------------------
+
+const TRACE_LINE: &str = "2026-06-16 10:09:43.288 [HOST:h1][SERVER:AppServer][PID:54][THR:1366][Kernel][Trace][UID:0][SID:0][OID:0][D.cpp:394] NetChannel closed";
+const OTHER_HOST: &str = "2026-06-16 10:09:44.000 [HOST:h2][SERVER:AppServer][PID:54][THR:1366][Kernel][Trace][UID:0][SID:0][OID:0][D.cpp:395] other host";
+
+#[test]
+fn field_pattern_pins_the_chosen_fields_and_frees_the_rest() {
+    let extractor = default_extractor();
+    let chosen = [
+        ("host".to_string(), "h1".to_string()),
+        ("log_level".to_string(), "Trace".to_string()),
+    ];
+    let pattern = extractor.field_pattern(&chosen).unwrap();
+    let regex = regex::Regex::new(&pattern).unwrap();
+
+    // Both pinned fields must hold. Neither alone is enough.
+    assert!(regex.is_match(TRACE_LINE));
+    assert!(!regex.is_match(OTHER_HOST), "host was not pinned");
+    assert!(!regex.is_match(ERROR_LINE), "level was not pinned");
+
+    // A continuation line belongs to its entry's raw text, so `.` must cross newlines.
+    let multi = format!("{TRACE_LINE}\n  at Foo.bar(Foo.java:12)");
+    assert!(regex.is_match(&multi), "multi-line entry rejected");
+}
+
+#[test]
+fn field_pattern_pins_an_optional_field_in_both_directions() {
+    let extractor = default_extractor();
+
+    // `ERROR_LINE` carries `[0x800424FB]`; pinning it excludes lines without a code.
+    let present = [("error_code".to_string(), "0x800424FB".to_string())];
+    let regex = regex::Regex::new(&extractor.field_pattern(&present).unwrap()).unwrap();
+    assert!(regex.is_match(ERROR_LINE));
+    assert!(!regex.is_match(TRACE_LINE));
+
+    // Pinning it to the empty value the source line had means "lines with no code",
+    // because the optional group carries its own separator and simply goes away.
+    let absent = [
+        ("log_level".to_string(), "Trace".to_string()),
+        ("error_code".to_string(), String::new()),
+    ];
+    let regex = regex::Regex::new(&extractor.field_pattern(&absent).unwrap()).unwrap();
+    assert!(regex.is_match(TRACE_LINE));
+    assert!(!regex.is_match(ERROR_LINE), "a coded line slipped through");
+}
+
+#[test]
+fn field_pattern_of_a_format_with_no_fields_is_none() {
+    let bare = Extractor::new("bare", "no placeholders here").unwrap();
+    assert_eq!(bare.field_pattern(&[]), None);
+
+    // The catch-all has exactly one field, so pinning it is just the message.
+    let generic = generic_extractor();
+    let chosen = [("message".to_string(), "hello".to_string())];
+    let pattern = generic.field_pattern(&chosen).unwrap();
+    let regex = regex::Regex::new(&pattern).unwrap();
+    assert!(regex.is_match("hello"));
+    assert!(!regex.is_match("goodbye"));
+}
+
+// ---- the time range is a slot, not one rule among many -------------------------------
+
+#[test]
+fn a_time_range_is_recognised_whatever_the_field_is_called() {
+    for field in ["timestamp", "time", "ts"] {
+        let rule = FilterRule::new(field, "range", "a..b", "include");
+        assert!(rule.is_time_range(), "{field} range not recognised");
+    }
+    // A range over something else is an ordinary filter, and so is an equals on the time.
+    assert!(!FilterRule::new("line_number", "range", "1..9", "include").is_time_range());
+    assert!(!FilterRule::new("timestamp", "equals", "a", "include").is_time_range());
+}
+
+#[test]
+fn time_bounds_split_a_range_and_allow_an_open_end() {
+    let bounded = FilterRule::new("timestamp", "range", " a .. b ", "include");
+    assert_eq!(bounded.time_bounds(), ("a", "b"));
+    let from = FilterRule::new("timestamp", "range", "a..", "include");
+    assert_eq!(from.time_bounds(), ("a", ""));
+    let until = FilterRule::new("timestamp", "range", "..b", "include");
+    assert_eq!(until.time_bounds(), ("", "b"));
+}
+
+/// A project answers "when" once. Adding a second range replaces the first, in place.
+#[test]
+fn a_second_time_range_replaces_the_first_and_keeps_its_place() {
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new("level", "equals", "Trace", "exclude"));
+    filters.add(FilterRule::new("timestamp", "range", "a..b", "include"));
+    filters.add(FilterRule::new("module", "contains", "SQL", "include"));
+    assert_eq!(filters.rules.len(), 3);
+    assert_eq!(filters.time_index(), Some(1));
+
+    filters.add(FilterRule::new("timestamp", "range", "c..d", "include"));
+    assert_eq!(filters.rules.len(), 3, "a second range was appended");
+    assert_eq!(filters.time_index(), Some(1), "the range moved");
+    assert_eq!(filters.time_rule().unwrap().value, "c..d");
+
+    // The text rules are everything else, and keep their real indices.
+    let text: Vec<(usize, &str)> = filters
+        .text_rules()
+        .map(|(index, rule)| (index, rule.field.as_str()))
+        .collect();
+    assert_eq!(text, [(0, "level"), (2, "module")]);
+
+    filters.clear_time();
+    assert_eq!(filters.time_rule(), None);
+    assert_eq!(filters.rules.len(), 2);
+    // Clearing a range that is not there is not an error.
+    filters.clear_time();
+    assert_eq!(filters.rules.len(), 2);
+}
+
+/// The replacement holds through the filter machinery, not just the bookkeeping.
+#[test]
+fn only_the_latest_time_range_filters_the_log() {
+    let model = sample_model();
+    let mut filters = FilterSet::default();
+    filters.add(FilterRule::new(
+        "timestamp",
+        "range",
+        "2026-06-16 10:09:43..2026-06-16 10:12:20",
+        "include",
+    ));
+    let wide = model
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&model, entry))
+        .count();
+
+    filters.add(FilterRule::new(
+        "timestamp",
+        "range",
+        "2026-06-16 10:09:43..2026-06-16 10:09:44",
+        "include",
+    ));
+    let narrow = model
+        .entries
+        .iter()
+        .filter(|entry| filters.visible(&model, entry))
+        .count();
+
+    assert!(
+        narrow < wide,
+        "the first range still applies: {narrow} of {wide}"
+    );
+    assert_eq!(filters.rules.len(), 1);
+}
+
+// ---- the time slot tolerates no leftovers -------------------------------------------
+
+#[test]
+fn set_time_removes_every_earlier_range_not_just_the_first() {
+    let mut filters = FilterSet::default();
+    // Two stale ranges, as an old build could have left behind.
+    filters
+        .rules
+        .push(FilterRule::new("timestamp", "range", "a..b", "include"));
+    filters
+        .rules
+        .push(FilterRule::new("level", "equals", "Trace", "exclude"));
+    filters
+        .rules
+        .push(FilterRule::new("timestamp", "range", "c..d", "include"));
+
+    filters.set_time(FilterRule::new("timestamp", "range", "e..f", "include"));
+    let ranges: Vec<&str> = filters
+        .rules
+        .iter()
+        .filter(|rule| rule.is_time_range())
+        .map(|rule| rule.value.as_str())
+        .collect();
+    assert_eq!(ranges, ["e..f"], "a stale range survived set_time");
+    // The text rule is untouched.
+    assert_eq!(filters.text_rules().count(), 1);
+}
+
+#[test]
+fn dedupe_keeps_the_last_range_and_is_idempotent() {
+    let mut filters = FilterSet::default();
+    filters
+        .rules
+        .push(FilterRule::new("timestamp", "range", "old..x", "include"));
+    filters
+        .rules
+        .push(FilterRule::new("host", "equals", "h", "exclude"));
+    filters
+        .rules
+        .push(FilterRule::new("timestamp", "range", "new..y", "include"));
+
+    filters.dedupe_time_range();
+    assert_eq!(filters.time_rule().unwrap().value, "new..y");
+    assert_eq!(
+        filters.rules.iter().filter(|r| r.is_time_range()).count(),
+        1
+    );
+    // Dropping the earlier range shifts the text rule up, but keeps its order.
+    assert_eq!(filters.rules[0].field, "host");
+
+    // Running it again changes nothing.
+    let before = filters.clone();
+    filters.dedupe_time_range();
+    assert_eq!(filters, before);
+
+    // Nothing to do when there is no range.
+    let mut none = FilterSet::default();
+    none.add(FilterRule::new("level", "equals", "Trace", "exclude"));
+    let before = none.clone();
+    none.dedupe_time_range();
+    assert_eq!(none, before);
+}
+
+/// The reported bug: a stale wider `include` range OR's a narrow one back open, so lines
+/// outside the intended window stay visible. One range must mean one window.
+#[test]
+fn a_leftover_wider_range_does_not_reopen_the_window() {
+    let model = sample_model();
+    let inside = |filters: &FilterSet| {
+        model
+            .entries
+            .iter()
+            .filter(|entry| filters.visible(&model, entry))
+            .count()
+    };
+
+    // A narrow window: just the first couple of seconds.
+    let mut narrow = FilterSet::default();
+    narrow.add(FilterRule::new(
+        "timestamp",
+        "range",
+        "2026-06-16 10:09:43..2026-06-16 10:09:44",
+        "include",
+    ));
+    let narrow_count = inside(&narrow);
+
+    // Simulate the broken on-disk state: a stale wider range sitting beside it.
+    let mut broken = narrow.clone();
+    broken.rules.insert(
+        0,
+        FilterRule::new(
+            "timestamp",
+            "range",
+            "2026-06-16 10:09:43..2026-06-16 10:20:00",
+            "include",
+        ),
+    );
+    assert!(
+        inside(&broken) > narrow_count,
+        "two include ranges should OR wider -- otherwise this test proves nothing"
+    );
+
+    // Loading heals it; the window is narrow again.
+    broken.dedupe_time_range();
+    assert_eq!(inside(&broken), narrow_count);
 }
