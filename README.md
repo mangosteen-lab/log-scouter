@@ -289,7 +289,8 @@ filters, saved searches, settings, last session), with user-level libraries unde
 
 | Key | Action |
 |---|---|
-| `a` / `o` / `d` | add file / browse for a folder / remove focused file from project |
+| `a` / `o` | browse for a file to add / browse for a folder |
+| `d` / `Delete` | delete the selected item: a log source, a filter, or a saved search |
 | `j k` or arrows | move selection |
 | `gg` / `G` / `[count]G` | top / bottom / go to visible row |
 | `Ctrl+d` / `Ctrl+u` | half page down/up |
@@ -302,7 +303,6 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `y` / right-click | copy selected raw lines (cursor line if nothing selected) |
 | `Esc` | clear the selection, then the search |
 | `f` / `t` / `F` | add filter / open the time range picker / clear filters |
-| `Delete` (sidebar) | remove the filter under the cursor |
 | `T` | measure elapsed time from the current line (again to turn off) |
 | `x` / `L` | export filters / import filters from a folder |
 | `X` / `I` | export log schemas / import log schemas from a folder |
@@ -312,8 +312,8 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `↑` / `↓` (pattern popup) | pick a template, greediest first |
 | `Tab` (pattern popup) | flip the derived pattern between hide and keep |
 | `Space` (sidebar log) | add/remove that log from the view, merged by timestamp |
-| `Space` (sidebar filter) | enable/disable that filter |
-| `Space` (sidebar search) | run that saved search, or clear it if it is running |
+| `Space` (sidebar filter) | enable/disable that filter (`d` removes it) |
+| `Space` (sidebar search) | run that saved search, or clear it if it is running (`d` removes it) |
 | `Enter` (sidebar log) | edit that log's format |
 | `Enter` (sidebar filter) | edit that filter rule |
 | `Enter` (sidebar search) | edit that saved search |
@@ -352,7 +352,7 @@ single slot. Two ranges over the same field can only ever intersect, and the sec
 what you just asked for -- so a new range *replaces* the old rather than narrowing it. That
 holds however the range arrives: the `t` picker, the `f` popup, or an imported filter pack.
 
-On any filter row, `Space` enables or disables it and `Delete` removes it. On the `Time`
+On any filter row, `Space` enables or disables it and `d` (or `Delete`) removes it. On the `Time`
 row -- or on the `none - t` under it -- `Enter` reopens the picker on the range in force,
 with the caret on `Start`, so changing "when" never means retyping it. Nobody should have
 to hand-edit `timestamp range 'a..b'`, so that row does not open the filter text editor.
@@ -651,10 +651,32 @@ compatible self-hosted model, or a test double.
 so edits take effect live), which is how you teach it your team's playbook for a class of
 incident. `/skills` lists what you have written and marks the ones that are on.
 
-## Opening a Folder
+## Adding Files and Folders
 
-Press `o` to browse for a folder, starting from the one the project is already in. The
-popup lists the subfolders of wherever you are, plus how many files sit directly in it:
+Press `a` to browse for **one file** to add as a log source, or `o` to browse for a **whole
+folder** (which adds every text file in it). Both start from the folder the project is
+already in and share the same navigation.
+
+The file picker (`a`) lists the text files in each folder alongside the subfolders; `Enter`
+on a file adds it, `Enter` on a folder descends into it. If you would rather type or paste a
+path — say an absolute one far from here — press `p`.
+
+```text
+┌Add Log File─────────────────────────────────┐
+│…/var/log/appserver                          │
+│pick a file to add, or enter a folder        │
+│                                             │
+│  ../    go up                               │
+│  archive/                                   │
+│> app.log                                    │
+│  server.log                                 │
+│                                             │
+│j/k move  Enter add/enter  Left up  p type path│
+└─────────────────────────────────────────────┘
+```
+
+The folder picker (`o`) lists subfolders and how many files sit directly in each, with a
+`./ open this folder` row at the top:
 
 ```text
 ┌Open Folder──────────────────────────────────┐

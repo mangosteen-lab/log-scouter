@@ -519,11 +519,23 @@ enum BrowserRow {
     OpenCurrent,
     Parent,
     Child(PathBuf),
+    /// A file that can be added as a log source. Only listed in `File` purpose.
+    File(PathBuf),
 }
 
-/// The `o` popup: the folder being browsed, and its subfolders.
+/// What the browser is picking: a folder to open (`o`, add every text file in it) or a
+/// single file to add (`a`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserPurpose {
+    Folder,
+    File,
+}
+
+/// The `o`/`a` popup: the folder being browsed, plus its subfolders (and, when picking a
+/// file, the text files in it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FolderBrowser {
+    purpose: BrowserPurpose,
     current: PathBuf,
     rows: Vec<BrowserRow>,
     selected: usize,
@@ -537,8 +549,19 @@ struct FolderBrowser {
 }
 
 impl FolderBrowser {
+    /// Browse `folder` to open a whole folder (the `o` flow).
     fn open(folder: PathBuf) -> std::io::Result<Self> {
+        Self::with_purpose(folder, BrowserPurpose::Folder)
+    }
+
+    /// Browse `folder` to pick one file to add (the `a` flow).
+    fn open_for_file(folder: PathBuf) -> std::io::Result<Self> {
+        Self::with_purpose(folder, BrowserPurpose::File)
+    }
+
+    fn with_purpose(folder: PathBuf, purpose: BrowserPurpose) -> std::io::Result<Self> {
         let mut browser = Self {
+            purpose,
             current: folder,
             rows: Vec::new(),
             selected: 0,
@@ -550,9 +573,11 @@ impl FolderBrowser {
         Ok(browser)
     }
 
-    /// Re-read `current`. Selection returns to the top, which is the "open this" row.
+    /// Re-read `current`. Selection returns to the top.
     fn reload(&mut self) -> std::io::Result<()> {
+        let picking_file = matches!(self.purpose, BrowserPurpose::File);
         let mut children = Vec::new();
+        let mut files = Vec::new();
         let mut file_count = 0;
         for entry in std::fs::read_dir(&self.current)? {
             let path = entry?.path();
@@ -562,16 +587,30 @@ impl FolderBrowser {
                 }
             } else if path.is_file() {
                 file_count += 1;
+                // Offer only text files as log sources, and respect the hidden toggle.
+                if picking_file
+                    && (self.show_hidden || !is_hidden(&path))
+                    && crate::core::project::is_text_file(&path)
+                {
+                    files.push(path);
+                }
             }
         }
         children.sort_by_key(|path| folder_name(path).to_lowercase());
+        files.sort_by_key(|path| folder_name(path).to_lowercase());
 
-        self.rows = vec![BrowserRow::OpenCurrent];
+        // Folder purpose leads with "open this folder"; file purpose has no such row.
+        self.rows = if picking_file {
+            Vec::new()
+        } else {
+            vec![BrowserRow::OpenCurrent]
+        };
         if self.current.parent().is_some() {
             self.rows.push(BrowserRow::Parent);
         }
         self.rows
             .extend(children.into_iter().map(BrowserRow::Child));
+        self.rows.extend(files.into_iter().map(BrowserRow::File));
         self.file_count = file_count;
         self.selected = 0;
         self.scroll = 0;
@@ -619,6 +658,7 @@ impl FolderBrowser {
             BrowserRow::OpenCurrent => "./     open this folder".to_string(),
             BrowserRow::Parent => "../    go up".to_string(),
             BrowserRow::Child(path) => format!("{}/", folder_name(path)),
+            BrowserRow::File(path) => folder_name(path),
         }
     }
 }
@@ -2300,7 +2340,13 @@ impl AppState {
         let area = centered_rect(width, height, root);
         frame.render_widget(Clear, area);
 
-        let block = Block::default().title("Open Folder").borders(Borders::ALL);
+        let picking_file = matches!(browser.purpose, BrowserPurpose::File);
+        let title = if picking_file {
+            "Add Log File"
+        } else {
+            "Open Folder"
+        };
+        let block = Block::default().title(title).borders(Borders::ALL);
         let inner = block.inner(area);
         let text_width = inner.width as usize;
         let listed = (inner.height as usize)
@@ -2314,10 +2360,14 @@ impl AppState {
             browser.scroll = browser.selected + 1 - listed;
         }
 
-        let files = match browser.file_count {
-            0 => "no files here".to_string(),
-            1 => "1 file here".to_string(),
-            n => format!("{n} files here"),
+        let files = if picking_file {
+            "pick a file to add, or enter a folder".to_string()
+        } else {
+            match browser.file_count {
+                0 => "no files here".to_string(),
+                1 => "1 file here".to_string(),
+                n => format!("{n} files here"),
+            }
         };
         let mut lines = vec![
             Line::from(Span::styled(
@@ -2350,9 +2400,14 @@ impl AppState {
             )));
         }
 
+        let footer = if picking_file {
+            "j/k move   Enter add file / enter folder   Left up   p type path   . hidden   Esc"
+        } else {
+            "j/k move   Enter select   Right in   Left up   . hidden   Esc cancel"
+        };
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "j/k move   Enter select   Right in   Left up   . hidden   Esc cancel",
+            footer,
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -3335,10 +3390,10 @@ impl AppState {
                 self.open_input(Mode::ImportSchemas(self.default_schema_folder_input()))
             }
             KeyCode::Char('H') => self.begin_hide(),
-            KeyCode::Char('a') => self.open_input(Mode::AddFile(String::new())),
+            KeyCode::Char('a') => self.open_file_browser(),
             KeyCode::Char('o') => self.open_folder_browser(),
-            KeyCode::Char('d') => self.remove_active_file(),
-            KeyCode::Delete if self.focus == Focus::Sidebar => self.remove_selected_filter(),
+            KeyCode::Char('d') => self.delete_selected(),
+            KeyCode::Delete if self.focus == Focus::Sidebar => self.delete_selected(),
             KeyCode::Char('S') => self.open_new_schema_input(),
             KeyCode::Char('|') | KeyCode::Char('\\') => self.split_active(SplitMode::Horizontal),
             KeyCode::Char('-') => self.split_active(SplitMode::Vertical),
@@ -4543,6 +4598,46 @@ impl AppState {
         self.status = format!("filter removed: {removed}");
     }
 
+    fn remove_saved_search(&mut self, index: usize) {
+        if index >= self.project.saved_searches.len() {
+            return;
+        }
+        let removed = self.project.saved_searches.remove(index);
+        self.sidebar_selected = self
+            .sidebar_selected
+            .min(self.sidebar_items().len().saturating_sub(1));
+        self.autosave_project();
+        self.status = format!("search removed: /{removed}");
+    }
+
+    /// `d` (and `Delete` in the sidebar): delete whatever the cursor is on. In the sidebar
+    /// that is the selected log source, filter (text or time), or saved search; in a pane it
+    /// is that pane's log source.
+    fn delete_selected(&mut self) {
+        if self.focus != Focus::Sidebar {
+            self.remove_active_file();
+            return;
+        }
+        enum Target {
+            File,
+            Filter,
+            Search(usize),
+            None,
+        }
+        let target = match self.sidebar_items().get(self.sidebar_selected) {
+            Some(SidebarItem::File { .. }) => Target::File,
+            Some(SidebarItem::Filter { .. } | SidebarItem::TimeFilter { .. }) => Target::Filter,
+            Some(SidebarItem::Search { index, .. }) => Target::Search(*index),
+            _ => Target::None,
+        };
+        match target {
+            Target::File => self.remove_active_file(),
+            Target::Filter => self.remove_selected_filter(),
+            Target::Search(index) => self.remove_saved_search(index),
+            Target::None => {}
+        }
+    }
+
     /// A bad field leaves the popup open on the offending value rather than discarding
     /// everything the user typed.
     fn handle_time_picker_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
@@ -4624,14 +4719,26 @@ impl AppState {
 
     /// `o`: browse for a folder, starting where the project already is.
     fn open_folder_browser(&mut self) {
-        let start = if self.project.root.is_dir() {
+        match FolderBrowser::open(self.browser_start_dir()) {
+            Ok(browser) => self.mode = Mode::OpenFolder(browser),
+            Err(error) => self.status = format!("could not read folder: {error}"),
+        }
+    }
+
+    /// `a`: browse for a single file to add as a log source.
+    fn open_file_browser(&mut self) {
+        match FolderBrowser::open_for_file(self.browser_start_dir()) {
+            Ok(browser) => self.mode = Mode::OpenFolder(browser),
+            Err(error) => self.status = format!("could not read folder: {error}"),
+        }
+    }
+
+    /// Where a browser opens: the project folder if it exists, else the current directory.
+    fn browser_start_dir(&self) -> PathBuf {
+        if self.project.root.is_dir() {
             self.project.root.clone()
         } else {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        };
-        match FolderBrowser::open(start) {
-            Ok(browser) => self.mode = Mode::OpenFolder(browser),
-            Err(error) => self.status = format!("could not read folder: {error}"),
         }
     }
 
@@ -4681,6 +4788,11 @@ impl AppState {
                     failure = Some(format!("could not read folder: {error}"));
                 }
             }
+            // In the file picker, fall back to typing a path (e.g. to paste an absolute one).
+            KeyCode::Char('p') if matches!(browser.purpose, BrowserPurpose::File) => {
+                self.open_input(Mode::AddFile(String::new()));
+                return Ok(false);
+            }
             // Descend only. Enter does that too, but also opens and goes up, depending on
             // the row; these keys keep their one meaning whatever is selected.
             KeyCode::Right | KeyCode::Char('l') => {
@@ -4702,6 +4814,12 @@ impl AppState {
                     failure = walk(&mut browser, parent);
                 }
                 Some(BrowserRow::Child(path)) => failure = walk(&mut browser, Some(path)),
+                // Picking a file: add it and close.
+                Some(BrowserRow::File(path)) => {
+                    self.mode = Mode::Normal;
+                    self.submit_add_file(path.to_string_lossy().to_string())?;
+                    return Ok(false);
+                }
                 None => {}
             },
             _ => {}
@@ -7210,17 +7328,19 @@ fn centered_rect(width: u16, height: u16, root: Rect) -> Rect {
 
 fn help_text() -> &'static str {
     "Project/files
-  a add file        o browse for a folder       d remove focused file       Ctrl+s save
+  a browse for a file  o browse for a folder      d delete selected item      Ctrl+s save
+  d/Delete delete what the cursor is on: a log source, filter, or saved search
   S define reusable log schema
-  In the folder browser: j/k or arrows move, Enter opens './' or enters a subfolder,
-                         Right enters, Left/Backspace goes up, '.' shows hidden folders
+  In the browser: j/k or arrows move, Enter opens './' or a folder (or adds the file),
+                  Right enters, Left/Backspace goes up, '.' shows hidden, Esc cancels
+                  a's file picker also lists files; Enter adds one, or 'p' types a path
   e apply/edit this file's schema (schema name, or full format template)
   i infer this file's schema with the configured LLM (see AI assistant) and apply it
   r label this source (short label | description, so the AI can tell what it is)
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
   In the sidebar: Space on a log adds/removes it, merging the logs by timestamp
-                  Space on a filter enables/disables it; Delete removes it
-                  Space on a saved search runs it, or clears it if running
+                  Space on a filter enables/disables it; d/Delete removes it
+                  Space on a saved search runs it, or clears it if running; d removes it
                   Enter edits that log's schema, that filter, or that search
                   Enter on the Time row (or its 'none - t') reopens the time picker
   Enter also jumps to the selected search result
@@ -9281,6 +9401,35 @@ mod tests {
         assert_eq!(app.project.filters.rules.len(), 0);
     }
 
+    /// `d` deletes whatever the sidebar cursor is on, unified across the kinds of rows.
+    #[test]
+    fn d_deletes_the_selected_filter_or_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.mutate_filters(|filters| {
+            filters.add(FilterRule::new("level", "equals", "Trace", "exclude"))
+        });
+        app.project.saved_searches = vec!["alpha".to_string(), "beta".to_string()];
+        app.focus = Focus::Sidebar;
+
+        // `d` on a text filter removes it, like Delete does.
+        app.sidebar_selected = sidebar_row(&app, "text");
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.project.filters.rules.len(), 0);
+        assert!(app.status.starts_with("filter removed"), "{}", app.status);
+
+        // `d` on a saved search removes that search.
+        let row = app
+            .sidebar_items()
+            .iter()
+            .position(|item| matches!(item, SidebarItem::Search { text, .. } if text == "alpha"))
+            .unwrap();
+        app.sidebar_selected = row;
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.project.saved_searches, vec!["beta".to_string()]);
+        assert!(app.status.contains("search removed"), "{}", app.status);
+    }
+
     /// Typing into Start must reach the field, not the preset list.
     #[test]
     fn the_start_field_is_editable() {
@@ -9761,6 +9910,55 @@ mod tests {
         assert!(app.status.contains("with 1 text file"), "{}", app.status);
         assert_eq!(app.project.root, std::fs::canonicalize(&logs).unwrap());
         assert_eq!(app.active_view().unwrap().visible.len(), 1);
+    }
+
+    #[test]
+    fn the_file_browser_lists_and_adds_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("app.log"),
+            "2026-06-16 10:00:01.000 INFO alpha\n",
+        )
+        .unwrap();
+
+        let mut app = AppState::new(Project::new(root.path()));
+        press(&mut app, KeyCode::Char('a'));
+        assert!(matches!(app.mode, Mode::OpenFolder(_)), "a opens a browser");
+
+        // The file is offered as a row, and the file picker has no "open this folder" row.
+        let rows = browser_rows(&app);
+        assert!(rows.iter().any(|row| row == "app.log"), "rows: {rows:?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("open this folder")),
+            "rows: {rows:?}"
+        );
+
+        // Select the file and add it.
+        let index = rows.iter().position(|row| row == "app.log").unwrap();
+        for _ in 0..index {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        press(&mut app, KeyCode::Enter);
+        app.finish_work();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.project.files.iter().filter(|f| !f.is_merged()).count(),
+            1
+        );
+        assert_eq!(app.active_view().unwrap().visible.len(), 1);
+    }
+
+    #[test]
+    fn the_file_browser_can_fall_back_to_typing_a_path() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(Project::new(root.path()));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('p'));
+        assert!(
+            matches!(app.mode, Mode::AddFile(_)),
+            "p opens the path input"
+        );
     }
 
     #[test]

@@ -512,7 +512,7 @@ pub fn text_files_in_dir(folder: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn is_text_file(path: &Path) -> bool {
+pub fn is_text_file(path: &Path) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
