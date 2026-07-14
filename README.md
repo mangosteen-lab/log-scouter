@@ -11,7 +11,6 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 [Concept Model](#concept-model) · [Architecture](#architecture) · [Keys](#keys) ·
 [Filters](#filters-text-and-time) · [Search](#search-query-language) ·
 [Hiding by Example](#hiding-by-example) · [AI Assistant](#ai-assistant) ·
-[External Agents (MCP)](#driving-it-from-an-external-agent-mcp) ·
 [Log Formats](#log-formats) · [Building from Source](#building-from-source) ·
 [Development](#development) · [Releasing](#releasing)
 
@@ -29,6 +28,8 @@ together they explain what the app is built out of and how the pieces fit and ru
 - **Schema detection.** Adding a file matches its first lines against the project's log
   formats and picks the one that explains them, most specific first. A log no format
   explains falls back to `Generic line`: one entry per line, timestamp read off the line.
+- **AI schema inference.** For a log nothing parses, press `i` to have the configured LLM
+  infer a format from a sample and apply it — the fields appear immediately.
 - **Validated schemas.** A log format can carry sample lines with their expected level.
   A format that matches a sample but extracts the wrong value is rejected when it is
   defined or imported, rather than quietly mis-parsing your logs.
@@ -95,11 +96,6 @@ together they explain what the app is built out of and how the pieces fit and ru
 - **Source labels.** Press `r` on a log source to give it a short label and a note. They
   show in the sidebar detail and are handed to the assistant, so it knows that `app.log` is,
   say, "auth service — handles login". Saved with the project.
-- **Drive it from an external agent (MCP).** Start with `--mcp` and log-scouter serves a
-  local [Model Context Protocol](https://modelcontextprotocol.io) endpoint. Point Claude
-  Code or Codex at it from another terminal and chat with them while they operate this
-  window in real time — the same inspect/filter/search/time tools the built-in assistant
-  uses. Loopback-only, guarded by a bearer token.
 
 ## Quick Start
 
@@ -113,6 +109,14 @@ logscout /path/to/logs
 Run `logscout .` inside a log folder to add every direct text file in that folder as
 a log source. Run `logscout` with no arguments to start an empty project, then press
 `o` to browse for a folder and add its text files.
+
+Two side commands stand apart from opening logs:
+
+```bash
+logscout version                                        # print the version
+logscout config set --provider anthropic --api-key ...  # set up the AI assistant once
+logscout config list                                    # show the current AI settings
+```
 
 Upgrade or uninstall with the matching scripts:
 
@@ -229,8 +233,7 @@ src/
     project.rs     the Project: sources, formats, filters, searches, session; JSON persist
   tui/           Ratatui application — one big AppState in mod.rs
   ai/            the AI assistant (see below)
-  mcp/           MCP server: an external agent can drive the app over local HTTP
-tests/           integration tests: core.rs, ai.rs, mcp.rs, bench_manual.rs
+tests/           integration tests: core.rs, ai.rs, bench_manual.rs
 ```
 
 **Separation.** `core` knows nothing about the terminal: it parses, extracts, filters,
@@ -277,15 +280,6 @@ captured JSON in `tests/ai.rs` with no network. `ai/tools.rs` declares the tool 
 model sees; `ai/config.rs` handles provider/model/key resolution and `~/.log-scouter/ai.json`;
 `ai/skills.rs` reads the user's markdown skills.
 
-**External agents reuse the same path in reverse** (`mcp/mod.rs`). With `--mcp`, a background
-thread runs a tiny synchronous HTTP server (`tiny_http`) speaking MCP over JSON-RPC. It
-answers the handshake and `tools/list` itself (the schemas are `ai::tools::specs()`), and
-forwards each `tools/call` to the main thread over the *same* kind of channel the AI worker
-uses; the main loop runs it through `dispatch_ai_tool` and replies. So the built-in assistant
-and an external agent share one tool surface, one dispatch, and one live-refresh story — the
-only difference is which side originates the call. The endpoint binds loopback and is guarded
-by a bearer token.
-
 **Persistence** is centralized in `<project>/.logscouter/project.json` (sources, formats,
 filters, saved searches, settings, last session), with user-level libraries under
 `~/.log-scouter/` for filter packs (`filters/`), schema packs (`schemas/`), AI config
@@ -325,6 +319,7 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `Enter` (sidebar search) | edit that saved search |
 | `S` | define a reusable log format |
 | `e` | assign or edit the focused file's log format |
+| `i` | infer the focused file's log format with the configured LLM, and apply it |
 | `r` | label the focused source (`short label \| description`, shown in Detail and given to the AI) |
 | `|` / `-` / `w` | split columns / split rows / close pane |
 | `A` | open the AI chat panel (Enter to send, Esc to cancel/leave) |
@@ -624,77 +619,37 @@ each action noted in the transcript. The loop is capped at 12 turns so a confuse
 cannot spin forever. `Esc` cancels a reply in flight, then leaves the panel; `↑`/`↓` scroll
 the transcript; write actions apply immediately (a removed source still confirms).
 
-**Providers and keys.** Works with OpenAI, Anthropic, and DeepSeek (OpenAI and DeepSeek
-share the `/chat/completions` wire format; Anthropic uses the Messages API). The key is
-resolved in this order:
+**Configure it once.** Set the provider and key from the command line and every later
+session picks it up — press `A` and start chatting, no prompts:
+
+```bash
+logscout config set --provider anthropic --api-key sk-ant-...   # or openai / deepseek
+logscout config set --model claude-opus-4-8                     # optional
+logscout config list                                            # show current settings
+```
+
+`config` writes `~/.log-scouter/ai.json` (chmod `600`, the key masked in any printout). Works
+with OpenAI, Anthropic, and DeepSeek (OpenAI and DeepSeek share the `/chat/completions` wire
+format; Anthropic uses the Messages API).
+
+**Where the key comes from**, in precedence order:
 
 1. a `/key <your-key>` typed in the chat — kept in memory for the session only, never
    written to disk and never echoed into the transcript;
 2. the provider's environment variable — `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or
    `DEEPSEEK_API_KEY`;
-3. the `api_key` field of `~/.log-scouter/ai.json`, which you can set with an editor (the
-   file is chmod `600` on save because it can hold a secret).
+3. the `api_key` field of `~/.log-scouter/ai.json` — what `logscout config set` writes (you
+   can also edit the file by hand).
 
-Pick the provider and model from the chat with `/provider openai|anthropic|deepseek` and
-`/model <name>` (both saved to `~/.log-scouter/ai.json`, which stores only the non-secret
-provider and model unless you add a key yourself); `/clear` resets the conversation.
-`LOGSCOUT_AI_BASE_URL` overrides the endpoint for a corporate gateway, a compatible
-self-hosted model, or a test double.
+You can also change provider and model from inside the chat with `/provider
+openai|anthropic|deepseek` and `/model <name>` (saved to the same file); `/clear` resets the
+conversation. `LOGSCOUT_AI_BASE_URL` overrides the endpoint for a corporate gateway, a
+compatible self-hosted model, or a test double.
 
 **Skills.** Drop a markdown file in `~/.log-scouter/skills/<name>.md` and switch it on with
 `/skill <name>`; its text is appended to the assistant's system prompt (re-read each turn,
 so edits take effect live), which is how you teach it your team's playbook for a class of
 incident. `/skills` lists what you have written and marks the ones that are on.
-
-## Driving It From an External Agent (MCP)
-
-The built-in assistant *calls out* to an LLM. The reverse is also supported: log-scouter can
-expose its operations as an [MCP](https://modelcontextprotocol.io) server, so an external
-agent — **Claude Code**, **Codex**, or any MCP client — drives *this* window from another
-terminal while you chat with it. You watch the filters, view, and time range change live.
-
-Start it with `--mcp`:
-
-```bash
-logscout --mcp /path/to/logs
-```
-
-On launch it prints a connection block (and writes the same to
-`<project>/.logscouter/mcp.txt`, chmod `600`, so you can read it from the other terminal):
-
-```text
-log-scouter MCP server is live.
-
-  URL: http://127.0.0.1:52431/mcp
-  Auth header: Authorization: Bearer 9f3c…
-
-Connect Claude Code (in another terminal):
-  claude mcp add --transport http log-scouter "http://127.0.0.1:52431/mcp" \
-    --header "Authorization: Bearer 9f3c…"
-
-Connect a stdio-only client (Codex, ...) via the mcp-remote bridge:
-  npx -y mcp-remote http://127.0.0.1:52431/mcp --header "Authorization: Bearer 9f3c…"
-```
-
-Then, in the other terminal, run your agent and ask it to troubleshoot — "hide the trace
-noise and show me the errors in the last hour" — and watch this window follow along. The
-agent gets the same tools the built-in assistant has: `list_sources`, `list_filters`,
-`sample_lines`, `count_matches`, `level_breakdown`, `add_filter`, `set_time_range`,
-`search`, `add_source`. Each action it takes is echoed on the status line (`[mcp] …`) and,
-if the chat panel is open, in its transcript.
-
-Flags:
-
-| Flag | Effect |
-| --- | --- |
-| `--mcp` | serve the endpoint (default: OS-assigned free port, random bearer token) |
-| `--mcp-port <PORT>` | bind a fixed port instead of a random one |
-| `--mcp-no-auth` | drop the bearer token (still localhost-only) |
-
-**Transport and safety.** It is streamable HTTP on `127.0.0.1` only — never exposed off the
-machine — and requires the bearer token unless you pass `--mcp-no-auth`. Write actions apply
-immediately, exactly as the built-in assistant's do, so treat granting an agent access like
-letting it drive the app. `mcp-remote` is the bridge for clients that only speak stdio MCP.
 
 ## Opening a Folder
 
@@ -790,7 +745,16 @@ depends on it. Format definitions and per-file assignments are saved in
 
 `Enter` on a log in the sidebar opens the same editor as `e`.
 
-## Elapsed Time
+### Inferring a Schema with the LLM
+
+When the built-in detection can't structure a log — it falls back to `Generic line`, one
+entry per line with nothing extracted — press `i` on that source to have the configured LLM
+work out the format for you. It sends the first ~20 lines to the model (see
+[AI Assistant](#ai-assistant) for setting a provider and key with `logscout config set`),
+which returns a format expression, timestamp field, and timestamp format; log-scouter builds
+that schema and applies it to the file. Applying re-parses the file, so the extracted fields
+appear immediately — if the guess is off, press `e` to tweak it or `i` to try again. Needs an
+LLM configured; otherwise the status line tells you to run `logscout config set`.
 
 Press `T` on a line to make it the origin. The timestamp column then shows every line's
 signed offset from it, so "how long did this take" is a glance rather than arithmetic:

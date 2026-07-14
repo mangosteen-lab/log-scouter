@@ -124,6 +124,26 @@ impl AiChat {
     }
 }
 
+/// A one-off request to infer a log schema from a file's first lines. Kept apart from the
+/// chat so the two never share a worker thread or a generation counter.
+struct SchemaInfer {
+    worker: AiWorker,
+    /// The `(generation, file_id)` of the request in flight, if any; replies to older ones,
+    /// or with a mismatched generation, are ignored.
+    pending: Option<(u64, String)>,
+    next_gen: u64,
+}
+
+impl SchemaInfer {
+    fn new() -> Self {
+        Self {
+            worker: AiWorker::spawn(),
+            pending: None,
+            next_gen: 0,
+        }
+    }
+}
+
 /// Rows the hide-pattern preview will read before it stops counting. Large enough that a
 /// normal pane is covered exactly, small enough that a million-line view still redraws
 /// between keystrokes.
@@ -739,21 +759,15 @@ enum Stage {
 }
 
 pub fn run(project: Project) -> anyhow::Result<()> {
-    run_with_mcp(project, None)
-}
-
-/// Like `run`, but also serve an MCP endpoint so an external agent can drive the app.
-pub fn run_with_mcp(project: Project, mcp: Option<crate::mcp::McpServer>) -> anyhow::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut app = AppState::new(project);
-    app.mcp = mcp;
     app.queue_initial_loads();
 
     loop {
         // A reply from the AI worker may have arrived; run any tools it asked for.
         app.drain_ai_events();
-        // An external agent may have queued a tool call over MCP; run it the same way.
-        app.drain_mcp_commands();
+        // A schema-inference reply may have arrived; open its suggestion for review.
+        app.drain_schema_events();
 
         // Long work runs in slices between frames, so the progress bar animates and
         // Esc still gets through. Everything else waits until the work is done.
@@ -771,11 +785,9 @@ pub fn run_with_mcp(project: Project, mcp: Option<crate::mcp::McpServer>) -> any
         }
 
         terminal.draw(|frame| app.draw(frame))?;
-        // A chat turn in flight arrives asynchronously, so poll briefly instead of blocking
-        // a whole 100ms -- the "thinking…" state and the reply then land promptly.
-        // While a chat turn is in flight, or an external agent may send a tool call at any
-        // moment, poll briefly so the reply or command lands within a frame or two.
-        let poll = if app.ai_busy() || app.mcp.is_some() {
+        // A chat turn or schema inference in flight arrives asynchronously, so poll briefly
+        // instead of blocking a whole 100ms -- the reply then lands promptly.
+        let poll = if app.ai_busy() || app.schema_pending() {
             Duration::from_millis(30)
         } else {
             Duration::from_millis(100)
@@ -879,9 +891,8 @@ struct AppState {
     /// The AI chat panel. Created lazily on first use so the worker thread and its runtime
     /// only exist for a session that asks for them.
     ai: Option<AiChat>,
-    /// The MCP server, when `--mcp` was passed. Lets an external agent drive the app; its
-    /// tool calls run through the same dispatch path as the built-in assistant.
-    mcp: Option<crate::mcp::McpServer>,
+    /// A pending AI schema-inference request, created lazily on first use (`i`).
+    ai_schema: Option<SchemaInfer>,
 }
 
 impl AppState {
@@ -914,7 +925,7 @@ impl AppState {
             input_cursor: 0,
             pending_merges: Vec::new(),
             ai: None,
-            mcp: None,
+            ai_schema: None,
         };
         app.restore_session();
         app
@@ -1055,6 +1066,13 @@ impl AppState {
     /// True while an AI chat turn is waiting on the model or running its tools.
     fn ai_busy(&self) -> bool {
         self.ai.as_ref().map(|ai| ai.pending).unwrap_or(false)
+    }
+
+    fn schema_pending(&self) -> bool {
+        self.ai_schema
+            .as_ref()
+            .map(|schema| schema.pending.is_some())
+            .unwrap_or(false)
     }
 
     fn cancel_work(&mut self) {
@@ -1512,13 +1530,8 @@ impl AppState {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        // When an external agent can drive the app, say so, with where to connect.
-        let mcp = match &self.mcp {
-            Some(server) => format!("  mcp {}", server.url()),
-            None => String::new(),
-        };
         let text = format!(
-            " Log Scouter  {}  q quit  / search  f filter  t time  H hide  y copy  ? help{mcp} ",
+            " Log Scouter  {}  q quit  / search  f filter  t time  H hide  y copy  ? help ",
             self.project.root.display()
         );
         frame.render_widget(
@@ -3332,6 +3345,7 @@ impl AppState {
             KeyCode::Char('w') => self.close_active_pane(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('e') => self.open_schema_input(),
+            KeyCode::Char('i') => self.infer_schema_ai(),
             KeyCode::Char('r') => self.open_source_label(),
             KeyCode::Enter => match self.focus {
                 Focus::Sidebar => self.activate_sidebar_item(),
@@ -3823,9 +3837,9 @@ impl AppState {
                 let provider = ai.config.provider;
                 if ai.resolved_key().is_none() {
                     ai.transcript.push(ChatLine::Error(format!(
-                        "No API key. Type /key <your-key> here, set {} in the environment, or \
-                         add \"api_key\" to ~/.log-scouter/ai.json. Switch provider with \
-                         /provider openai|anthropic|deepseek.",
+                        "No API key. Set one for good with `logscout config set --api-key \
+                         <key>`, or type /key <your-key> here, or set {} in the environment. \
+                         Switch provider with /provider openai|anthropic|deepseek.",
                         provider.key_var()
                     )));
                 } else {
@@ -4341,34 +4355,6 @@ impl AppState {
         if let Err(error) = ai.worker.send(request) {
             ai.transcript.push(ChatLine::Error(error));
             ai.pending = false;
-        }
-    }
-
-    /// Run any tool calls an external MCP agent has queued, against the live project. Uses
-    /// the same dispatch path as the built-in assistant, so the panels refresh for free, and
-    /// reports each action so the watching user sees what the agent did. Called once per
-    /// frame.
-    fn drain_mcp_commands(&mut self) {
-        loop {
-            let Some(command) = self.mcp.as_ref().and_then(|server| server.poll()) else {
-                break;
-            };
-            let result = self.dispatch_ai_tool(&command.tool, &command.args);
-            let note = match &result {
-                Ok(text) => format!(
-                    "[mcp] {}: {}",
-                    command.tool,
-                    text.lines().next().unwrap_or("done")
-                ),
-                Err(error) => format!("[mcp] {} failed: {error}", command.tool),
-            };
-            self.status = note.clone();
-            // Mirror the action into the chat transcript when the panel is open, so the two
-            // ways of driving the app share one history.
-            if let Some(ai) = &mut self.ai {
-                ai.transcript.push(ChatLine::Action(note));
-            }
-            let _ = command.reply.send(result);
         }
     }
 
@@ -5230,6 +5216,108 @@ impl AppState {
             } else {
                 format!("labelled {name} as {label:?}")
             };
+        }
+    }
+
+    /// `i` on a log source: ask the configured LLM to infer a schema from its first lines.
+    /// The reply is not applied blindly -- `drain_schema_events` opens it in the schema editor
+    /// for review. Needs a key configured (`logscout config set`, an env var, or `/key`).
+    fn infer_schema_ai(&mut self) {
+        let Some(file_id) = self.schema_target() else {
+            self.status = "select a log source first".to_string();
+            return;
+        };
+        let Some(file) = self.project.get_file(&file_id) else {
+            return;
+        };
+        if file.is_merged() {
+            self.status = "a merged view has no single schema to infer".to_string();
+            return;
+        }
+        let path = file.path.clone();
+
+        let config = AiConfig::load();
+        let Some(key) = config.api_key() else {
+            self.status =
+                "Configure an LLM first: logscout config set --provider <p> --api-key <key>"
+                    .to_string();
+            return;
+        };
+
+        let sample: Vec<String> = match crate::core::parser::read_first_lines(&path, 25) {
+            Ok(lines) => lines
+                .into_iter()
+                .filter(|line| !line.trim().is_empty())
+                .take(20)
+                .collect(),
+            Err(error) => {
+                self.status = format!("could not read the file: {error}");
+                return;
+            }
+        };
+        if sample.is_empty() {
+            self.status = "the file has no lines to sample".to_string();
+            return;
+        }
+
+        let schema = self.ai_schema.get_or_insert_with(SchemaInfer::new);
+        schema.next_gen += 1;
+        let generation = schema.next_gen;
+        let request = AgentRequest {
+            generation,
+            config: config.clone(),
+            key,
+            conversation: vec![
+                ChatMsg::system(schema_infer_prompt()),
+                ChatMsg::user(format!("Sample log lines:\n{}", sample.join("\n"))),
+            ],
+            tools: Vec::new(),
+        };
+        if let Err(error) = schema.worker.send(request) {
+            self.status = error;
+            return;
+        }
+        schema.pending = Some((generation, file_id));
+        self.status = format!("Inferring a schema with {}…", config.provider.label());
+    }
+
+    /// Take a schema-inference reply, if one arrived, build the schema, and apply it to the
+    /// file it was inferred from. Applying re-parses the file, so the extracted fields appear
+    /// at once -- if the schema is wrong you see it immediately and can `e` to edit or `i` to
+    /// try again. Called once per frame.
+    fn drain_schema_events(&mut self) {
+        let event = match &self.ai_schema {
+            Some(schema) if schema.pending.is_some() => schema.worker.poll(),
+            _ => None,
+        };
+        let Some(event) = event else { return };
+        let Some((generation, file_id)) = self
+            .ai_schema
+            .as_ref()
+            .and_then(|schema| schema.pending.clone())
+        else {
+            return;
+        };
+        if event.generation != generation {
+            return;
+        }
+        if let Some(schema) = &mut self.ai_schema {
+            schema.pending = None;
+        }
+
+        match event.result {
+            Err(error) => self.status = format!("schema inference failed: {error}"),
+            Ok(assistant) => match parse_inferred_schema(&assistant.text) {
+                Ok(extractor) => {
+                    let name = extractor.name.clone();
+                    if let Err(error) = self.project.add_extractor(extractor) {
+                        self.status = format!("the AI's schema did not compile: {error}");
+                    } else {
+                        self.apply_schema_to_file(&file_id, &name);
+                    }
+                }
+                Err(error) => self.status = format!("could not use the AI's schema: {error}"),
+            },
         }
     }
 
@@ -6328,6 +6416,87 @@ fn log_schema_scope_from_token(token: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The instructions handed to the LLM for schema inference: teach it log-scouter's format
+/// language and pin the output to a JSON object the app can parse.
+fn schema_infer_prompt() -> String {
+    "You infer a log-parsing schema for log-scouter from sample log lines.\n\
+     A schema is a `format` string made of `<field>` placeholders separated by the literal \
+     text that appears between fields in the log (brackets, colons, spaces). Use `<field?>` \
+     for a field only some lines carry; it also consumes the literal separator right before \
+     it. Exactly one field is the timestamp and it MUST be named <timestamp>.\n\n\
+     Reply with ONLY a JSON object -- no prose, no code fence:\n\
+     {\"name\": \"<short name>\", \"format\": \"<the format string>\", \
+     \"timestamp_format\": \"<chrono strftime for the timestamp, e.g. %Y-%m-%d %H:%M:%S%.3f>\", \
+     \"description\": \"<one line>\"}\n\n\
+     With each <field> replaced by that line's value, the format must reproduce the sample \
+     lines exactly. Prefer specific literals so it does not over-match. Example: for the line\n\
+     [2026-06-16 10:09:43.288][Kernel][Info] service started\n\
+     use format `[<timestamp>][<module>][<level>] <message>` and timestamp_format \
+     `%Y-%m-%d %H:%M:%S%.3f`."
+        .to_string()
+}
+
+/// Build an `Extractor` from the LLM's JSON reply. Tolerates surrounding prose or a code
+/// fence around the object. Built directly rather than through the `name | format | …` text
+/// grammar, because a format may itself contain `|` (pipe-delimited logs), which that grammar
+/// splits on.
+fn parse_inferred_schema(text: &str) -> Result<Extractor, String> {
+    let json = extract_json_object(text).ok_or("no JSON object in the reply")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|error| format!("bad JSON: {error}"))?;
+    let str_field = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+    };
+
+    let format = str_field("format")
+        .filter(|value| !value.is_empty())
+        .ok_or("the reply has no \"format\"")?;
+    let name = str_field("name")
+        .filter(|value| !value.is_empty())
+        .unwrap_or("AI schema");
+    let timestamp = str_field("timestamp_format")
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_TIMESTAMP_FORMAT);
+    let mut extractor = Extractor::with_timestamp_format(name, format, timestamp)?;
+    extractor.description = str_field("description").unwrap_or("").to_string();
+    Ok(extractor)
+}
+
+/// Extract the first balanced `{...}` object from `text`, ignoring braces inside strings, so
+/// a JSON reply wrapped in prose or ```json fences still parses.
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..start + offset + ch.len_utf8()].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn parse_log_schema_input(input: &str) -> Result<Extractor, String> {
     let parts: Vec<&str> = input.splitn(4, '|').map(str::trim).collect();
     if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
@@ -7046,6 +7215,7 @@ fn help_text() -> &'static str {
   In the folder browser: j/k or arrows move, Enter opens './' or enters a subfolder,
                          Right enters, Left/Backspace goes up, '.' shows hidden folders
   e apply/edit this file's schema (schema name, or full format template)
+  i infer this file's schema with the configured LLM (see AI assistant) and apply it
   r label this source (short label | description, so the AI can tell what it is)
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
   In the sidebar: Space on a log adds/removes it, merging the logs by timestamp
@@ -7114,8 +7284,6 @@ AI assistant
   /provider openai|anthropic|deepseek and /model <name> pick the model (saved to ai.json)
   /skills lists skills in ~/.log-scouter/skills/*.md; /skill <name> toggles one on/off
   /clear resets the conversation
-  Start with --mcp to let an external agent (Claude Code, Codex) drive this window over
-  a local MCP endpoint; the header shows its URL and .logscouter/mcp.txt has the token
 
 Log schema
   <field> is required, <field?> is optional and may be missing from a line
@@ -7140,6 +7308,37 @@ mod tests {
     use super::*;
     use crate::core::extractor::{DEFAULT_EXTRACTOR_NAME, GENERIC_EXTRACTOR_NAME};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn inferred_schema_builds_a_working_extractor() {
+        let json = r#"{"name":"svc","format":"[<timestamp>][<level>] <message>",
+            "timestamp_format":"%Y-%m-%d %H:%M:%S","description":"a service log"}"#;
+        let extractor = parse_inferred_schema(json).expect("usable schema");
+        assert_eq!(extractor.name, "svc");
+        assert_eq!(extractor.timestamp_format, "%Y-%m-%d %H:%M:%S");
+        assert_eq!(extractor.description, "a service log");
+        let fields = extractor.extract("[2026-07-13 10:00:01][INFO] hi").unwrap();
+        assert_eq!(fields.get("level").map(String::as_str), Some("INFO"));
+    }
+
+    #[test]
+    fn inferred_schema_handles_pipe_formats_and_fences() {
+        // A pipe-delimited format — which the `name | format | …` text grammar could not
+        // round-trip — built straight from JSON wrapped in a ```json fence.
+        let reply = "```json\n{\"format\": \"<timestamp> | <level> | <message>\"}\n```";
+        let extractor = parse_inferred_schema(reply).expect("usable schema");
+        let fields = extractor
+            .extract("2026-07-13T10:00:01Z | INFO | hi")
+            .unwrap();
+        assert_eq!(fields.get("level").map(String::as_str), Some("INFO"));
+        assert_eq!(fields.get("message").map(String::as_str), Some("hi"));
+    }
+
+    #[test]
+    fn inferred_schema_rejects_junk() {
+        assert!(parse_inferred_schema("no json here").is_err());
+        assert!(parse_inferred_schema(r#"{"name":"x"}"#).is_err()); // no format
+    }
 
     const LONG_MESSAGE: &str =
         "UserSession::TimeOut() failed to resolve inbox message for session 4A2F99BC";
