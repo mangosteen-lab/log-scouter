@@ -739,13 +739,21 @@ enum Stage {
 }
 
 pub fn run(project: Project) -> anyhow::Result<()> {
+    run_with_mcp(project, None)
+}
+
+/// Like `run`, but also serve an MCP endpoint so an external agent can drive the app.
+pub fn run_with_mcp(project: Project, mcp: Option<crate::mcp::McpServer>) -> anyhow::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut app = AppState::new(project);
+    app.mcp = mcp;
     app.queue_initial_loads();
 
     loop {
         // A reply from the AI worker may have arrived; run any tools it asked for.
         app.drain_ai_events();
+        // An external agent may have queued a tool call over MCP; run it the same way.
+        app.drain_mcp_commands();
 
         // Long work runs in slices between frames, so the progress bar animates and
         // Esc still gets through. Everything else waits until the work is done.
@@ -765,7 +773,9 @@ pub fn run(project: Project) -> anyhow::Result<()> {
         terminal.draw(|frame| app.draw(frame))?;
         // A chat turn in flight arrives asynchronously, so poll briefly instead of blocking
         // a whole 100ms -- the "thinking…" state and the reply then land promptly.
-        let poll = if app.ai_busy() {
+        // While a chat turn is in flight, or an external agent may send a tool call at any
+        // moment, poll briefly so the reply or command lands within a frame or two.
+        let poll = if app.ai_busy() || app.mcp.is_some() {
             Duration::from_millis(30)
         } else {
             Duration::from_millis(100)
@@ -869,6 +879,9 @@ struct AppState {
     /// The AI chat panel. Created lazily on first use so the worker thread and its runtime
     /// only exist for a session that asks for them.
     ai: Option<AiChat>,
+    /// The MCP server, when `--mcp` was passed. Lets an external agent drive the app; its
+    /// tool calls run through the same dispatch path as the built-in assistant.
+    mcp: Option<crate::mcp::McpServer>,
 }
 
 impl AppState {
@@ -901,6 +914,7 @@ impl AppState {
             input_cursor: 0,
             pending_merges: Vec::new(),
             ai: None,
+            mcp: None,
         };
         app.restore_session();
         app
@@ -1498,8 +1512,13 @@ impl AppState {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        // When an external agent can drive the app, say so, with where to connect.
+        let mcp = match &self.mcp {
+            Some(server) => format!("  mcp {}", server.url()),
+            None => String::new(),
+        };
         let text = format!(
-            " Log Scouter  {}  q quit  / search  f filter  t time  H hide  y copy  ? help ",
+            " Log Scouter  {}  q quit  / search  f filter  t time  H hide  y copy  ? help{mcp} ",
             self.project.root.display()
         );
         frame.render_widget(
@@ -4325,6 +4344,34 @@ impl AppState {
         }
     }
 
+    /// Run any tool calls an external MCP agent has queued, against the live project. Uses
+    /// the same dispatch path as the built-in assistant, so the panels refresh for free, and
+    /// reports each action so the watching user sees what the agent did. Called once per
+    /// frame.
+    fn drain_mcp_commands(&mut self) {
+        loop {
+            let Some(command) = self.mcp.as_ref().and_then(|server| server.poll()) else {
+                break;
+            };
+            let result = self.dispatch_ai_tool(&command.tool, &command.args);
+            let note = match &result {
+                Ok(text) => format!(
+                    "[mcp] {}: {}",
+                    command.tool,
+                    text.lines().next().unwrap_or("done")
+                ),
+                Err(error) => format!("[mcp] {} failed: {error}", command.tool),
+            };
+            self.status = note.clone();
+            // Mirror the action into the chat transcript when the panel is open, so the two
+            // ways of driving the app share one history.
+            if let Some(ai) = &mut self.ai {
+                ai.transcript.push(ChatLine::Action(note));
+            }
+            let _ = command.reply.send(result);
+        }
+    }
+
     /// Drain the worker's replies, run any tools the model asked for, and continue the loop
     /// until it stops calling tools. Called once per frame.
     fn drain_ai_events(&mut self) {
@@ -7067,6 +7114,8 @@ AI assistant
   /provider openai|anthropic|deepseek and /model <name> pick the model (saved to ai.json)
   /skills lists skills in ~/.log-scouter/skills/*.md; /skill <name> toggles one on/off
   /clear resets the conversation
+  Start with --mcp to let an external agent (Claude Code, Codex) drive this window over
+  a local MCP endpoint; the header shows its URL and .logscouter/mcp.txt has the token
 
 Log schema
   <field> is required, <field?> is optional and may be missing from a line

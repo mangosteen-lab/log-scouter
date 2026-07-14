@@ -11,6 +11,7 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 [Concept Model](#concept-model) · [Architecture](#architecture) · [Keys](#keys) ·
 [Filters](#filters-text-and-time) · [Search](#search-query-language) ·
 [Hiding by Example](#hiding-by-example) · [AI Assistant](#ai-assistant) ·
+[External Agents (MCP)](#driving-it-from-an-external-agent-mcp) ·
 [Log Formats](#log-formats) · [Building from Source](#building-from-source) ·
 [Development](#development) · [Releasing](#releasing)
 
@@ -94,6 +95,11 @@ together they explain what the app is built out of and how the pieces fit and ru
 - **Source labels.** Press `r` on a log source to give it a short label and a note. They
   show in the sidebar detail and are handed to the assistant, so it knows that `app.log` is,
   say, "auth service — handles login". Saved with the project.
+- **Drive it from an external agent (MCP).** Start with `--mcp` and log-scouter serves a
+  local [Model Context Protocol](https://modelcontextprotocol.io) endpoint. Point Claude
+  Code or Codex at it from another terminal and chat with them while they operate this
+  window in real time — the same inspect/filter/search/time tools the built-in assistant
+  uses. Loopback-only, guarded by a bearer token.
 
 ## Quick Start
 
@@ -223,7 +229,8 @@ src/
     project.rs     the Project: sources, formats, filters, searches, session; JSON persist
   tui/           Ratatui application — one big AppState in mod.rs
   ai/            the AI assistant (see below)
-tests/           integration tests: core.rs, ai.rs, bench_manual.rs
+  mcp/           MCP server: an external agent can drive the app over local HTTP
+tests/           integration tests: core.rs, ai.rs, mcp.rs, bench_manual.rs
 ```
 
 **Separation.** `core` knows nothing about the terminal: it parses, extracts, filters,
@@ -269,6 +276,15 @@ parses the response — those builders and parsers are pure functions, round-tri
 captured JSON in `tests/ai.rs` with no network. `ai/tools.rs` declares the tool schemas the
 model sees; `ai/config.rs` handles provider/model/key resolution and `~/.log-scouter/ai.json`;
 `ai/skills.rs` reads the user's markdown skills.
+
+**External agents reuse the same path in reverse** (`mcp/mod.rs`). With `--mcp`, a background
+thread runs a tiny synchronous HTTP server (`tiny_http`) speaking MCP over JSON-RPC. It
+answers the handshake and `tools/list` itself (the schemas are `ai::tools::specs()`), and
+forwards each `tools/call` to the main thread over the *same* kind of channel the AI worker
+uses; the main loop runs it through `dispatch_ai_tool` and replies. So the built-in assistant
+and an external agent share one tool surface, one dispatch, and one live-refresh story — the
+only difference is which side originates the call. The endpoint binds loopback and is guarded
+by a bearer token.
 
 **Persistence** is centralized in `<project>/.logscouter/project.json` (sources, formats,
 filters, saved searches, settings, last session), with user-level libraries under
@@ -629,6 +645,56 @@ self-hosted model, or a test double.
 `/skill <name>`; its text is appended to the assistant's system prompt (re-read each turn,
 so edits take effect live), which is how you teach it your team's playbook for a class of
 incident. `/skills` lists what you have written and marks the ones that are on.
+
+## Driving It From an External Agent (MCP)
+
+The built-in assistant *calls out* to an LLM. The reverse is also supported: log-scouter can
+expose its operations as an [MCP](https://modelcontextprotocol.io) server, so an external
+agent — **Claude Code**, **Codex**, or any MCP client — drives *this* window from another
+terminal while you chat with it. You watch the filters, view, and time range change live.
+
+Start it with `--mcp`:
+
+```bash
+logscout --mcp /path/to/logs
+```
+
+On launch it prints a connection block (and writes the same to
+`<project>/.logscouter/mcp.txt`, chmod `600`, so you can read it from the other terminal):
+
+```text
+log-scouter MCP server is live.
+
+  URL: http://127.0.0.1:52431/mcp
+  Auth header: Authorization: Bearer 9f3c…
+
+Connect Claude Code (in another terminal):
+  claude mcp add --transport http log-scouter "http://127.0.0.1:52431/mcp" \
+    --header "Authorization: Bearer 9f3c…"
+
+Connect a stdio-only client (Codex, ...) via the mcp-remote bridge:
+  npx -y mcp-remote http://127.0.0.1:52431/mcp --header "Authorization: Bearer 9f3c…"
+```
+
+Then, in the other terminal, run your agent and ask it to troubleshoot — "hide the trace
+noise and show me the errors in the last hour" — and watch this window follow along. The
+agent gets the same tools the built-in assistant has: `list_sources`, `list_filters`,
+`sample_lines`, `count_matches`, `level_breakdown`, `add_filter`, `set_time_range`,
+`search`, `add_source`. Each action it takes is echoed on the status line (`[mcp] …`) and,
+if the chat panel is open, in its transcript.
+
+Flags:
+
+| Flag | Effect |
+| --- | --- |
+| `--mcp` | serve the endpoint (default: OS-assigned free port, random bearer token) |
+| `--mcp-port <PORT>` | bind a fixed port instead of a random one |
+| `--mcp-no-auth` | drop the bearer token (still localhost-only) |
+
+**Transport and safety.** It is streamable HTTP on `127.0.0.1` only — never exposed off the
+machine — and requires the bearer token unless you pass `--mcp-no-auth`. Write actions apply
+immediately, exactly as the built-in assistant's do, so treat granting an agent access like
+letting it drive the app. `mcp-remote` is the bridge for clients that only speak stdio MCP.
 
 ## Opening a Folder
 
