@@ -132,9 +132,14 @@ impl AiConfig {
     }
 
     pub fn save(&self) -> std::io::Result<()> {
-        let Some(path) = config_path() else {
-            return Ok(());
-        };
+        // Surfacing this (rather than a silent no-op) matters on a machine with no HOME or
+        // USERPROFILE: otherwise `logscout config set` would report success without writing.
+        let path = config_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not find your home directory (set HOME or USERPROFILE)",
+            )
+        })?;
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -157,7 +162,8 @@ fn restrict_permissions(path: &Path) {
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) {}
 
-/// `~/.log-scouter/ai.json`, or `None` when `$HOME` is unset.
-fn config_path() -> Option<PathBuf> {
+/// The full path to `ai.json` under the user's home directory, or `None` when it cannot be
+/// found. Public so the CLI can show where it wrote (or would write) the file.
+pub fn config_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(USER_DIR).join("ai.json"))
 }

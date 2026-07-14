@@ -90,7 +90,10 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
             config
                 .save()
                 .with_context(|| format!("could not write {AI_CONFIG_PATH}"))?;
-            println!("Saved LLM config to {AI_CONFIG_PATH}.\n");
+            let saved_to = log_scouter::ai::config::config_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| AI_CONFIG_PATH.to_string());
+            println!("Saved LLM config to {saved_to}\n");
             print_config(&config);
         }
     }

@@ -13,9 +13,31 @@ pub const USER_DIR: &str = ".log-scouter";
 pub const USER_FILTERS_SUBDIR: &str = "filters";
 
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
+    resolve_home(|key| std::env::var_os(key))
+}
+
+/// Resolve the user's home directory across platforms: `HOME` first (Unix, and set by many
+/// Windows shells), then `USERPROFILE`, then `HOMEDRIVE` + `HOMEPATH` (Windows, where `HOME`
+/// is usually unset). Split from `home_dir` so the fallback order is testable without
+/// touching the process environment.
+fn resolve_home(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let non_empty = |key: &str| get(key).filter(|value| !value.is_empty());
+    if let Some(home) = non_empty("HOME") {
+        return Some(PathBuf::from(home));
+    }
+    if let Some(profile) = non_empty("USERPROFILE") {
+        return Some(PathBuf::from(profile));
+    }
+    match (non_empty("HOMEDRIVE"), non_empty("HOMEPATH")) {
+        // e.g. `C:` + `\Users\name`. Concatenate the strings rather than `join`, which would
+        // treat the drive-relative `\Users\name` as replacing the drive.
+        (Some(drive), Some(path)) => {
+            let mut home = drive.to_string_lossy().into_owned();
+            home.push_str(&path.to_string_lossy());
+            Some(PathBuf::from(home))
+        }
+        _ => None,
+    }
 }
 
 /// `~/.log-scouter/filters`, or `None` when `$HOME` is unset.
@@ -992,4 +1014,46 @@ fn default_action() -> String {
 
 fn default_enabled() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_home;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(*value))
+        }
+    }
+
+    #[test]
+    fn home_dir_prefers_home_then_falls_back_to_windows() {
+        // HOME wins when present.
+        assert_eq!(
+            resolve_home(env(&[("HOME", "/home/u"), ("USERPROFILE", r"C:\Users\u")])),
+            Some(PathBuf::from("/home/u"))
+        );
+        // Windows leaves HOME unset, so USERPROFILE is used.
+        assert_eq!(
+            resolve_home(env(&[("USERPROFILE", r"C:\Users\u")])),
+            Some(PathBuf::from(r"C:\Users\u"))
+        );
+        // Failing that, HOMEDRIVE + HOMEPATH concatenate.
+        assert_eq!(
+            resolve_home(env(&[("HOMEDRIVE", "C:"), ("HOMEPATH", r"\Users\u")])),
+            Some(PathBuf::from(r"C:\Users\u"))
+        );
+        // An empty HOME is ignored rather than yielding an empty path.
+        assert_eq!(
+            resolve_home(env(&[("HOME", ""), ("USERPROFILE", r"C:\Users\u")])),
+            Some(PathBuf::from(r"C:\Users\u"))
+        );
+        // Nothing set at all.
+        assert_eq!(resolve_home(env(&[])), None);
+    }
 }
