@@ -15,7 +15,8 @@ use crate::core::parser::{self, EntryBuilder};
 use crate::core::project::{Bookmark, PaneSession, Project, Session, CONFIG_DIR};
 use crate::core::search::{
     compile_query, export_searches_to_folder, install_default_search_library,
-    load_searches_from_folder, parse_datetime, user_search_dir, Query, USER_SEARCHES_SUBDIR,
+    load_searches_from_folder, parse_datetime, user_search_dir, Predicate, Query,
+    USER_SEARCHES_SUBDIR,
 };
 use chrono::{Duration as ChronoDuration, NaiveDateTime};
 use crossterm::event::{
@@ -2987,8 +2988,22 @@ impl AppState {
         self.pane_areas[pane_index] = inner;
         frame.render_widget(block, area);
 
-        let row_height = inner.height as usize;
+        let search_footer = matches!(self.mode, Mode::Search(_)) && pane_index == self.focused_pane;
+        let (list_area, search_area) = if search_footer && inner.height > 1 {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(inner);
+            (split[0], Some(split[1]))
+        } else {
+            (inner, None)
+        };
+
+        let row_height = list_area.height as usize;
         if row_height == 0 {
+            if let Some(area) = search_area {
+                self.draw_inline_search(frame, area);
+            }
             return;
         }
 
@@ -3022,7 +3037,8 @@ impl AppState {
                 bookmarked,
                 elapsed_from,
             );
-            let line = crop(&raw_line, view.scroll_x, inner.width as usize);
+            let line = crop(&raw_line, view.scroll_x, list_area.width as usize);
+            let search_ranges = query_highlight_ranges(view.query.as_ref(), &raw_line);
             let style = match (picked, at_cursor) {
                 (true, true) => Style::default().bg(Color::LightBlue).fg(Color::Black),
                 (true, false) => Style::default().bg(Color::Blue).fg(Color::White),
@@ -3039,11 +3055,44 @@ impl AppState {
                 .map(|sel| sel.range());
             rows.push(ListItem::new(match selected {
                 Some((lo, hi)) => highlighted_row(&line, lo, hi, view.scroll_x, style),
+                None if !search_ranges.is_empty() => highlighted_ranges(
+                    &line,
+                    &search_ranges,
+                    view.scroll_x,
+                    style,
+                    search_hit_style(),
+                ),
                 None => Line::from(Span::styled(line, style)),
             }));
         }
 
-        frame.render_widget(List::new(rows), inner);
+        frame.render_widget(List::new(rows), list_area);
+        if let Some(area) = search_area {
+            self.draw_inline_search(frame, area);
+        }
+    }
+
+    fn draw_inline_search(&self, frame: &mut Frame, area: Rect) {
+        let Mode::Search(text) = &self.mode else {
+            return;
+        };
+        if area.width == 0 {
+            return;
+        }
+
+        let full = format!("/{text}");
+        let caret = self.input_cursor.min(text.chars().count()) + 1;
+        let (shown, caret_column) = input_window(&full, caret, area.width as usize);
+        let padded = pad_to_width(&shown, area.width as usize);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                padded,
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            ))),
+            area,
+        );
+        let x = area.x + caret_column.min(area.width.saturating_sub(1) as usize) as u16;
+        frame.set_cursor_position((x, area.y));
     }
 
     /// The row exactly as `draw_pane` builds it, before horizontal cropping. Substring
@@ -3185,10 +3234,13 @@ impl AppState {
             } else {
                 Style::default().fg(Color::Yellow)
             };
-            rows.push(ListItem::new(Line::from(Span::styled(
-                crop(&raw_line, 0, inner.width as usize),
-                style,
-            ))));
+            let line = crop(&raw_line, 0, inner.width as usize);
+            let search_ranges = query_highlight_ranges(view.query.as_ref(), &raw_line);
+            rows.push(ListItem::new(if search_ranges.is_empty() {
+                Line::from(Span::styled(line, style))
+            } else {
+                highlighted_ranges(&line, &search_ranges, 0, style, search_hit_style())
+            }));
         }
 
         frame.render_widget(List::new(rows), inner);
@@ -3198,13 +3250,7 @@ impl AppState {
         self.entry_detail_area = Rect::default();
         match self.mode.clone() {
             Mode::Normal => {}
-            Mode::Search(text) => self.draw_input_popup(
-                frame,
-                root,
-                "Search",
-                "text | \"phrase\" | /regex/ | field=value | after:<ts>",
-                &text,
-            ),
+            Mode::Search(_) => {}
             Mode::AddFile(text) => {
                 self.draw_input_popup(frame, root, "Add File", "Type a path and press Enter", &text)
             }
@@ -4720,6 +4766,10 @@ impl AppState {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        if matches!(self.mode, Mode::Search(_)) {
+            return self.handle_search_key(key);
+        }
+
         let caret = self.input_cursor;
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
@@ -4795,6 +4845,71 @@ impl AppState {
             }
             KeyCode::Enter => self.submit_input()?,
             _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let caret = self.input_cursor;
+        let mut changed = false;
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Backspace => {
+                if caret > 0 {
+                    if let Some(input) = self.input_mut() {
+                        remove_char(input, caret - 1);
+                    }
+                    self.input_cursor = caret - 1;
+                    changed = true;
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(input) = self.input_mut() {
+                    if caret < input.chars().count() {
+                        remove_char(input, caret);
+                        changed = true;
+                    }
+                }
+            }
+            KeyCode::Left => self.input_cursor = caret.saturating_sub(1),
+            KeyCode::Right => {
+                let len = self.input_mut().map(|input| input.chars().count());
+                if let Some(len) = len {
+                    self.input_cursor = (caret + 1).min(len);
+                }
+            }
+            KeyCode::Home => self.input_cursor = 0,
+            KeyCode::End => {
+                if let Some(len) = self.input_mut().map(|input| input.chars().count()) {
+                    self.input_cursor = len;
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(input) = self.input_mut() {
+                    if !input.is_empty() {
+                        input.clear();
+                        changed = true;
+                    }
+                }
+                self.input_cursor = 0;
+            }
+            KeyCode::Char(ch) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if let Some(input) = self.input_mut() {
+                        insert_char(input, caret, ch);
+                    }
+                    self.input_cursor = caret + 1;
+                    changed = true;
+                }
+            }
+            KeyCode::Enter => self.submit_input()?,
+            _ => {}
+        }
+
+        if changed {
+            if let Mode::Search(text) = &self.mode {
+                self.apply_search_text(text.clone(), After::GotoFirstMatch);
+            }
         }
         Ok(false)
     }
@@ -4987,29 +5102,34 @@ impl AppState {
 
     fn submit_search(&mut self, text: String) {
         let query_text = text.trim().to_string();
-        if let Some(view) = self.active_view_mut() {
-            view.query_text = query_text.clone();
-            view.query = if query_text.is_empty() {
-                None
-            } else {
-                Some(compile_query(&query_text))
-            };
-        }
         if !query_text.is_empty() && !self.project.saved_searches.contains(&query_text) {
             self.project.saved_searches.insert(0, query_text.clone());
             self.project.saved_searches.truncate(8);
         }
+        self.apply_search_text(query_text, After::GotoFirstMatch);
+        self.save_project();
+    }
+
+    fn apply_search_text(&mut self, query_text: String, after: After) {
+        if let Some(view) = self.active_view_mut() {
+            view.query_text = query_text.trim().to_string();
+            view.query = if view.query_text.is_empty() {
+                None
+            } else {
+                Some(compile_query(&view.query_text))
+            };
+        }
         self.results_selected = 0;
         self.results_scroll = 0;
         // The scan spans frames, so jumping to the first match has to wait for it.
-        self.queue_recompute(self.focused_pane, After::GotoFirstMatch);
+        self.queue_recompute(self.focused_pane, after);
 
-        if let Some(query) = self.active_view().and_then(|view| view.query.as_ref()) {
-            if !query.error.is_empty() {
+        match self.active_view().and_then(|view| view.query.as_ref()) {
+            Some(query) if !query.error.is_empty() => {
                 self.status = format!("search: {}", query.error);
             }
+            Some(_) | None => self.status.clear(),
         }
-        self.save_project();
     }
 
     fn submit_add_file(&mut self, path: String) -> anyhow::Result<()> {
@@ -8679,6 +8799,9 @@ impl AppState {
     }
 
     fn search_results_visible(&self) -> bool {
+        if matches!(self.mode, Mode::Search(_)) {
+            return false;
+        }
         self.active_view()
             .map(|view| view.query.is_some() && !view.query_text.trim().is_empty())
             .unwrap_or(false)
@@ -9845,6 +9968,26 @@ fn crop(text: &str, start: usize, width: usize) -> String {
     text.chars().skip(start).take(width).collect()
 }
 
+fn input_window(text: &str, caret: usize, width: usize) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    let len = text.chars().count();
+    let caret = caret.min(len);
+    let start = if caret < width { 0 } else { caret + 1 - width };
+    let shown = text.chars().skip(start).take(width).collect();
+    (shown, caret.saturating_sub(start).min(width - 1))
+}
+
+fn pad_to_width(text: &str, width: usize) -> String {
+    let mut out = crop(text, 0, width);
+    let len = out.chars().count();
+    if len < width {
+        out.push_str(&" ".repeat(width - len));
+    }
+    out
+}
+
 /// Clip a path from the *left*. `…/microstrategy/Tech/log-scouter` says which folder you
 /// are in; the first 60 characters of `/var/lib/jenkins/...` say only where it lives.
 fn truncate_head(text: &str, width: usize) -> String {
@@ -9945,25 +10088,159 @@ fn highlighted_row(
     scroll_x: usize,
     base: Style,
 ) -> Line<'static> {
+    highlighted_ranges(
+        line,
+        &[(lo, hi)],
+        scroll_x,
+        base,
+        base.bg(Color::White).fg(Color::Black),
+    )
+}
+
+fn highlighted_ranges(
+    line: &str,
+    ranges: &[(usize, usize)],
+    scroll_x: usize,
+    base: Style,
+    highlight: Style,
+) -> Line<'static> {
     let chars: Vec<char> = line.chars().collect();
-    let visible_lo = lo.saturating_sub(scroll_x).min(chars.len());
-    // `hi` is inclusive, so the exclusive end is one past it.
-    let visible_hi = (hi + 1).saturating_sub(scroll_x).min(chars.len());
-    if visible_lo >= visible_hi {
+    let ranges = visible_ranges(ranges, scroll_x, chars.len());
+    if ranges.is_empty() {
         return Line::from(Span::styled(line.to_string(), base));
     }
 
     let take = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
-    let selected = base.bg(Color::White).fg(Color::Black);
-    let mut spans = Vec::with_capacity(3);
-    if visible_lo > 0 {
-        spans.push(Span::styled(take(0..visible_lo), base));
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for (lo, hi) in ranges {
+        if cursor < lo {
+            spans.push(Span::styled(take(cursor..lo), base));
+        }
+        spans.push(Span::styled(take(lo..hi), highlight));
+        cursor = hi;
     }
-    spans.push(Span::styled(take(visible_lo..visible_hi), selected));
-    if visible_hi < chars.len() {
-        spans.push(Span::styled(take(visible_hi..chars.len()), base));
+    if cursor < chars.len() {
+        spans.push(Span::styled(take(cursor..chars.len()), base));
     }
     Line::from(spans)
+}
+
+fn visible_ranges(
+    ranges: &[(usize, usize)],
+    scroll_x: usize,
+    visible_len: usize,
+) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter_map(|(lo, hi)| {
+            let visible_lo = lo.saturating_sub(scroll_x).min(visible_len);
+            // `hi` is inclusive; convert to an exclusive end inside the cropped line.
+            let visible_hi = hi
+                .saturating_add(1)
+                .saturating_sub(scroll_x)
+                .min(visible_len);
+            (visible_lo < visible_hi).then_some((visible_lo, visible_hi))
+        })
+        .collect();
+    if out.is_empty() {
+        return out;
+    }
+
+    out.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(out.len());
+    for (lo, hi) in out {
+        match merged.last_mut() {
+            Some((_, last_hi)) if lo <= *last_hi => *last_hi = (*last_hi).max(hi),
+            _ => merged.push((lo, hi)),
+        }
+    }
+    merged
+}
+
+fn search_hit_style() -> Style {
+    Style::default()
+        .bg(Color::Yellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn query_highlight_ranges(query: Option<&Query>, line: &str) -> Vec<(usize, usize)> {
+    let Some(query) = query else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    for predicate in &query.predicates {
+        match predicate {
+            Predicate::Substring(needle) => push_substring_ranges(line, needle, &mut ranges),
+            Predicate::Regex(regex) => push_regex_ranges(line, regex, &mut ranges),
+            Predicate::FieldEq { value, .. } => push_substring_ranges(line, value, &mut ranges),
+            Predicate::FieldContains { value, .. } => {
+                push_substring_ranges(line, value, &mut ranges)
+            }
+            Predicate::FieldRegex { regex, .. } => push_regex_ranges(line, regex, &mut ranges),
+            Predicate::After(_) | Predicate::Before(_) | Predicate::DateRange { .. } => {}
+        }
+    }
+    normalize_ranges(&mut ranges);
+    ranges
+}
+
+fn push_substring_ranges(line: &str, needle: &str, ranges: &mut Vec<(usize, usize)>) {
+    if needle.is_empty() {
+        return;
+    }
+    let haystack = line.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(found) = haystack[offset..].find(&needle) {
+        let start = offset + found;
+        let end = start + needle.len();
+        if start < end {
+            let start_char = byte_to_char(line, start);
+            let end_char = byte_to_char(line, end);
+            if start_char < end_char {
+                ranges.push((start_char, end_char - 1));
+            }
+        }
+        offset = end;
+    }
+}
+
+fn push_regex_ranges(line: &str, regex: &regex::Regex, ranges: &mut Vec<(usize, usize)>) {
+    for hit in regex.find_iter(line) {
+        if hit.start() == hit.end() {
+            continue;
+        }
+        let start_char = byte_to_char(line, hit.start());
+        let end_char = byte_to_char(line, hit.end());
+        if start_char < end_char {
+            ranges.push((start_char, end_char - 1));
+        }
+    }
+}
+
+fn normalize_ranges(ranges: &mut Vec<(usize, usize)>) {
+    if ranges.is_empty() {
+        return;
+    }
+    ranges.sort_unstable();
+    let mut write = 0;
+    for read in 1..ranges.len() {
+        if ranges[read].0 <= ranges[write].1.saturating_add(1) {
+            ranges[write].1 = ranges[write].1.max(ranges[read].1);
+        } else {
+            write += 1;
+            ranges[write] = ranges[read];
+        }
+    }
+    ranges.truncate(write + 1);
+}
+
+fn byte_to_char(text: &str, byte: usize) -> usize {
+    text.char_indices()
+        .take_while(|(index, _)| *index < byte)
+        .count()
 }
 
 fn level_style(level: &str) -> Style {
@@ -10069,7 +10346,8 @@ Select/copy
   Esc               clear the selection, then the search
 
 Filter/search
-  / search          n/N next/previous match      c context 0/3/10
+  / inline search   Enter opens matches panel    n/N next/previous match
+                    c context 0/3/10
   f guided filter builder   t time range picker      F clear filters
   In the builder: ↑↓ pick a row, ←→ change a dropdown or step suggestions, type to edit
                   the field/value, Tab switches to the raw grammar, Enter applies
@@ -10095,7 +10373,8 @@ Filter/search
                         rows it matches; Tab flips hide/keep; the header counts both
   Filters apply to the whole project and are saved automatically
   x/L default to ~/.log-scouter/filters (any path works)
-  Search opens a bottom matches panel; click a match or focus it and press Enter
+  While typing /, the pane jumps to the first live match; Enter submits the search.
+  In the matches panel, click a match or focus it and press Enter
 
 Layout
   | split columns   - split rows                 w close pane
@@ -12812,6 +13091,58 @@ mod tests {
     }
 
     #[test]
+    fn slash_search_is_inline_live_and_submits_to_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press(&mut app, KeyCode::Char('/'));
+        assert!(matches!(app.mode, Mode::Search(_)));
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            !screen.contains("text | \"phrase\""),
+            "search should not open the old popup:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Matches"),
+            "live search should not open the results panel yet:\n{screen}"
+        );
+
+        type_text(&mut app, "Trigger: 7");
+        assert!(matches!(app.mode, Mode::Search(_)));
+        assert_eq!(app.active_view().unwrap().query_text, "Trigger: 7");
+        assert_eq!(app.active_view().unwrap().cursor, 7);
+        assert!(
+            !app.search_results_visible(),
+            "results panel stays hidden while editing"
+        );
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("/Trigger: 7"), "{screen}");
+        assert!(!screen.contains("Matches"), "{screen}");
+
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.search_results_visible());
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Matches 1/1"), "{screen}");
+    }
+
+    #[test]
+    fn n_and_shift_n_navigate_submitted_search_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        app.submit_search("queued".to_string());
+        app.finish_work();
+        assert_eq!(app.active_view().unwrap().cursor, 0);
+
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.active_view().unwrap().cursor, 1);
+
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.active_view().unwrap().cursor, 0);
+    }
+
+    #[test]
     fn loading_reports_progress_and_populates_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("big.log");
@@ -14432,6 +14763,23 @@ mod tests {
         // A run entirely scrolled off leaves the row unstyled.
         let line = highlighted_row("cdefgh", 0, 1, 2, base);
         assert_eq!(line.spans.len(), 1);
+    }
+
+    #[test]
+    fn query_highlight_ranges_cover_every_visible_occurrence() {
+        let query = compile_query("queued");
+        let line = "queued then QUEUED";
+        let ranges = query_highlight_ranges(Some(&query), line);
+        assert_eq!(ranges, vec![(0, 5), (12, 17)]);
+
+        let highlighted =
+            highlighted_ranges(line, &ranges, 0, Style::default(), search_hit_style());
+        let texts: Vec<String> = highlighted
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert_eq!(texts, vec!["queued", " then ", "QUEUED"]);
     }
 
     // ---- elapsed time from a mark ----------------------------------------------
