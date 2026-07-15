@@ -2286,6 +2286,41 @@ fn a_leftover_wider_range_does_not_reopen_the_window() {
     assert_eq!(inside(&broken), narrow_count);
 }
 
+/// The memoised one-pass field extraction must agree with per-field access, and repeat
+/// reads must stay stable. Uses a many-field JSON schema -- the shape whose ~11 ms parse
+/// made field-at-a-time access stall the UI, now cached.
+#[test]
+fn cached_field_extraction_matches_and_is_stable() {
+    let format = "{\"@timestamp\":\"<timestamp>\",\"message\":\"<message>\",\"logger_name\":\"<logger>\",\"level\":\"<level>\"}";
+    let mut extractor =
+        Extractor::with_timestamp_format("json", format, "%Y-%m-%dT%H:%M:%S%.3fZ").unwrap();
+    extractor.entry_start = r"^\{".to_string();
+    extractor.compile().unwrap();
+
+    let body = "{\"@timestamp\":\"2026-07-15T08:12:59.414Z\",\"message\":\"boom, with a comma\",\"logger_name\":\"com.mstr.Rest\",\"level\":\"ERROR\"}";
+    let mut model = LogFileModel::new(
+        "f1",
+        "m.log",
+        extractor.name.clone(),
+        "",
+        Some(extractor.clone()),
+    );
+    model.load_from_lines(body.lines());
+    let entry = &model.entries[0];
+
+    assert_eq!(model.get_field(entry, "level"), "ERROR");
+    assert_eq!(model.get_field(entry, "logger"), "com.mstr.Rest");
+    assert_eq!(model.get_field(entry, "message"), "boom, with a comma");
+    // Second read hits the cache and returns the same thing.
+    assert_eq!(model.get_field(entry, "message"), "boom, with a comma");
+
+    // fields_for (one pass) agrees with field-at-a-time access.
+    let map = model.fields_for(entry);
+    for field in ["timestamp", "message", "logger", "level"] {
+        assert_eq!(map.get(field).map(String::as_str).unwrap_or(""), model.get_field(entry, field));
+    }
+}
+
 /// A block schema whose `message` *value* itself spans several physical lines. Without
 /// `(?s)` on the whole-entry regex the record fails to parse: `level`/`host` come back
 /// blank and the row collapses to a bare `{`. The message must survive with its newlines,

@@ -4,8 +4,12 @@ use crate::core::parser;
 use crate::core::search::Query;
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -225,6 +229,39 @@ fn shell_quote(part: &str) -> String {
     }
 }
 
+/// How many parsed entries the per-file field cache keeps. Far more than a viewport
+/// holds, so scrolling never re-parses a row already on screen; small enough that even a
+/// pathological schema's multi-KB field maps stay well under a few MB.
+const FIELD_CACHE_CAP: usize = 1024;
+
+/// Memoised field extraction, keyed by entry content.
+///
+/// Reading a field runs the schema's whole-entry regex. On an ordinary line that is
+/// nothing; on a 30 KB JSON line under a schema with a dozen `.*?` groups it is ~11 ms,
+/// and the results list reads three or four fields per visible row *every frame* while the
+/// detail panel reads a dozen for the current entry. Unmemoised that is hundreds of ms per
+/// frame and the cursor visibly stalls. Parsing once per distinct entry collapses it to a
+/// one-off cost paid as each row is first revealed.
+#[derive(Debug, Default)]
+struct FieldCacheInner {
+    map: HashMap<u64, Rc<HashMap<String, String>>>,
+    /// Insertion order, for FIFO eviction once `map` reaches `FIELD_CACHE_CAP`.
+    order: VecDeque<u64>,
+}
+
+#[derive(Debug, Default)]
+struct FieldCache {
+    inner: RefCell<FieldCacheInner>,
+}
+
+impl Clone for FieldCache {
+    /// A cloned model starts cold: the cache is a pure optimisation, and its entries would
+    /// only have to be re-validated against the clone's (possibly edited) schema anyway.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LogFileModel {
     pub file_id: String,
@@ -249,6 +286,7 @@ pub struct LogFileModel {
     /// project can show the already captured lines before reconnecting.
     pub live: Option<LiveSourceConfig>,
     concrete: HashMap<String, Option<String>>,
+    field_cache: FieldCache,
 }
 
 impl LogFileModel {
@@ -288,6 +326,7 @@ impl LogFileModel {
             merged_from: Vec::new(),
             live: None,
             concrete: HashMap::new(),
+            field_cache: FieldCache::default(),
         }
     }
 
@@ -368,75 +407,120 @@ impl LogFileModel {
         let Some(concrete) = concrete_name(extractor, name) else {
             return visit("");
         };
-        let message_group = message_group(extractor);
-        let is_message = concrete == message_group;
 
-        // The trailing field runs to end-of-line, so only the header needs capturing.
-        let first_line = entry.raw.split_once('\n').map(|(head, _)| head);
-        let head_line = first_line.unwrap_or(&entry.raw);
-
-        if first_line.is_some() && extractor.format.contains('\n') {
-            let Some(captures) = extractor.captures(&entry.raw) else {
-                return if is_message {
-                    visit(&entry.raw)
-                } else {
-                    visit("")
-                };
-            };
-            let value = captures.name(&concrete).map(|m| m.as_str()).unwrap_or("");
-            return visit(value);
+        // One regex pass fills every field; the result is memoised per entry, so the
+        // dozen field reads a detail panel makes -- and the same reads on the next frame --
+        // are lookups rather than re-parses. See `FieldCache`.
+        let fields = self.cached_fields(entry);
+        match fields.get(&concrete) {
+            Some(value) => visit(value),
+            None => visit(""),
         }
-
-        let Some((captures, tail_start)) = extractor.head_captures(head_line) else {
-            return if is_message {
-                visit(&entry.raw)
-            } else {
-                visit("")
-            };
-        };
-
-        if is_message && extractor.tail_field() == Some(concrete.as_str()) {
-            let tail = &head_line[tail_start..];
-            return match first_line {
-                None => visit(tail),
-                Some(_) => {
-                    // Multi-line entry: continuation lines belong to the message.
-                    let continuation = &entry.raw[head_line.len()..];
-                    let mut owned = String::with_capacity(tail.len() + continuation.len());
-                    owned.push_str(tail);
-                    owned.push_str(continuation);
-                    visit(&owned)
-                }
-            };
-        }
-
-        let value = captures.name(&concrete).map(|m| m.as_str()).unwrap_or("");
-        if is_message {
-            if let Some((_, continuation)) = entry.raw.split_once('\n') {
-                let mut owned = String::with_capacity(value.len() + continuation.len() + 1);
-                owned.push_str(value);
-                owned.push('\n');
-                owned.push_str(continuation);
-                return visit(&owned);
-            }
-        }
-        visit(value)
     }
 
-    pub fn fields_for(&self, entry: &LogEntry) -> HashMap<String, String> {
+    /// Every field of `entry` under its schema, extracted in a single regex pass. This is
+    /// the one place the whole-entry regex runs; `with_field` reads from the map it builds.
+    fn field_map(&self, entry: &LogEntry) -> HashMap<String, String> {
         let Some(extractor) = self.extractor_for(entry) else {
             return HashMap::from([("message".to_string(), entry.raw.clone())]);
         };
-        if extractor.captures(&entry.raw).is_none() {
-            return HashMap::from([("message".to_string(), entry.raw.clone())]);
+        let message_group = message_group(extractor);
+        let first_line = entry.raw.split_once('\n').map(|(head, _)| head);
+        let head_line = first_line.unwrap_or(&entry.raw);
+
+        // A multi-line block schema captures the whole entry at once.
+        if first_line.is_some() && extractor.format.contains('\n') {
+            let Some(captures) = extractor.captures(&entry.raw) else {
+                return HashMap::from([(message_group, entry.raw.clone())]);
+            };
+            return extractor
+                .field_names
+                .iter()
+                .map(|name| {
+                    let value = captures
+                        .name(name)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
+                    (name.clone(), value)
+                })
+                .collect();
         }
 
-        let names = extractor.field_names.clone();
-        let mut parsed = HashMap::with_capacity(names.len());
-        for name in &names {
-            parsed.insert(name.clone(), self.get_field(entry, name));
+        // The trailing field runs to end-of-line, so only the header needs capturing.
+        let Some((captures, tail_start)) = extractor.head_captures(head_line) else {
+            return HashMap::from([(message_group, entry.raw.clone())]);
+        };
+        let tail_field = extractor.tail_field();
+        let mut map = HashMap::with_capacity(extractor.field_names.len());
+        for name in &extractor.field_names {
+            let is_message = *name == message_group;
+            if is_message && tail_field == Some(name.as_str()) {
+                let tail = &head_line[tail_start..];
+                let value = match first_line {
+                    None => tail.to_string(),
+                    Some(_) => {
+                        // Multi-line entry: continuation lines belong to the message.
+                        let continuation = &entry.raw[head_line.len()..];
+                        let mut owned = String::with_capacity(tail.len() + continuation.len());
+                        owned.push_str(tail);
+                        owned.push_str(continuation);
+                        owned
+                    }
+                };
+                map.insert(name.clone(), value);
+                continue;
+            }
+
+            let value = captures.name(name).map(|m| m.as_str()).unwrap_or("");
+            if is_message {
+                if let Some((_, continuation)) = entry.raw.split_once('\n') {
+                    let mut owned = String::with_capacity(value.len() + continuation.len() + 1);
+                    owned.push_str(value);
+                    owned.push('\n');
+                    owned.push_str(continuation);
+                    map.insert(name.clone(), owned);
+                    continue;
+                }
+            }
+            map.insert(name.clone(), value.to_string());
         }
-        parsed
+        map
+    }
+
+    /// The memoised field map for `entry`, parsing on a miss. Keyed by entry content and
+    /// schema identity (below), so a re-ordered, merged, or re-filtered `entries` never
+    /// serves a stale map, and editing a schema re-keys every entry automatically.
+    fn cached_fields(&self, entry: &LogEntry) -> Rc<HashMap<String, String>> {
+        let key = self.field_cache_key(entry);
+        if let Some(hit) = self.field_cache.inner.borrow().map.get(&key) {
+            return hit.clone();
+        }
+        let fields = Rc::new(self.field_map(entry));
+        let mut cache = self.field_cache.inner.borrow_mut();
+        cache.map.insert(key, fields.clone());
+        cache.order.push_back(key);
+        while cache.order.len() > FIELD_CACHE_CAP {
+            if let Some(evicted) = cache.order.pop_front() {
+                cache.map.remove(&evicted);
+            }
+        }
+        fields
+    }
+
+    fn field_cache_key(&self, entry: &LogEntry) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        entry.source.hash(&mut hasher);
+        if let Some(extractor) = self.extractor_for(entry) {
+            extractor.name.hash(&mut hasher);
+            extractor.format.hash(&mut hasher);
+            extractor.timestamp_format.hash(&mut hasher);
+        }
+        entry.raw.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    pub fn fields_for(&self, entry: &LogEntry) -> HashMap<String, String> {
+        (*self.cached_fields(entry)).clone()
     }
 
     /// The entry's time, from its schema's timestamp field when that field exists and
