@@ -134,6 +134,8 @@ struct FileData {
     label: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    tag: String,
 }
 
 impl Project {
@@ -493,6 +495,7 @@ impl Project {
             );
             model.label = file_data.label;
             model.description = file_data.description;
+            model.tag = file_data.tag;
             self.files.push(model);
         }
     }
@@ -513,6 +516,7 @@ impl Project {
                     display_name: file.display_name.clone(),
                     label: file.label.clone(),
                     description: file.description.clone(),
+                    tag: file.tag.clone(),
                 })
                 .collect(),
             extractors: self.extractors.values().cloned().collect(),

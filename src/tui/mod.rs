@@ -7,8 +7,9 @@ use crate::core::extractor::{
 };
 use crate::core::filters::{
     common_message_pattern, expand_tilde, export_filters_to_folder, hide_like, home_dir,
-    load_filters_from_folder, message_template, pattern_candidates, user_filter_dir, FilterRule,
-    FilterSet, PatternOption, USER_DIR, USER_FILTERS_SUBDIR,
+    json_file_paths, load_filters_from_folder, message_template, pattern_candidates,
+    sanitize_file_component, user_filter_dir, FilterRule, FilterSet, PatternOption, USER_DIR,
+    USER_FILTERS_SUBDIR,
 };
 use crate::core::models::{apply_context, LogEntry, LogFileModel, ViewModel, VisibleIndices};
 use crate::core::parser::{self, EntryBuilder};
@@ -42,6 +43,18 @@ use std::time::{Duration, Instant};
 
 const CONTEXT_CYCLE: &[usize] = &[0, 3, 10];
 const DETAIL_LABEL_WIDTH: usize = 14;
+const USER_BOOKMARKS_SUBDIR: &str = "bookmarks";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BookmarkFile {
+    name: String,
+    #[serde(default)]
+    description: String,
+    file_path: String,
+    line_no: usize,
+    #[serde(default)]
+    note: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -769,6 +782,59 @@ impl ThemePicker {
 }
 
 #[derive(Debug, Clone)]
+struct SourceEditor {
+    file_id: String,
+    row: usize,
+    short_name: String,
+    description: String,
+    tag: String,
+    schema: String,
+}
+
+impl SourceEditor {
+    const SHORT_NAME: usize = 0;
+    const DESCRIPTION: usize = 1;
+    const TAG: usize = 2;
+    const SCHEMA: usize = 3;
+    const ROWS: usize = 4;
+
+    fn new(file: &LogFileModel) -> Self {
+        Self {
+            file_id: file.file_id.clone(),
+            row: Self::SHORT_NAME,
+            short_name: source_default_short_name(file),
+            description: file.description.clone(),
+            tag: file.tag.clone(),
+            schema: file.extractor_name.clone(),
+        }
+    }
+
+    fn pick(&mut self, delta: isize) {
+        self.row = self
+            .row
+            .saturating_add_signed(delta)
+            .min(Self::ROWS.saturating_sub(1));
+    }
+
+    fn field_mut(&mut self) -> &mut String {
+        match self.row {
+            Self::SHORT_NAME => &mut self.short_name,
+            Self::DESCRIPTION => &mut self.description,
+            Self::TAG => &mut self.tag,
+            Self::SCHEMA => &mut self.schema,
+            _ => &mut self.short_name,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SchemaLibraryPicker {
+    file_id: String,
+    options: Vec<Extractor>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
 enum Mode {
     Normal,
     Search(String),
@@ -781,11 +847,18 @@ enum Mode {
     LoadFilters(String),
     ExportSearches(String),
     ImportSearches(String),
+    ExportBookmarks(String),
+    ImportBookmarks(String),
     ExportSchemas(String),
     ImportSchemas(String),
     ExportIncident(String),
     Extractor(String),
-    LogSchema(String),
+    SaveSourceSchema {
+        file_id: String,
+        text: String,
+    },
+    SourceEditor(SourceEditor),
+    SchemaLibraryPicker(SchemaLibraryPicker),
     /// Enter on a sidebar filter: edit that rule in place. `index` addresses
     /// `project.filters.rules`.
     EditFilter {
@@ -795,12 +868,6 @@ enum Mode {
     /// Enter on a saved search: edit that query in place.
     EditSearch {
         index: usize,
-        text: String,
-    },
-    /// `r` on a log source: give it a short label and description, `label | description`,
-    /// so the assistant and the sidebar can tell what the file is.
-    SourceLabel {
-        file_id: String,
         text: String,
     },
     /// Add or edit a note on a bookmarked line. Empty text is allowed: the bookmark itself
@@ -846,6 +913,8 @@ enum Command {
     ExportFilters,
     ImportSearches,
     ExportSearches,
+    ImportSchemas,
+    ExportSchemas,
     ExportIncident,
     AskAi,
     Copy,
@@ -859,9 +928,6 @@ enum Command {
     ShowDetail,
     OpenSource,
     MergeSource,
-    ChangeSchema,
-    InferSchema,
-    LabelSource,
     DeleteSelected,
     EditItem,
     ToggleItem,
@@ -895,6 +961,8 @@ impl Command {
             Command::ExportFilters => "Export filter pack",
             Command::ImportSearches => "Import saved-search library",
             Command::ExportSearches => "Export saved-search library",
+            Command::ImportSchemas => "Import schema library",
+            Command::ExportSchemas => "Export schema library",
             Command::ExportIncident => "Export incident Markdown",
             Command::AskAi => "Ask AI to help",
             Command::Copy => "Copy selection",
@@ -908,9 +976,6 @@ impl Command {
             Command::ShowDetail => "Show line detail",
             Command::OpenSource => "Open this source",
             Command::MergeSource => "Add source to view (merge)",
-            Command::ChangeSchema => "Change schema",
-            Command::InferSchema => "Infer schema with AI",
-            Command::LabelSource => "Label this source",
             Command::DeleteSelected => "Delete selected",
             Command::EditItem => "Edit",
             Command::ToggleItem => "Enable / disable",
@@ -938,12 +1003,14 @@ impl Command {
         match self {
             Command::Search => "/",
             Command::AddFilter => "f",
-            Command::ClearFilters => "F",
+            Command::ClearFilters => "",
             Command::TimeRange => "t",
             Command::ImportFilters => "L",
-            Command::ExportFilters => "x",
-            Command::ImportSearches => "",
-            Command::ExportSearches => "",
+            Command::ExportFilters => "X",
+            Command::ImportSearches => "L",
+            Command::ExportSearches => "X",
+            Command::ImportSchemas => "",
+            Command::ExportSchemas => "",
             Command::ExportIncident => "E",
             Command::AskAi => "A",
             Command::Copy => "y",
@@ -957,9 +1024,6 @@ impl Command {
             Command::ShowDetail => "Enter",
             Command::OpenSource => "",
             Command::MergeSource => "Space",
-            Command::ChangeSchema => "e",
-            Command::InferSchema => "i",
-            Command::LabelSource => "r",
             Command::DeleteSelected => "d",
             Command::EditItem => "Enter",
             Command::ToggleItem => "Space",
@@ -1064,6 +1128,8 @@ struct BookmarkNavPending {
 enum DetailSurface {
     Inline,
     Popup,
+    PrettyPrint,
+    Help,
 }
 
 /// Quick ranges offered by the time picker, as (label, seconds back from the anchor).
@@ -1671,6 +1737,10 @@ struct AppState {
     detail_area: Rect,
     /// Inner rect of the large entry detail popup.
     entry_detail_area: Rect,
+    /// Inner rect of the pretty-print popup.
+    pretty_print_area: Rect,
+    /// Inner rect of the help popup.
+    help_area: Rect,
     mouse_drag: Option<MouseDrag>,
     detail_selection: Option<DetailSelection>,
     /// Characters dragged out of a single pane row; `y` and right-click copy exactly it.
@@ -1739,6 +1809,8 @@ impl AppState {
             pane_areas: Vec::new(),
             detail_area: Rect::default(),
             entry_detail_area: Rect::default(),
+            pretty_print_area: Rect::default(),
+            help_area: Rect::default(),
             mouse_drag: None,
             detail_selection: None,
             text_selection: None,
@@ -3518,6 +3590,8 @@ impl AppState {
 
     fn draw_mode(&mut self, frame: &mut Frame, root: Rect) {
         self.entry_detail_area = Rect::default();
+        self.pretty_print_area = Rect::default();
+        self.help_area = Rect::default();
         match self.mode.clone() {
             Mode::Normal => {}
             Mode::Search(_) => {}
@@ -3561,6 +3635,20 @@ impl AppState {
                 "Folder of saved-search JSON files to merge into this project",
                 &text,
             ),
+            Mode::ExportBookmarks(text) => self.draw_input_popup(
+                frame,
+                root,
+                "Export Bookmarks",
+                "Folder to write one JSON file per incident bookmark",
+                &text,
+            ),
+            Mode::ImportBookmarks(text) => self.draw_input_popup(
+                frame,
+                root,
+                "Import Bookmarks",
+                "Folder of bookmark JSON files to merge into this project",
+                &text,
+            ),
             Mode::ExportSchemas(text) => self.draw_input_popup(
                 frame,
                 root,
@@ -3589,13 +3677,17 @@ impl AppState {
                 "schema name OR name | format template | [timestamp strptime format] | [description]",
                 &text,
             ),
-            Mode::LogSchema(text) => self.draw_input_popup(
+            Mode::SaveSourceSchema { text, .. } => self.draw_input_popup(
                 frame,
                 root,
-                "New Log Schema",
-                "name | format template | [timestamp strptime format] | [description]",
+                "Save Schema to Library",
+                "schema name | description",
                 &text,
             ),
+            Mode::SourceEditor(editor) => self.draw_source_editor(frame, root, &editor),
+            Mode::SchemaLibraryPicker(picker) => {
+                self.draw_schema_library_picker(frame, root, &picker)
+            }
             Mode::EditFilter { text, .. } => self.draw_input_popup(
                 frame,
                 root,
@@ -3608,13 +3700,6 @@ impl AppState {
                 root,
                 "Edit Saved Search",
                 "text | \"phrase\" | /regex/ | field=value | after:<ts>",
-                &text,
-            ),
-            Mode::SourceLabel { text, .. } => self.draw_input_popup(
-                frame,
-                root,
-                "Label Source",
-                "short label | description   (helps the AI understand this source)",
                 &text,
             ),
             Mode::BookmarkNote { text, .. } => self.draw_input_popup(
@@ -3632,16 +3717,7 @@ impl AppState {
                 body,
                 scroll,
             } => self.draw_pretty_print_popup(frame, root, &title, &body, scroll),
-            Mode::Help => {
-                let area = centered_rect(84, 46, root);
-                frame.render_widget(Clear, area);
-                frame.render_widget(
-                    Paragraph::new(help_text())
-                        .block(Block::default().title("Keys").borders(Borders::ALL))
-                        .wrap(Wrap { trim: false }),
-                    area,
-                );
-            }
+            Mode::Help => self.draw_help_popup(frame, root),
             Mode::Palette(palette) => self.draw_palette(frame, root, palette),
             Mode::FilterBuilder(builder) => self.draw_filter_builder(frame, root, &builder),
             Mode::ThemePicker(picker) => self.draw_theme_picker(frame, root, &picker),
@@ -3829,6 +3905,111 @@ impl AppState {
             theme.dim(),
         )));
 
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn draw_source_editor(&self, frame: &mut Frame, root: Rect, editor: &SourceEditor) {
+        let theme = self.theme();
+        let width = root
+            .width
+            .saturating_sub(4)
+            .min(112)
+            .max(root.width.min(72));
+        let height = 11.min(root.height.max(8));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title("Log Source  Enter save  Esc cancel")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent()));
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+        let label_width = 13usize;
+        let rows = [
+            ("Short name", editor.short_name.as_str()),
+            ("Description", editor.description.as_str()),
+            ("Tag", editor.tag.as_str()),
+            ("Schema", editor.schema.as_str()),
+        ];
+
+        let mut lines = Vec::new();
+        for (index, (label, value)) in rows.into_iter().enumerate() {
+            let marker = if index == editor.row { "> " } else { "  " };
+            let row = format!(
+                "{marker}{label:<label_width$} {}",
+                value,
+                label_width = label_width
+            );
+            let style = if index == editor.row {
+                theme.selected()
+            } else if index == SourceEditor::SCHEMA {
+                theme.section()
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(crop(&row, 0, text_width), style)));
+        }
+        lines.push(Line::from(""));
+        if editor.row == SourceEditor::SCHEMA {
+            lines.push(Line::from(Span::styled(
+                "Schema: i detect with LLM  e edit manually  L load library  X save to library",
+                theme.dim(),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Use Up/Down or Tab to move; type to edit the focused field",
+                theme.dim(),
+            )));
+        }
+
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn draw_schema_library_picker(
+        &self,
+        frame: &mut Frame,
+        root: Rect,
+        picker: &SchemaLibraryPicker,
+    ) {
+        let theme = self.theme();
+        let width = root.width.saturating_sub(4).min(96).max(root.width.min(64));
+        let visible = 10usize;
+        let height = ((picker.options.len().min(visible) + 3) as u16).min(root.height.max(7));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title("Schema Library  Enter apply  Esc cancel")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent()));
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+        let start = picker.selected.saturating_sub(visible.saturating_sub(1));
+
+        let mut lines = Vec::new();
+        for (index, schema) in picker.options.iter().enumerate().skip(start).take(visible) {
+            let selected = index == picker.selected;
+            let marker = if selected { "> " } else { "  " };
+            let desc = if schema.description.trim().is_empty() {
+                schema.format.as_str()
+            } else {
+                schema.description.as_str()
+            };
+            let row = format!("{marker}{:<24} {}", schema.name, desc);
+            lines.push(Line::from(Span::styled(
+                crop(&row, 0, text_width),
+                if selected {
+                    theme.selected()
+                } else {
+                    Style::default()
+                },
+            )));
+        }
+        if picker.options.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  no schemas in ~/.log-scouter/schemas",
+                theme.dim(),
+            )));
+        }
         frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
@@ -4097,7 +4278,7 @@ impl AppState {
     }
 
     fn draw_pretty_print_popup(
-        &self,
+        &mut self,
         frame: &mut Frame,
         root: Rect,
         title: &str,
@@ -4118,19 +4299,44 @@ impl AppState {
         frame.render_widget(Clear, area);
 
         let block = Block::default()
-            .title(format!("{title}  Esc/q close  j/k scroll"))
+            .title(format!("{title}  y copy  Esc/q close  j/k scroll"))
             .borders(Borders::ALL);
         let inner = block.inner(area);
+        self.pretty_print_area = inner;
         frame.render_widget(block, area);
         if inner.width == 0 || inner.height == 0 {
             return;
         }
 
         let lines = pretty_body_lines(body, inner.width as usize);
+        let lines = self.apply_detail_selection(lines, DetailSurface::PrettyPrint);
         frame.render_widget(
             Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)),
             inner,
         );
+    }
+
+    fn draw_help_popup(&mut self, frame: &mut Frame, root: Rect) {
+        let width = root
+            .width
+            .saturating_sub(4)
+            .min(160)
+            .max(root.width.min(84));
+        let height = root
+            .height
+            .saturating_sub(4)
+            .min(70)
+            .max(root.height.min(20));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title("Keys  y copy  Esc/q close")
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        self.help_area = inner;
+        let lines = self.detail_surface_lines(DetailSurface::Help, inner.width as usize);
+        let lines = self.apply_detail_selection(lines, DetailSurface::Help);
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     /// Long values (a derived regex, a full log message) must wrap: with a single
@@ -4383,24 +4589,28 @@ impl AppState {
             | Mode::LoadFilters(_)
             | Mode::ExportSearches(_)
             | Mode::ImportSearches(_)
+            | Mode::ExportBookmarks(_)
+            | Mode::ImportBookmarks(_)
             | Mode::ExportSchemas(_)
             | Mode::ImportSchemas(_)
             | Mode::ExportIncident(_)
             | Mode::Extractor(_)
-            | Mode::LogSchema(_)
+            | Mode::SaveSourceSchema { .. }
             | Mode::EditFilter { .. }
             | Mode::EditSearch { .. }
-            | Mode::SourceLabel { .. }
             | Mode::BookmarkNote { .. }
             | Mode::HidePattern(_) => 1,
             Mode::HideChoice(_) => 2,
             Mode::EntryDetail { .. } | Mode::PrettyPrint { .. } => 3,
-            Mode::Help | Mode::ActionLog => 4,
+            Mode::ActionLog => 4,
             Mode::TimePicker(_) => 5,
             Mode::OpenFolder(_) => 6,
             Mode::Palette(_) => 7,
             Mode::FilterBuilder(_) => 8,
             Mode::ThemePicker(_) => 9,
+            Mode::Help => 10,
+            Mode::SourceEditor(_) => 11,
+            Mode::SchemaLibraryPicker(_) => 12,
         };
 
         match mode_kind {
@@ -4417,13 +4627,24 @@ impl AppState {
             7 => self.handle_palette_key(key),
             8 => self.handle_filter_builder_key(key),
             9 => self.handle_theme_picker_key(key),
+            10 => self.handle_help_key(key),
+            11 => self.handle_source_editor_key(key),
+            12 => self.handle_schema_library_picker_key(key),
             _ => Ok(false),
         }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if matches!(self.mode, Mode::EntryDetail { .. }) {
-            self.handle_entry_detail_mouse(mouse);
+            self.handle_detail_popup_mouse(DetailSurface::Popup, mouse);
+            return;
+        }
+        if matches!(self.mode, Mode::PrettyPrint { .. }) {
+            self.handle_detail_popup_mouse(DetailSurface::PrettyPrint, mouse);
+            return;
+        }
+        if matches!(self.mode, Mode::Help) {
+            self.handle_detail_popup_mouse(DetailSurface::Help, mouse);
             return;
         }
 
@@ -4442,15 +4663,15 @@ impl AppState {
         }
     }
 
-    fn handle_entry_detail_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_detail_popup_mouse(&mut self, surface: DetailSurface, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Right) => {
-                if rect_contains(self.entry_detail_area, mouse.column, mouse.row) {
-                    self.copy_detail_text(DetailSurface::Popup);
+                if rect_contains(self.detail_surface_area(surface), mouse.column, mouse.row) {
+                    self.copy_detail_text(surface);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                self.begin_detail_mouse_selection(DetailSurface::Popup, mouse);
+                self.begin_detail_mouse_selection(surface, mouse);
             }
             MouseEventKind::Drag(MouseButton::Left) => self.drag_mouse_selection(mouse),
             MouseEventKind::Up(MouseButton::Left) => self.mouse_drag = None,
@@ -4731,8 +4952,9 @@ impl AppState {
         }
 
         let count = selected.len();
+        let label = detail_surface_label(surface);
         self.status = match copy_to_clipboard(&text) {
-            Ok(()) => format!("copied {count} detail line(s), {} bytes", text.len()),
+            Ok(()) => format!("copied {count} {label} line(s), {} bytes", text.len()),
             Err(error) => format!("copy failed: {error}"),
         };
     }
@@ -4802,10 +5024,7 @@ impl AppState {
             return None;
         }
         let row = y.saturating_sub(area.y) as usize;
-        let line = match surface {
-            DetailSurface::Inline => row,
-            DetailSurface::Popup => self.entry_detail_scroll().saturating_add(row),
-        };
+        let line = self.detail_surface_scroll(surface).saturating_add(row);
         let lines = self.detail_surface_lines(surface, area.width as usize);
         (line < lines.len()).then_some(line)
     }
@@ -4814,6 +5033,8 @@ impl AppState {
         match surface {
             DetailSurface::Inline => self.detail_area,
             DetailSurface::Popup => self.entry_detail_area,
+            DetailSurface::PrettyPrint => self.pretty_print_area,
+            DetailSurface::Help => self.help_area,
         }
     }
 
@@ -4828,12 +5049,18 @@ impl AppState {
                 }
             }
             DetailSurface::Popup => self.full_entry_detail_lines(width),
+            DetailSurface::PrettyPrint => match &self.mode {
+                Mode::PrettyPrint { body, .. } => pretty_body_lines(body, width),
+                _ => Vec::new(),
+            },
+            DetailSurface::Help => pretty_body_lines(help_text(), width),
         }
     }
 
-    fn entry_detail_scroll(&self) -> usize {
-        match self.mode {
-            Mode::EntryDetail { scroll } => scroll,
+    fn detail_surface_scroll(&self, surface: DetailSurface) -> usize {
+        match (surface, &self.mode) {
+            (DetailSurface::Popup, Mode::EntryDetail { scroll }) => *scroll,
+            (DetailSurface::PrettyPrint, Mode::PrettyPrint { scroll, .. }) => *scroll,
             _ => 0,
         }
     }
@@ -4843,10 +5070,49 @@ impl AppState {
             return;
         };
         let count = selection.anchor.abs_diff(selection.cursor) + 1;
+        let label = detail_surface_label(selection.surface);
         self.status = match count {
-            1 => "1 detail line selected".to_string(),
-            n => format!("{n} detail lines selected"),
+            1 => format!("1 {label} line selected"),
+            n => format!("{n} {label} lines selected"),
         };
+    }
+
+    fn selected_sidebar_item(&self) -> Option<SidebarItem> {
+        (self.focus == Focus::Sidebar)
+            .then(|| self.sidebar_items().get(self.sidebar_selected).cloned())
+            .flatten()
+    }
+
+    fn open_library_load(&mut self) {
+        match self.selected_sidebar_item() {
+            Some(SidebarItem::File { file_id, .. }) => self.open_schema_library_picker(file_id),
+            Some(SidebarItem::Search { .. }) => {
+                self.open_input(Mode::ImportSearches(self.default_search_folder_input()))
+            }
+            Some(SidebarItem::Bookmark { .. }) => {
+                self.open_input(Mode::ImportBookmarks(self.default_bookmark_folder_input()))
+            }
+            Some(SidebarItem::Filter { .. } | SidebarItem::TimeFilter { .. }) | None => {
+                self.open_input(Mode::LoadFilters(self.default_filter_folder_input()))
+            }
+            _ => self.open_input(Mode::LoadFilters(self.default_filter_folder_input())),
+        }
+    }
+
+    fn open_library_save(&mut self) {
+        match self.selected_sidebar_item() {
+            Some(SidebarItem::File { file_id, .. }) => self.open_save_source_schema(file_id),
+            Some(SidebarItem::Search { .. }) => {
+                self.open_input(Mode::ExportSearches(self.default_search_folder_input()))
+            }
+            Some(SidebarItem::Bookmark { .. }) => {
+                self.open_input(Mode::ExportBookmarks(self.default_bookmark_folder_input()))
+            }
+            Some(SidebarItem::Filter { .. } | SidebarItem::TimeFilter { .. }) | None => {
+                self.open_input(Mode::ExportFilters(self.default_filter_folder_input()))
+            }
+            _ => self.open_input(Mode::ExportFilters(self.default_filter_folder_input())),
+        }
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
@@ -5074,33 +5340,21 @@ impl AppState {
             KeyCode::Char('f') => self.open_filter_builder(None),
             KeyCode::Char('t') => self.open_time_picker(),
             KeyCode::Char('T') => self.toggle_elapsed_mark(),
-            KeyCode::Char('F') => self.clear_filters(),
             KeyCode::Char('P') | KeyCode::Char('p')
                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 self.open_pretty_print();
             }
-            KeyCode::Char('x') => {
-                self.open_input(Mode::ExportFilters(self.default_filter_folder_input()))
-            }
             KeyCode::Char('E') => {
                 self.open_input(Mode::ExportIncident(self.default_incident_file_input()))
             }
-            KeyCode::Char('L') => {
-                self.open_input(Mode::LoadFilters(self.default_filter_folder_input()))
-            }
-            KeyCode::Char('X') => {
-                self.open_input(Mode::ExportSchemas(self.default_schema_folder_input()))
-            }
-            KeyCode::Char('I') => {
-                self.open_input(Mode::ImportSchemas(self.default_schema_folder_input()))
-            }
+            KeyCode::Char('L') => self.open_library_load(),
+            KeyCode::Char('X') => self.open_library_save(),
             KeyCode::Char('H') => self.begin_hide(),
             KeyCode::Char('a') => self.open_file_browser(),
             KeyCode::Char('o') => self.open_folder_browser(),
             KeyCode::Char('d') => self.delete_selected(),
             KeyCode::Delete if self.focus == Focus::Sidebar => self.delete_selected(),
-            KeyCode::Char('S') => self.open_new_schema_input(),
             KeyCode::Char('|') | KeyCode::Char('\\') => self.split_active(SplitMode::Horizontal),
             KeyCode::Char('-') => self.split_active(SplitMode::Vertical),
             KeyCode::Char('[') => self.resize_sidebar_or_start_bookmark_nav(false, count),
@@ -5112,9 +5366,6 @@ impl AppState {
             KeyCode::Char('w') => self.close_active_pane(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char(':') => self.open_palette(),
-            KeyCode::Char('e') => self.open_schema_input(),
-            KeyCode::Char('i') => self.infer_schema_ai(),
-            KeyCode::Char('r') => self.open_source_label(),
             KeyCode::Enter => match self.focus {
                 Focus::Sidebar => self.activate_sidebar_item(),
                 Focus::Results => self.jump_to_selected_result(),
@@ -5287,14 +5538,15 @@ impl AppState {
             | Mode::LoadFilters(text)
             | Mode::ExportSearches(text)
             | Mode::ImportSearches(text)
+            | Mode::ExportBookmarks(text)
+            | Mode::ImportBookmarks(text)
             | Mode::ExportSchemas(text)
             | Mode::ImportSchemas(text)
             | Mode::ExportIncident(text)
             | Mode::Extractor(text)
-            | Mode::LogSchema(text)
+            | Mode::SaveSourceSchema { text, .. }
             | Mode::EditFilter { text, .. }
             | Mode::EditSearch { text, .. }
-            | Mode::SourceLabel { text, .. }
             | Mode::BookmarkNote { text, .. } => text.chars().count(),
             Mode::HidePattern(prompt) => prompt.text.chars().count(),
             _ => 0,
@@ -5382,6 +5634,7 @@ impl AppState {
         if matches!(self.mode, Mode::PrettyPrint { .. }) {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.mode = Mode::Normal,
+                KeyCode::Char('y') => self.copy_detail_text(DetailSurface::PrettyPrint),
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_pretty_print(1),
                 KeyCode::Up | KeyCode::Char('k') => self.scroll_pretty_print(-1),
                 KeyCode::PageDown => self.scroll_pretty_print(10),
@@ -5430,6 +5683,14 @@ impl AppState {
         Ok(false)
     }
 
+    fn handle_help_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        match key.code {
+            KeyCode::Char('y') => self.copy_detail_text(DetailSurface::Help),
+            _ => self.mode = Mode::Normal,
+        }
+        Ok(false)
+    }
+
     fn scroll_entry_detail(&mut self, delta: isize) {
         if let Mode::EntryDetail { scroll } = &mut self.mode {
             *scroll = scroll.saturating_add_signed(delta);
@@ -5451,14 +5712,15 @@ impl AppState {
             | Mode::LoadFilters(input)
             | Mode::ExportSearches(input)
             | Mode::ImportSearches(input)
+            | Mode::ExportBookmarks(input)
+            | Mode::ImportBookmarks(input)
             | Mode::ExportSchemas(input)
             | Mode::ImportSchemas(input)
             | Mode::ExportIncident(input)
             | Mode::Extractor(input)
-            | Mode::LogSchema(input)
+            | Mode::SaveSourceSchema { text: input, .. }
             | Mode::EditFilter { text: input, .. }
             | Mode::EditSearch { text: input, .. }
-            | Mode::SourceLabel { text: input, .. }
             | Mode::BookmarkNote { text: input, .. } => Some(input),
             Mode::HidePattern(prompt) => Some(&mut prompt.text),
             _ => None,
@@ -5475,14 +5737,17 @@ impl AppState {
             Mode::LoadFilters(folder) => self.submit_load_filters(folder),
             Mode::ExportSearches(folder) => self.submit_export_searches(folder),
             Mode::ImportSearches(folder) => self.submit_import_searches(folder),
+            Mode::ExportBookmarks(folder) => self.submit_export_bookmarks(folder),
+            Mode::ImportBookmarks(folder) => self.submit_import_bookmarks(folder),
             Mode::ExportSchemas(folder) => self.submit_export_schemas(folder),
             Mode::ImportSchemas(folder) => self.submit_import_schemas(folder),
             Mode::ExportIncident(path) => self.submit_export_incident(path),
             Mode::Extractor(text) => self.submit_extractor(text),
-            Mode::LogSchema(text) => self.submit_schema_definition(text),
+            Mode::SaveSourceSchema { file_id, text } => {
+                self.submit_save_source_schema(file_id, text)
+            }
             Mode::EditFilter { index, text } => self.submit_edit_filter(index, text),
             Mode::EditSearch { index, text } => self.submit_edit_search(index, text),
-            Mode::SourceLabel { file_id, text } => self.submit_source_label(file_id, text),
             Mode::BookmarkNote {
                 file_id,
                 line_no,
@@ -5803,6 +6068,9 @@ impl AppState {
                 if !file.description.is_empty() {
                     out.push_str(&format!("      note: {}\n", file.description));
                 }
+                if !file.tag.is_empty() {
+                    out.push_str(&format!("      tag: {}\n", file.tag));
+                }
             }
         }
 
@@ -5935,8 +6203,13 @@ impl AppState {
             } else {
                 format!(" | {}", file.description)
             };
+            let tag = if file.tag.is_empty() {
+                String::new()
+            } else {
+                format!(" | tag {}", file.tag)
+            };
             out.push_str(&format!(
-                "{} | schema {} | {state}{label}{note}\n",
+                "{} | schema {} | {state}{label}{tag}{note}\n",
                 file.display_name, file.extractor_name
             ));
         }
@@ -6639,9 +6912,7 @@ impl AppState {
                 Some(SidebarItem::File { .. }) => commands.extend([
                     Command::OpenSource,
                     Command::MergeSource,
-                    Command::ChangeSchema,
-                    Command::InferSchema,
-                    Command::LabelSource,
+                    Command::EditItem,
                     Command::DeleteSelected,
                 ]),
                 Some(SidebarItem::Filter { .. } | SidebarItem::TimeFilter { .. }) => commands
@@ -6693,6 +6964,8 @@ impl AppState {
             Command::ExportFilters,
             Command::ImportSearches,
             Command::ExportSearches,
+            Command::ImportSchemas,
+            Command::ExportSchemas,
             Command::ExportIncident,
             Command::AskAi,
             Command::Undo,
@@ -6744,6 +7017,12 @@ impl AppState {
             Command::ExportSearches => {
                 self.open_input(Mode::ExportSearches(self.default_search_folder_input()))
             }
+            Command::ImportSchemas => {
+                self.open_input(Mode::ImportSchemas(self.default_schema_folder_input()))
+            }
+            Command::ExportSchemas => {
+                self.open_input(Mode::ExportSchemas(self.default_schema_folder_input()))
+            }
             Command::ExportIncident => {
                 self.open_input(Mode::ExportIncident(self.default_incident_file_input()))
             }
@@ -6759,9 +7038,6 @@ impl AppState {
             Command::ShowDetail => self.open_entry_detail_popup(),
             Command::OpenSource => self.open_selected_source(),
             Command::MergeSource => self.toggle_active_selection(),
-            Command::ChangeSchema => self.open_schema_input(),
-            Command::InferSchema => self.infer_schema_ai(),
-            Command::LabelSource => self.open_source_label(),
             Command::DeleteSelected => self.delete_selected(),
             Command::EditItem => self.activate_sidebar_item(),
             Command::ToggleItem => self.toggle_active_selection(),
@@ -6871,6 +7147,90 @@ impl AppState {
             Ok(()) => self.status = format!("theme: {}", theme.label()),
             Err(error) => self.status = format!("theme not saved: {error}"),
         }
+    }
+
+    fn handle_source_editor_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::SourceEditor(mut editor) = self.mode.clone() else {
+            return Ok(false);
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.submit_source_editor(editor);
+            }
+            KeyCode::Up => {
+                editor.pick(-1);
+                self.mode = Mode::SourceEditor(editor);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                editor.pick(1);
+                self.mode = Mode::SourceEditor(editor);
+            }
+            KeyCode::BackTab => {
+                editor.pick(-1);
+                self.mode = Mode::SourceEditor(editor);
+            }
+            KeyCode::Backspace => {
+                editor.field_mut().pop();
+                self.mode = Mode::SourceEditor(editor);
+            }
+            KeyCode::Char('u') if ctrl => {
+                editor.field_mut().clear();
+                self.mode = Mode::SourceEditor(editor);
+            }
+            KeyCode::Char('i') if editor.row == SourceEditor::SCHEMA && !ctrl => {
+                self.save_source_editor_fields(&editor);
+                self.mode = Mode::Normal;
+                self.infer_schema_ai_for(editor.file_id);
+            }
+            KeyCode::Char('e') if editor.row == SourceEditor::SCHEMA && !ctrl => {
+                self.save_source_editor_fields(&editor);
+                self.open_schema_input_for(&editor.file_id);
+            }
+            KeyCode::Char('L') if editor.row == SourceEditor::SCHEMA && !ctrl => {
+                self.save_source_editor_fields(&editor);
+                self.open_schema_library_picker(editor.file_id);
+            }
+            KeyCode::Char('X') if editor.row == SourceEditor::SCHEMA && !ctrl => {
+                self.save_source_editor_fields(&editor);
+                self.open_save_source_schema(editor.file_id);
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                editor.field_mut().push(ch);
+                self.mode = Mode::SourceEditor(editor);
+            }
+            _ => self.mode = Mode::SourceEditor(editor),
+        }
+        Ok(false)
+    }
+
+    fn handle_schema_library_picker_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::SchemaLibraryPicker(mut picker) = self.mode.clone() else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+                self.mode = Mode::SchemaLibraryPicker(picker);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(picker.options.len().saturating_sub(1));
+                self.mode = Mode::SchemaLibraryPicker(picker);
+            }
+            KeyCode::Enter => {
+                let selected = picker.options.get(picker.selected).cloned();
+                let file_id = picker.file_id.clone();
+                self.mode = Mode::Normal;
+                if let Some(schema) = selected {
+                    self.apply_library_schema(file_id, schema);
+                }
+            }
+            _ => self.mode = Mode::SchemaLibraryPicker(picker),
+        }
+        Ok(false)
     }
 
     // ---- Guided filter builder --------------------------------------------------------
@@ -7394,6 +7754,153 @@ impl AppState {
         };
     }
 
+    fn submit_export_bookmarks(&mut self, folder: String) {
+        let folder = self.bookmark_folder_from_input(&folder);
+        if self.project.bookmarks.is_empty() {
+            self.status = "no bookmarks to export".to_string();
+            return;
+        }
+        if let Err(error) = fs::create_dir_all(&folder) {
+            self.status = format!("export failed: {error}");
+            return;
+        }
+
+        let mut written = 0usize;
+        for (index, bookmark) in self.project.bookmarks.iter().enumerate() {
+            let Some(bookmark_file) = self.bookmark_to_file(index + 1, bookmark) else {
+                continue;
+            };
+            let path = folder.join(format!(
+                "{:03}-{}.json",
+                index + 1,
+                sanitize_file_component(&bookmark_file.name)
+            ));
+            let body = match serde_json::to_string_pretty(&bookmark_file) {
+                Ok(body) => body,
+                Err(error) => {
+                    self.status = format!("export failed: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = fs::write(path, body) {
+                self.status = format!("export failed: {error}");
+                return;
+            }
+            written += 1;
+        }
+        self.status = format!("exported {written} bookmark(s) to {}", folder.display());
+    }
+
+    fn submit_import_bookmarks(&mut self, folder: String) {
+        let folder = self.bookmark_folder_from_input(&folder);
+        if !folder.is_dir() {
+            self.status = format!("no bookmark folder: {}", folder.display());
+            return;
+        }
+        let mut paths = match json_file_paths(&folder) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.status = format!("load failed: {error}");
+                return;
+            }
+        };
+        paths.sort();
+        if paths.is_empty() {
+            self.status = format!("no bookmark JSON files in {}", folder.display());
+            return;
+        }
+
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for path in paths {
+            let body = match fs::read_to_string(&path) {
+                Ok(body) => body,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let file = match serde_json::from_str::<BookmarkFile>(&body) {
+                Ok(file) => file,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let Some(file_id) = self.bookmark_file_id_from_library_path(&file.file_path) else {
+                skipped += 1;
+                continue;
+            };
+            let bookmark = Bookmark {
+                file_id,
+                line_no: file.line_no,
+                note: if file.note.trim().is_empty() {
+                    file.description
+                } else {
+                    file.note
+                },
+            };
+            if self.project.bookmarks.contains(&bookmark) {
+                skipped += 1;
+                continue;
+            }
+            self.project.bookmarks.push(bookmark);
+            added += 1;
+        }
+
+        self.autosave_project();
+        self.status = match skipped {
+            0 => format!("loaded {added} bookmark(s) from {}", folder.display()),
+            skipped => format!(
+                "loaded {added} bookmark(s), skipped {skipped} from {}",
+                folder.display()
+            ),
+        };
+    }
+
+    fn bookmark_to_file(&self, index: usize, bookmark: &Bookmark) -> Option<BookmarkFile> {
+        let file = self.project.get_file(&bookmark.file_id)?;
+        let source = self.project.rel(&file.path);
+        let preview = self
+            .bookmark_entry(bookmark)
+            .map(|(_, entry)| entry.raw.lines().next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let note = bookmark.note.trim();
+        let name = if note.is_empty() {
+            format!(
+                "bookmark-{index:03}-{}-{}",
+                file.display_name, bookmark.line_no
+            )
+        } else {
+            format!("bookmark-{index:03}-{}", field_value_preview(note))
+        };
+        Some(BookmarkFile {
+            name,
+            description: preview,
+            file_path: source,
+            line_no: bookmark.line_no,
+            note: bookmark.note.clone(),
+        })
+    }
+
+    fn bookmark_file_id_from_library_path(&self, file_path: &str) -> Option<String> {
+        let raw = file_path.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(raw);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.project.root.join(path)
+        };
+        self.project
+            .files
+            .iter()
+            .find(|file| !file.is_merged() && file.path == path)
+            .map(|file| file.file_id.clone())
+    }
+
     fn submit_export_schemas(&mut self, folder: String) {
         let folder = self.schema_folder_from_input(&folder);
         // Project order is a HashMap's order, which is not stable across runs. Sort so
@@ -7485,8 +7992,22 @@ impl AppState {
         self.apply_schema_to_file(&file_id, &name);
     }
 
-    fn submit_schema_definition(&mut self, text: String) {
-        let extractor = match parse_log_schema_input(&text) {
+    fn apply_schema_text_to_file(&mut self, file_id: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            self.status = "schema name cannot be empty".to_string();
+            return;
+        }
+        if !text.contains('|') {
+            if !self.project.extractors.contains_key(text) {
+                self.status = format!("unknown log schema: {text}");
+                return;
+            }
+            self.apply_schema_to_file(file_id, text);
+            return;
+        }
+
+        let extractor = match parse_log_schema_input(text) {
             Ok(extractor) => extractor,
             Err(error) => {
                 self.status = error;
@@ -7498,8 +8019,109 @@ impl AppState {
             self.status = error;
             return;
         }
-        self.autosave_project();
-        self.status = format!("schema saved: {name}");
+        self.apply_schema_to_file(file_id, &name);
+    }
+
+    fn open_schema_library_picker(&mut self, file_id: String) {
+        let folder = self.default_schema_folder_path();
+        if !folder.is_dir() {
+            self.status = format!("no schema folder: {}", folder.display());
+            self.mode = Mode::SourceEditor(
+                self.project
+                    .get_file(&file_id)
+                    .map(SourceEditor::new)
+                    .unwrap_or_else(|| SourceEditor {
+                        file_id,
+                        row: SourceEditor::SCHEMA,
+                        short_name: String::new(),
+                        description: String::new(),
+                        tag: String::new(),
+                        schema: String::new(),
+                    }),
+            );
+            return;
+        }
+        let loaded = match load_schemas_from_folder(&folder) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.status = format!("load failed: {error}");
+                return;
+            }
+        };
+        let mut options: Vec<Extractor> = loaded
+            .into_iter()
+            .map(|schema_file| {
+                let mut schema = schema_file.schema;
+                if schema.description.trim().is_empty() {
+                    schema.description = schema_file.description;
+                }
+                schema
+            })
+            .collect();
+        options.sort_by(|left, right| left.name.cmp(&right.name));
+        if options.is_empty() {
+            self.status = format!("no schema JSON files in {}", folder.display());
+            return;
+        }
+        self.mode = Mode::SchemaLibraryPicker(SchemaLibraryPicker {
+            file_id,
+            options,
+            selected: 0,
+        });
+    }
+
+    fn apply_library_schema(&mut self, file_id: String, schema: Extractor) {
+        let name = schema.name.clone();
+        if !self.project.extractors.contains_key(&name) {
+            if let Err(error) = self.project.add_extractor(schema) {
+                self.status = format!("schema import failed: {error}");
+                return;
+            }
+        }
+        self.apply_schema_to_file(&file_id, &name);
+    }
+
+    fn open_save_source_schema(&mut self, file_id: String) {
+        let Some(file) = self.project.get_file(&file_id) else {
+            return;
+        };
+        let Some(schema) = file.extractor.as_ref() else {
+            self.status = "this source has no schema to save".to_string();
+            return;
+        };
+        let text = if schema.description.trim().is_empty() {
+            schema.name.clone()
+        } else {
+            format!("{} | {}", schema.name, schema.description)
+        };
+        self.open_input(Mode::SaveSourceSchema { file_id, text });
+    }
+
+    fn submit_save_source_schema(&mut self, file_id: String, text: String) {
+        let Some(file) = self.project.get_file(&file_id) else {
+            self.status = "source is gone".to_string();
+            return;
+        };
+        let Some(mut schema) = file.extractor.clone() else {
+            self.status = "this source has no schema to save".to_string();
+            return;
+        };
+        let (name, description) = match text.split_once('|') {
+            Some((name, description)) => (name.trim(), description.trim()),
+            None => (text.trim(), schema.description.trim()),
+        };
+        if name.is_empty() {
+            self.status = "schema name cannot be empty".to_string();
+            return;
+        }
+        schema.name = name.to_string();
+        schema.description = description.to_string();
+        let folder = self.default_schema_folder_path();
+        match export_schemas_to_folder(&[schema], &folder) {
+            Ok(1) => self.status = format!("saved schema '{name}' to {}", folder.display()),
+            Ok(_) => self.status = "no schema saved".to_string(),
+            Err(error) => self.status = format!("schema save failed: {error}"),
+        }
     }
 
     fn apply_existing_schema_to_target(&mut self, name: &str) {
@@ -7818,56 +8440,50 @@ impl AppState {
         self.active_view().map(|view| view.file_id.clone())
     }
 
-    /// `r` on a source: edit its label and description. Prefilled with the current values as
-    /// `label | description`. Merged views are derived, not real sources, so they are skipped.
-    fn open_source_label(&mut self) {
-        let Some(file_id) = self.schema_target() else {
-            return;
-        };
-        let Some(file) = self.project.get_file(&file_id) else {
+    fn open_source_editor_for(&mut self, file_id: &str) {
+        let Some(file) = self.project.get_file(file_id) else {
             return;
         };
         if file.is_merged() {
-            self.status = "a merged view has no source label".to_string();
+            self.status = "a merged view has no source settings".to_string();
             return;
         }
-        let text = if file.description.is_empty() {
-            file.label.clone()
-        } else {
-            format!("{} | {}", file.label, file.description)
-        };
-        self.open_input(Mode::SourceLabel { file_id, text });
+        self.mode = Mode::SourceEditor(SourceEditor::new(file));
     }
 
-    /// Store a source's label and description from `label | description`, then persist.
-    fn submit_source_label(&mut self, file_id: String, text: String) {
-        let (label, description) = match text.split_once('|') {
-            Some((label, description)) => {
-                (label.trim().to_string(), description.trim().to_string())
-            }
-            None => (text.trim().to_string(), String::new()),
-        };
-        if let Some(file) = self.project.get_file_mut(&file_id) {
-            file.label = label.clone();
-            file.description = description;
-            let name = file.display_name.clone();
-            self.save_project();
-            self.status = if label.is_empty() {
-                format!("cleared label for {name}")
-            } else {
-                format!("labelled {name} as {label:?}")
-            };
+    fn save_source_editor_fields(&mut self, editor: &SourceEditor) {
+        if let Some(file) = self.project.get_file_mut(&editor.file_id) {
+            file.label = editor.short_name.trim().to_string();
+            file.description = editor.description.trim().to_string();
+            file.tag = editor.tag.trim().to_string();
+            self.autosave_project();
         }
+    }
+
+    fn submit_source_editor(&mut self, editor: SourceEditor) {
+        let schema = editor.schema.trim().to_string();
+        let old_schema = self
+            .project
+            .get_file(&editor.file_id)
+            .map(|file| file.extractor_name.clone())
+            .unwrap_or_default();
+        self.save_source_editor_fields(&editor);
+        if !schema.is_empty() && schema != old_schema {
+            self.apply_schema_text_to_file(&editor.file_id, &schema);
+            return;
+        }
+        let name = self
+            .project
+            .get_file(&editor.file_id)
+            .map(|file| source_default_short_name(file))
+            .unwrap_or_else(|| editor.short_name.clone());
+        self.status = format!("source updated: {name}");
     }
 
     /// `i` on a log source: ask the configured LLM to infer a schema from its first lines.
     /// The reply is not applied blindly -- `drain_schema_events` opens it in the schema editor
     /// for review. Needs a key configured (`logscout config set`, an env var, or `/key`).
-    fn infer_schema_ai(&mut self) {
-        let Some(file_id) = self.schema_target() else {
-            self.status = "select a log source first".to_string();
-            return;
-        };
+    fn infer_schema_ai_for(&mut self, file_id: String) {
         let Some(file) = self.project.get_file(&file_id) else {
             return;
         };
@@ -7962,10 +8578,11 @@ impl AppState {
         }
     }
 
-    fn open_schema_input(&mut self) {
+    fn open_schema_input_for(&mut self, file_id: &str) {
         let prefill = self
-            .schema_target()
-            .and_then(|file_id| self.project.get_file(&file_id).cloned())
+            .project
+            .get_file(file_id)
+            .cloned()
             .and_then(|file| {
                 file.extractor
                     .map(|extractor| (file.display_name, extractor))
@@ -7993,13 +8610,6 @@ impl AppState {
                 )
             });
         self.open_input(Mode::Extractor(prefill));
-    }
-
-    fn open_new_schema_input(&mut self) {
-        self.open_input(Mode::LogSchema(format!(
-            "My schema | <timestamp> <level>: <message> | {} | description",
-            DEFAULT_TIMESTAMP_FORMAT
-        )));
     }
 
     /// Oldest and newest parseable timestamps in the focused log. A log is written in
@@ -9176,7 +9786,7 @@ impl AppState {
             return;
         };
         match item {
-            SidebarItem::File { .. } => self.open_schema_input(),
+            SidebarItem::File { file_id, .. } => self.open_source_editor_for(&file_id),
             SidebarItem::Filter { index, .. } => self.open_filter_builder(Some(index)),
             // The picker, not the filter grammar: a range is edited as two timestamps.
             SidebarItem::TimeFilter { .. } => self.open_time_picker(),
@@ -9419,6 +10029,29 @@ impl AppState {
         }
     }
 
+    fn project_bookmark_folder_path(&self) -> PathBuf {
+        self.project
+            .root
+            .join(CONFIG_DIR)
+            .join(USER_BOOKMARKS_SUBDIR)
+    }
+
+    fn default_bookmark_folder_path(&self) -> PathBuf {
+        home_dir()
+            .map(|home| home.join(USER_DIR).join(USER_BOOKMARKS_SUBDIR))
+            .unwrap_or_else(|| self.project_bookmark_folder_path())
+    }
+
+    fn default_bookmark_folder_input(&self) -> String {
+        if home_dir().is_some() {
+            format!("~/{}/{}", USER_DIR, USER_BOOKMARKS_SUBDIR)
+        } else {
+            self.default_bookmark_folder_path()
+                .to_string_lossy()
+                .to_string()
+        }
+    }
+
     fn default_incident_file_input(&self) -> String {
         format!("{CONFIG_DIR}/incident.md")
     }
@@ -9447,6 +10080,10 @@ impl AppState {
 
     fn search_folder_from_input(&self, input: &str) -> PathBuf {
         self.folder_from_input(input, Self::default_search_folder_path)
+    }
+
+    fn bookmark_folder_from_input(&self, input: &str) -> PathBuf {
+        self.folder_from_input(input, Self::default_bookmark_folder_path)
     }
 
     fn install_default_search_library_if_default(
@@ -10429,6 +11066,9 @@ fn file_detail_lines(file: &LogFileModel, width: usize) -> Vec<Line<'static>> {
     if !file.description.is_empty() {
         push_detail(&mut lines, "note", &file.description, value_width, plain);
     }
+    if !file.tag.is_empty() {
+        push_detail(&mut lines, "tag", &file.tag, value_width, plain);
+    }
     push_detail(
         &mut lines,
         "path",
@@ -10562,6 +11202,18 @@ fn label_detail_lines(kind: &str, label: &str, width: usize) -> Vec<Line<'static
     lines
 }
 
+fn source_default_short_name(file: &LogFileModel) -> String {
+    if !file.label.trim().is_empty() {
+        return file.label.clone();
+    }
+    file.path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.trim().is_empty())
+        .unwrap_or(&file.display_name)
+        .to_string()
+}
+
 fn push_detail(
     lines: &mut Vec<Line<'static>>,
     label: &str,
@@ -10592,6 +11244,14 @@ fn selected_detail_line(line: Line<'static>) -> Line<'static> {
         text,
         Style::default().bg(Color::LightBlue).fg(Color::Black),
     ))
+}
+
+fn detail_surface_label(surface: DetailSurface) -> &'static str {
+    match surface {
+        DetailSurface::Inline | DetailSurface::Popup => "detail",
+        DetailSurface::PrettyPrint => "pretty",
+        DetailSurface::Help => "help",
+    }
 }
 
 fn line_to_plain(line: &Line<'static>) -> String {
@@ -11007,19 +11667,17 @@ Command palette
 Project/files
   a browse for a file  o browse for a folder      d delete selected item      Ctrl+s save
   d/Delete delete what the cursor is on: a log source, filter, or saved search
-  S define reusable log schema
   In the browser: j/k or arrows move, Enter opens './' or a folder (or adds the file),
                   Right enters, Left/Backspace goes up, '.' shows hidden, Esc cancels
                   a's file picker also lists files; Enter adds one, or 'p' types a path
-  e apply/edit this file's schema (schema name, or full format template)
-  i infer this file's schema with the configured LLM (see AI assistant) and apply it
-  r label this source (short label | description, so the AI can tell what it is)
+  Enter on a log source edits its short name, description, tag, and schema
+  In the source schema row: i infer with LLM, e edit manually, L load library, X save library
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
   In the sidebar: Space on a log adds/removes it, merging the logs by timestamp
                   Space on a filter enables/disables it; d/Delete removes it
                   Space on a saved search runs it, or clears it if running; d removes it
                   Space/Enter on a bookmark jumps to it; d removes it
-                  Enter edits that log's schema, that filter, or that search
+                  Enter edits that source, that filter, or that search
                   Enter on the Time row (or its 'none - t') reopens the time picker
   Enter also jumps to the selected search result
 
@@ -11048,7 +11706,7 @@ Select/copy
 Filter/search
   / inline search   Enter opens matches panel    n/N next/previous match
                     c context 0/3/10
-  f guided filter builder   t time range picker      F clear filters
+  f guided filter builder   t time range picker
   In the builder: ↑↓ pick a row, ←→ change a dropdown or step suggestions, type to edit
                   the field/value, Tab switches to the raw grammar, Enter applies
   Filters split into Text (as many as you like) and Time (at most one, replaced
@@ -11057,9 +11715,9 @@ Filter/search
   H hide like current row
   b timeline histogram: cycle off / by level / by module / by source; drag across its
     bars to build a time-range filter (a click zooms to one bucket)
-  x export filters  L import filters
-  Saved-search library import/export is in the command palette (Ctrl+P or :)
-  X export schemas  I import schemas (merges; existing names are kept)
+  L loads the selected source schema, filter pack, bookmark pack, or saved-search library
+  X saves the selected source schema, filter pack, bookmark pack, or saved-search library
+  Schema pack import/export is still available from the command palette (Ctrl+P or :)
   E export selected lines, bookmarks, filters, and latest AI summary as Markdown
   Time range picker presets count back from the newest entry, not from now
   Moving onto a preset fills Start/End from it; Enter applies what they show
@@ -11072,7 +11730,7 @@ Filter/search
   In the pattern popup: Up/Down pick a template, greediest first, each with the
                         rows it matches; Tab flips hide/keep; the header counts both
   Filters apply to the whole project and are saved automatically
-  x/L default to ~/.log-scouter/filters (any path works)
+  L/X default to the matching ~/.log-scouter library folder (any path works)
   While typing /, the pane jumps to the first live match; Enter submits the search.
   In the matches panel, click a match or focus it and press Enter
 
@@ -11117,7 +11775,7 @@ Input popups
 Long operations
   Loading, filtering and searching show a progress bar; Esc cancels
 
-Press any key to close."
+Press y to copy help text, or any other key to close."
 }
 
 #[cfg(test)]
@@ -12419,6 +13077,65 @@ mod tests {
     }
 
     #[test]
+    fn help_popup_uses_the_available_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        press(&mut app, KeyCode::Char('?'));
+        let screen = render(&mut app, 160, 80);
+
+        assert!(screen.contains("Keys"), "{screen}");
+        assert!(
+            screen.contains(
+                r#"Raw filter syntax (Tab from the builder): [schema="name"] field op [include|exclude] value"#
+            ),
+            "help text wrapped too early:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn mouse_selects_and_copies_help_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        press(&mut app, KeyCode::Char('?'));
+        render(&mut app, 160, 80);
+        let help = app.help_area;
+        assert!(help.height > 3, "help area was not rendered");
+
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            help.x + 2,
+            help.y + 1,
+            KeyModifiers::NONE,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            help.x + 2,
+            help.y + 3,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            app.detail_selection,
+            Some(DetailSelection {
+                surface: DetailSurface::Help,
+                anchor: 1,
+                cursor: 3,
+            })
+        );
+        assert_eq!(app.status, "3 help lines selected");
+
+        press(&mut app, KeyCode::Char('y'));
+        assert!(
+            app.status.starts_with("copied 3 help line(s),"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
     fn mouse_selects_and_copies_inline_detail_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_log(tmp.path());
@@ -12505,6 +13222,51 @@ mod tests {
         );
         assert!(
             app.status.starts_with("copied 3 detail line(s),"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn mouse_selects_and_copies_pretty_print_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_message(
+            tmp.path(),
+            r#"payload={"user":"ada","roles":["admin","ops"]}"#,
+        );
+
+        press(&mut app, KeyCode::Char('P'));
+        render(&mut app, 120, 30);
+        let pretty = app.pretty_print_area;
+        assert!(pretty.height > 3, "pretty area was not rendered");
+
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            pretty.x + 2,
+            pretty.y + 1,
+            KeyModifiers::NONE,
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            pretty.x + 2,
+            pretty.y + 3,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            app.detail_selection,
+            Some(DetailSelection {
+                surface: DetailSurface::PrettyPrint,
+                anchor: 1,
+                cursor: 3,
+            })
+        );
+        assert_eq!(app.status, "3 pretty lines selected");
+
+        press(&mut app, KeyCode::Char('y'));
+        assert!(
+            app.status.starts_with("copied 3 pretty line(s),"),
             "{}",
             app.status
         );
@@ -12959,8 +13721,11 @@ mod tests {
         app.sidebar_items()
             .iter()
             .position(|item| match (item, want) {
+                (SidebarItem::File { .. }, "file") => true,
                 (SidebarItem::TimeFilter { .. }, "time") => true,
                 (SidebarItem::Filter { .. }, "text") => true,
+                (SidebarItem::Search { .. }, "search") => true,
+                (SidebarItem::Bookmark { .. }, "bookmark") => true,
                 (SidebarItem::Hint(label), "no-time") => label.trim() == "none - t",
                 _ => false,
             })
@@ -13593,8 +14358,7 @@ mod tests {
             .unwrap();
 
         let commands = app.palette_commands();
-        assert!(commands.contains(&Command::ChangeSchema));
-        assert!(commands.contains(&Command::LabelSource));
+        assert!(commands.contains(&Command::EditItem));
         assert!(commands.contains(&Command::DeleteSelected));
         // Pane-only actions are not offered on a source.
         assert!(!commands.contains(&Command::ClosePane));
@@ -13703,7 +14467,8 @@ mod tests {
             assert_eq!(pane.view.visible.len(), 1);
         }
 
-        press(&mut app, KeyCode::Char('F')); // clear
+        app.dispatch_command(Command::ClearFilters).unwrap();
+        app.finish_work();
         assert!(app.project.filters.rules.is_empty());
         for pane in &app.panes {
             assert_eq!(pane.view.visible.len(), 2);
@@ -13852,7 +14617,8 @@ mod tests {
         assert_eq!(app.active_view().unwrap().visible.len(), 0);
 
         // Clear that filter, then filter to a subset and search within it.
-        press(&mut app, KeyCode::Char('F'));
+        app.dispatch_command(Command::ClearFilters).unwrap();
+        app.finish_work();
         press(&mut app, KeyCode::Char('f'));
         type_text(&mut app, "message contains include Trigger:");
         press(&mut app, KeyCode::Enter);
@@ -14564,23 +15330,94 @@ mod tests {
         assert!(app.sidebar_anchor.is_none());
     }
 
-    /// Enter on a log source opens its schema for editing; Space is what selects. Showing
-    /// one log alone is Space on the others to deselect them.
+    /// Enter on a log source opens the source settings panel; Space is what selects.
+    /// Showing one log alone is Space on the others to deselect them.
     #[test]
-    fn enter_on_a_log_source_opens_its_schema_editor() {
+    fn enter_on_a_log_source_opens_the_source_editor() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut app, _) = app_with_two_logs(tmp.path());
         app.focus = Focus::Sidebar;
         app.sidebar_selected = 2; // b.log
 
         press(&mut app, KeyCode::Enter);
-        let Mode::Extractor(text) = &app.mode else {
-            panic!("expected the schema editor, got {:?}", app.mode);
+        let Mode::SourceEditor(editor) = &app.mode else {
+            panic!("expected the source editor, got {:?}", app.mode);
         };
-        assert!(
-            text.contains("Bracketed default"),
-            "prefilled with the file's current schema: {text}"
-        );
+        assert_eq!(editor.short_name, "b");
+        assert_eq!(editor.description, "");
+        assert_eq!(editor.tag, "");
+        assert_eq!(editor.schema, "Bracketed default");
+    }
+
+    #[test]
+    fn source_editor_saves_name_description_tag_and_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut app, _) = app_with_two_logs(tmp.path());
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = 1; // a.log
+        let file_id = app.file_id_at(app.sidebar_selected).unwrap();
+
+        press(&mut app, KeyCode::Enter);
+        let Mode::SourceEditor(mut editor) = app.mode.clone() else {
+            panic!("expected the source editor, got {:?}", app.mode);
+        };
+        editor.short_name = "access".to_string();
+        editor.description = "front door requests".to_string();
+        editor.tag = "access_log".to_string();
+        editor.schema = "custom | <timestamp> <level>: <message> | %H:%M:%S | custom".to_string();
+        app.mode = Mode::SourceEditor(editor);
+        press(&mut app, KeyCode::Enter);
+        app.finish_work();
+
+        let file = app.project.get_file(&file_id).unwrap();
+        assert_eq!(file.label, "access");
+        assert_eq!(file.description, "front door requests");
+        assert_eq!(file.tag, "access_log");
+        assert_eq!(file.extractor_name, "custom");
+        let saved = std::fs::read_to_string(tmp.path().join(".logscouter/project.json")).unwrap();
+        assert!(saved.contains("\"tag\": \"access_log\""), "{saved}");
+    }
+
+    #[test]
+    fn library_shortcuts_follow_the_selected_sidebar_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        app.focus = Focus::Sidebar;
+
+        app.sidebar_selected = sidebar_row(&app, "file");
+        press(&mut app, KeyCode::Char('X'));
+        assert!(matches!(app.mode, Mode::SaveSourceSchema { .. }));
+        app.mode = Mode::Normal;
+
+        app.submit_filter("message contains include queued".to_string());
+        app.finish_work();
+        app.sidebar_selected = sidebar_row(&app, "text");
+        press(&mut app, KeyCode::Char('X'));
+        assert!(matches!(app.mode, Mode::ExportFilters(_)));
+        app.mode = Mode::Normal;
+        press(&mut app, KeyCode::Char('L'));
+        assert!(matches!(app.mode, Mode::LoadFilters(_)));
+        app.mode = Mode::Normal;
+
+        app.submit_search("queued 3".to_string());
+        app.finish_work();
+        app.sidebar_selected = sidebar_row(&app, "search");
+        press(&mut app, KeyCode::Char('X'));
+        assert!(matches!(app.mode, Mode::ExportSearches(_)));
+        app.mode = Mode::Normal;
+        press(&mut app, KeyCode::Char('L'));
+        assert!(matches!(app.mode, Mode::ImportSearches(_)));
+        app.mode = Mode::Normal;
+
+        app.focus = Focus::Pane;
+        press(&mut app, KeyCode::Char('m'));
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = sidebar_row(&app, "bookmark");
+        press(&mut app, KeyCode::Char('X'));
+        assert!(matches!(app.mode, Mode::ExportBookmarks(_)));
+        app.mode = Mode::Normal;
+        press(&mut app, KeyCode::Char('L'));
+        assert!(matches!(app.mode, Mode::ImportBookmarks(_)));
     }
 
     #[test]
@@ -14676,14 +15513,6 @@ mod tests {
         assert_eq!(file.entries.len(), 1);
         assert_eq!(file.level(&file.entries[0]), "");
 
-        // `e` prefills the focused file's current schema.
-        press(&mut app, KeyCode::Char('e'));
-        let Mode::Extractor(prefill) = app.mode.clone() else {
-            panic!("expected the schema popup, got {:?}", app.mode);
-        };
-        assert!(prefill.starts_with("Generic line | <message>"), "{prefill}");
-
-        app.mode = Mode::Normal;
         app.submit_extractor("simple | <timestamp> <level>: <message> | %H:%M:%S".to_string());
         app.finish_work();
 
@@ -14714,7 +15543,7 @@ mod tests {
     }
 
     #[test]
-    fn user_defined_schema_can_be_saved_then_assigned_to_a_file() {
+    fn source_schema_field_can_define_and_apply_a_schema() {
         let tmp = tempfile::tempdir().unwrap();
         let simple_log = tmp.path().join("simple.log");
         std::fs::write(&simple_log, "10:00:01 WARN: disk almost full\n").unwrap();
@@ -14724,34 +15553,22 @@ mod tests {
         app.finish_work();
         let file_id = app.active_view().unwrap().file_id.clone();
 
-        press(&mut app, KeyCode::Char('S'));
-        let Mode::LogSchema(prefill) = app.mode.clone() else {
-            panic!("expected schema definition popup, got {:?}", app.mode);
-        };
-        assert!(
-            prefill.starts_with("My schema | <timestamp> <level>: <message>"),
-            "{prefill}"
+        app.apply_schema_text_to_file(
+            &file_id,
+            "simple | <timestamp> <level>: <message> | %H:%M:%S | compact service log",
         );
+        app.finish_work();
 
-        app.mode = Mode::Normal;
-        app.submit_schema_definition(
-            "simple | <timestamp> <level>: <message> | %H:%M:%S | compact service log".to_string(),
+        assert!(
+            app.status
+                .starts_with("schema 'simple' applied to simple.log"),
+            "{}",
+            app.status
         );
-        assert_eq!(app.status, "schema saved: simple");
         assert_eq!(
             app.project.extractors["simple"].description,
             "compact service log"
         );
-
-        // Defining a schema does not implicitly re-parse the focused file: it keeps the
-        // catch-all it was detected with.
-        let file = app.project.get_file(&file_id).unwrap();
-        assert_eq!(file.extractor_name, GENERIC_EXTRACTOR_NAME);
-        assert_eq!(file.level(&file.entries[0]), "");
-
-        // Typing only the schema name in the file schema popup assigns an existing one.
-        app.submit_extractor("simple".to_string());
-        app.finish_work();
 
         let file = app.project.get_file(&file_id).unwrap();
         assert_eq!(file.extractor_name, "simple");
@@ -15280,18 +16097,22 @@ mod tests {
         let mut app = app_with_log(tmp.path());
 
         // Define a second schema so the export is not just the built-in default.
-        press(&mut app, KeyCode::Char('S'));
-        clear_input(&mut app); // `S` prefills a "My schema | ..." template
-        type_text(
-            &mut app,
-            "compact | <timestamp> <level>: <message> | %H:%M:%S | small",
-        );
-        press(&mut app, KeyCode::Enter);
+        app.project
+            .add_extractor(
+                Extractor::with_timestamp_format(
+                    "compact",
+                    "<timestamp> <level>: <message>",
+                    "%H:%M:%S",
+                )
+                .unwrap()
+                .with_description("small"),
+            )
+            .unwrap();
         // The two built-ins, plus `compact`.
         assert_eq!(app.project.extractors.len(), 3);
 
         let folder = tmp.path().join("pack");
-        press(&mut app, KeyCode::Char('X'));
+        app.dispatch_command(Command::ExportSchemas).unwrap();
         assert!(matches!(app.mode, Mode::ExportSchemas(_)));
         clear_input(&mut app);
         type_text(&mut app, folder.to_str().unwrap());
@@ -15306,7 +16127,7 @@ mod tests {
         let mut app2 = app_with_log(other.path());
         assert_eq!(app2.project.extractors.len(), 2);
 
-        press(&mut app2, KeyCode::Char('I'));
+        app2.dispatch_command(Command::ImportSchemas).unwrap();
         assert!(matches!(app2.mode, Mode::ImportSchemas(_)));
         clear_input(&mut app2);
         type_text(&mut app2, folder.to_str().unwrap());
@@ -15335,7 +16156,7 @@ mod tests {
         let mut app = app_with_log(tmp.path());
         let before = app.project.extractors["Bracketed default"].format.clone();
 
-        press(&mut app, KeyCode::Char('I'));
+        app.dispatch_command(Command::ImportSchemas).unwrap();
         clear_input(&mut app);
         type_text(&mut app, folder.to_str().unwrap());
         press(&mut app, KeyCode::Enter);
@@ -15352,7 +16173,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_log(tmp.path());
 
-        press(&mut app, KeyCode::Char('I'));
+        app.dispatch_command(Command::ImportSchemas).unwrap();
         clear_input(&mut app);
         type_text(&mut app, tmp.path().join("nope").to_str().unwrap());
         press(&mut app, KeyCode::Enter);

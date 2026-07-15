@@ -325,10 +325,10 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `Space` (pane) | add/remove the current line from the selection |
 | `y` / right-click | copy selected raw lines (cursor line if nothing selected) |
 | `Esc` | clear the selection, then the search |
-| `f` / `t` / `F` | guided filter builder / open the time range picker / clear filters |
+| `f` / `t` | guided filter builder / open the time range picker |
 | `T` | measure elapsed time from the current line (again to turn off) |
-| `x` / `L` | export filters / import filters from a folder |
-| `X` / `I` | export log schemas / import log schemas from a folder |
+| `Enter` (source) | edit the log source name, description, tag, and schema |
+| `L` / `X` | load / save the selected schema, filters, bookmarks, or saved search library |
 | `H` | hide logs like the selection, using fields from the log format |
 | `Space` (hide menu) | pick a field; `Enter` ANDs the picks into one regex |
 | `H` (hide menu) | derive a pattern from the single current line |

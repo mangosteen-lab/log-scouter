@@ -34,6 +34,7 @@ pub struct LogFileModel {
     /// (and the sidebar) can tell what it is. Both empty by default; persisted per project.
     pub label: String,
     pub description: String,
+    pub tag: String,
     pub extractor: Option<Extractor>,
     pub entries: Vec<LogEntry>,
     pub loaded: bool,
@@ -74,6 +75,7 @@ impl LogFileModel {
             display_name,
             label: String::new(),
             description: String::new(),
+            tag: String::new(),
             extractor,
             entries: Vec::new(),
             loaded: false,
