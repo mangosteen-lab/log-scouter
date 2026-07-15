@@ -22,6 +22,7 @@ pub struct Project {
     pub extractors: HashMap<String, Extractor>,
     pub saved_searches: Vec<String>,
     pub filters: FilterSet,
+    pub bookmarks: Vec<Bookmark>,
     /// What was on screen when the folder was last closed. Filters live in `filters`
     /// because they are project-wide; this is the per-pane part.
     pub session: Option<Session>,
@@ -79,6 +80,18 @@ pub struct PaneSession {
     pub context: usize,
 }
 
+/// A user-marked log entry with optional incident notes. It is stored by source file and
+/// physical line number so it survives search/filter changes and also works from merged panes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bookmark {
+    #[serde(default)]
+    pub file_id: String,
+    #[serde(default)]
+    pub line_no: usize,
+    #[serde(default)]
+    pub note: String,
+}
+
 impl Session {
     pub fn is_empty(&self) -> bool {
         self.panes.is_empty()
@@ -99,6 +112,8 @@ struct ProjectData {
     saved_searches: Vec<String>,
     #[serde(default)]
     filters: FilterSet,
+    #[serde(default)]
+    bookmarks: Vec<Bookmark>,
     #[serde(default)]
     session: Option<Session>,
     #[serde(default = "default_settings")]
@@ -129,6 +144,7 @@ impl Project {
             extractors: HashMap::new(),
             saved_searches: Vec::new(),
             filters: FilterSet::default(),
+            bookmarks: Vec::new(),
             session: None,
             settings: default_settings(),
             file_counter: 0,
@@ -255,6 +271,8 @@ impl Project {
 
     pub fn remove_file(&mut self, file_id: &str) {
         self.files.retain(|file| file.file_id != file_id);
+        self.bookmarks
+            .retain(|bookmark| bookmark.file_id != file_id);
         // A merged view over a removed file no longer reflects the project.
         self.files
             .retain(|file| !file.merged_from.iter().any(|id| id == file_id));
@@ -440,6 +458,7 @@ impl Project {
         self.file_counter = data.file_counter;
         self.saved_searches = data.saved_searches;
         self.filters = data.filters;
+        self.bookmarks = data.bookmarks;
         // A project written before the time slot was enforced can hold several ranges;
         // OR'd together they widen the window. Keep only the last.
         self.filters.dedupe_time_range();
@@ -499,6 +518,7 @@ impl Project {
             extractors: self.extractors.values().cloned().collect(),
             saved_searches: self.saved_searches.clone(),
             filters: self.filters.clone(),
+            bookmarks: self.bookmarks.clone(),
             session: self.session.clone(),
             settings: self.settings.clone(),
         }

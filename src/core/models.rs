@@ -18,6 +18,7 @@ pub struct LogEntry {
 /// One contributing file inside a merged model, with the schema it was parsed under.
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
+    pub file_id: String,
     pub display_name: String,
     pub extractor_name: String,
     pub extractor: Option<Extractor>,
@@ -627,6 +628,7 @@ pub fn merge_files(file_id: impl Into<String>, files: &[&LogFileModel]) -> LogFi
     merged.sources = files
         .iter()
         .map(|file| SourceInfo {
+            file_id: file.file_id.clone(),
             display_name: file.display_name.clone(),
             extractor_name: file.extractor_name.clone(),
             extractor: file.extractor.clone(),

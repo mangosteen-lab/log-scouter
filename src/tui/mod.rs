@@ -12,7 +12,7 @@ use crate::core::filters::{
 };
 use crate::core::models::{apply_context, LogEntry, LogFileModel, ViewModel, VisibleIndices};
 use crate::core::parser::{self, EntryBuilder};
-use crate::core::project::{PaneSession, Project, Session, CONFIG_DIR};
+use crate::core::project::{Bookmark, PaneSession, Project, Session, CONFIG_DIR};
 use crate::core::search::{compile_query, parse_datetime, Query};
 use chrono::{Duration as ChronoDuration, NaiveDateTime};
 use crossterm::event::{
@@ -63,6 +63,7 @@ struct PaneState {
 struct Snapshot {
     filters: crate::core::filters::FilterSet,
     saved_searches: Vec<String>,
+    bookmarks: Vec<Bookmark>,
     session: crate::core::project::Session,
 }
 
@@ -501,6 +502,7 @@ enum Mode {
     LoadFilters(String),
     ExportSchemas(String),
     ImportSchemas(String),
+    ExportIncident(String),
     Extractor(String),
     LogSchema(String),
     /// Enter on a sidebar filter: edit that rule in place. `index` addresses
@@ -518,6 +520,13 @@ enum Mode {
     /// so the assistant and the sidebar can tell what the file is.
     SourceLabel {
         file_id: String,
+        text: String,
+    },
+    /// Add or edit a note on a bookmarked line. Empty text is allowed: the bookmark itself
+    /// remains, and `m` removes it.
+    BookmarkNote {
+        file_id: String,
+        line_no: usize,
         text: String,
     },
     /// `H` on a single line: hide by one of that line's fields, or by several at once.
@@ -548,8 +557,13 @@ enum Command {
     TimeRange,
     ImportFilters,
     ExportFilters,
+    ExportIncident,
     AskAi,
     Copy,
+    BookmarkLine,
+    EditBookmarkNote,
+    PreviousBookmark,
+    NextBookmark,
     HideSimilar,
     MarkElapsed,
     ShowDetail,
@@ -588,8 +602,13 @@ impl Command {
             Command::TimeRange => "Set time range",
             Command::ImportFilters => "Import filter pack",
             Command::ExportFilters => "Export filter pack",
+            Command::ExportIncident => "Export incident Markdown",
             Command::AskAi => "Ask AI to help",
             Command::Copy => "Copy selection",
+            Command::BookmarkLine => "Bookmark line",
+            Command::EditBookmarkNote => "Edit bookmark note",
+            Command::PreviousBookmark => "Previous bookmark",
+            Command::NextBookmark => "Next bookmark",
             Command::HideSimilar => "Hide / keep similar lines",
             Command::MarkElapsed => "Mark elapsed time from here",
             Command::ShowDetail => "Show line detail",
@@ -628,8 +647,13 @@ impl Command {
             Command::TimeRange => "t",
             Command::ImportFilters => "L",
             Command::ExportFilters => "x",
+            Command::ExportIncident => "E",
             Command::AskAi => "A",
             Command::Copy => "y",
+            Command::BookmarkLine => "m",
+            Command::EditBookmarkNote => "M",
+            Command::PreviousBookmark => "[m",
+            Command::NextBookmark => "]m",
             Command::HideSimilar => "H",
             Command::MarkElapsed => "T",
             Command::ShowDetail => "Enter",
@@ -721,7 +745,20 @@ enum SidebarItem {
         text: String,
         label: String,
     },
+    Bookmark {
+        index: usize,
+        label: String,
+    },
     Hint(String),
+}
+
+#[derive(Debug, Clone)]
+struct BookmarkNavPending {
+    forward: bool,
+    count: usize,
+    previous_sidebar_width: Option<u16>,
+    previous_show_sidebar: bool,
+    previous_focus_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1323,6 +1360,7 @@ struct AppState {
     status: String,
     count: usize,
     g_pending: bool,
+    bookmark_nav_pending: Option<BookmarkNavPending>,
     results_selected: usize,
     results_scroll: usize,
     results_area: Rect,
@@ -1392,6 +1430,7 @@ impl AppState {
             status: String::new(),
             count: 0,
             g_pending: false,
+            bookmark_nav_pending: None,
             results_selected: 0,
             results_scroll: 0,
             results_area: Rect::default(),
@@ -1543,6 +1582,7 @@ impl AppState {
         Snapshot {
             filters: self.project.filters.clone(),
             saved_searches: self.project.saved_searches.clone(),
+            bookmarks: self.project.bookmarks.clone(),
             session: self.project.session.clone().unwrap_or_default(),
         }
     }
@@ -1577,6 +1617,7 @@ impl AppState {
     fn restore_snapshot(&mut self, snapshot: Snapshot) {
         self.project.filters = snapshot.filters;
         self.project.saved_searches = snapshot.saved_searches;
+        self.project.bookmarks = snapshot.bookmarks;
         self.project.session = Some(snapshot.session);
         self.panes.clear();
         self.pending_merges.clear();
@@ -2524,6 +2565,9 @@ impl AppState {
                     SidebarItem::Search { label, .. } => {
                         (format!("  {label}"), Style::default().fg(Color::Green))
                     }
+                    SidebarItem::Bookmark { label, .. } => {
+                        (format!("  {label}"), Style::default().fg(Color::Magenta))
+                    }
                     SidebarItem::Hint(label) => {
                         (format!("  {label}"), Style::default().fg(Color::DarkGray))
                     }
@@ -2799,6 +2843,11 @@ impl AppState {
                 .get(*index)
                 .map(|rule| time_filter_detail_lines(rule, width)),
             SidebarItem::Search { text, .. } => Some(search_detail_lines(text, width)),
+            SidebarItem::Bookmark { index, .. } => self
+                .project
+                .bookmarks
+                .get(*index)
+                .map(|bookmark| self.bookmark_detail_lines(bookmark, width)),
             SidebarItem::Section(label) | SidebarItem::SubSection(label) => {
                 Some(label_detail_lines("section", label, width))
             }
@@ -2952,7 +3001,16 @@ impl AppState {
             let at_cursor = position == view.cursor;
             let matched = view.match_set.contains(&global_index);
             let picked = view.is_selected(position, global_index);
-            let raw_line = row_line(file, entry, at_cursor, picked, matched, elapsed_from);
+            let bookmarked = self.is_bookmarked_entry(file, entry);
+            let raw_line = row_line(
+                file,
+                entry,
+                at_cursor,
+                picked,
+                matched,
+                bookmarked,
+                elapsed_from,
+            );
             let line = crop(&raw_line, view.scroll_x, inner.width as usize);
             let style = match (picked, at_cursor) {
                 (true, true) => Style::default().bg(Color::LightBlue).fg(Color::Black),
@@ -2990,6 +3048,7 @@ impl AppState {
             position == view.cursor,
             view.is_selected(position, global_index),
             view.match_set.contains(&global_index),
+            self.is_bookmarked_entry(file, entry),
             self.elapsed_from(&view.file_id),
         ))
     }
@@ -3175,6 +3234,13 @@ impl AppState {
                 "Folder of exported schema JSON files to merge into this project",
                 &text,
             ),
+            Mode::ExportIncident(text) => self.draw_input_popup(
+                frame,
+                root,
+                "Export Incident Markdown",
+                "Markdown file for selected lines, bookmarks, filters, and the latest AI summary",
+                &text,
+            ),
             Mode::Extractor(text) => self.draw_input_popup(
                 frame,
                 root,
@@ -3208,6 +3274,13 @@ impl AppState {
                 root,
                 "Label Source",
                 "short label | description   (helps the AI understand this source)",
+                &text,
+            ),
+            Mode::BookmarkNote { text, .. } => self.draw_input_popup(
+                frame,
+                root,
+                "Bookmark Note",
+                "Optional label or note for this incident bookmark",
                 &text,
             ),
             Mode::HideChoice(menu) => self.draw_hide_choice_popup(frame, root, &menu),
@@ -3884,11 +3957,13 @@ impl AppState {
             | Mode::LoadFilters(_)
             | Mode::ExportSchemas(_)
             | Mode::ImportSchemas(_)
+            | Mode::ExportIncident(_)
             | Mode::Extractor(_)
             | Mode::LogSchema(_)
             | Mode::EditFilter { .. }
             | Mode::EditSearch { .. }
             | Mode::SourceLabel { .. }
+            | Mode::BookmarkNote { .. }
             | Mode::HidePattern(_) => 1,
             Mode::HideChoice(_) => 2,
             Mode::EntryDetail { .. } => 3,
@@ -4350,6 +4425,15 @@ impl AppState {
         if self.focus == Focus::Chat {
             return self.handle_chat_key(key);
         }
+        if let Some(pending) = self.bookmark_nav_pending.take() {
+            if key.code == KeyCode::Char('m') && !key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.workspace.sidebar_width = pending.previous_sidebar_width;
+                self.workspace.show_sidebar = pending.previous_show_sidebar;
+                self.workspace.focus_mode = pending.previous_focus_mode;
+                self.jump_bookmark(pending.forward, pending.count);
+                return Ok(false);
+            }
+        }
         if key.code == KeyCode::Char('A') && !key.modifiers.contains(KeyModifiers::CONTROL) {
             self.open_ai_chat();
             self.input_cursor = 0;
@@ -4475,6 +4559,8 @@ impl AppState {
             KeyCode::PageUp if shift => self.extend_active_selection(-page),
             KeyCode::Char(' ') => self.toggle_active_selection(),
             KeyCode::Char('y') => self.copy_selection(),
+            KeyCode::Char('m') => self.toggle_bookmark_current(),
+            KeyCode::Char('M') => self.open_bookmark_note(),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_after_clearing_selection(count as isize);
             }
@@ -4562,6 +4648,9 @@ impl AppState {
             KeyCode::Char('x') => {
                 self.open_input(Mode::ExportFilters(self.default_filter_folder_input()))
             }
+            KeyCode::Char('E') => {
+                self.open_input(Mode::ExportIncident(self.default_incident_file_input()))
+            }
             KeyCode::Char('L') => {
                 self.open_input(Mode::LoadFilters(self.default_filter_folder_input()))
             }
@@ -4579,8 +4668,8 @@ impl AppState {
             KeyCode::Char('S') => self.open_new_schema_input(),
             KeyCode::Char('|') | KeyCode::Char('\\') => self.split_active(SplitMode::Horizontal),
             KeyCode::Char('-') => self.split_active(SplitMode::Vertical),
-            KeyCode::Char('[') => self.resize_sidebar(-4),
-            KeyCode::Char(']') => self.resize_sidebar(4),
+            KeyCode::Char('[') => self.resize_sidebar_or_start_bookmark_nav(false, count),
+            KeyCode::Char(']') => self.resize_sidebar_or_start_bookmark_nav(true, count),
             KeyCode::Char('z') => self.toggle_focus_mode(),
             KeyCode::Char('b') => self.cycle_timeline(),
             KeyCode::Char('u') => self.undo(),
@@ -4694,11 +4783,13 @@ impl AppState {
             | Mode::LoadFilters(text)
             | Mode::ExportSchemas(text)
             | Mode::ImportSchemas(text)
+            | Mode::ExportIncident(text)
             | Mode::Extractor(text)
             | Mode::LogSchema(text)
             | Mode::EditFilter { text, .. }
             | Mode::EditSearch { text, .. }
-            | Mode::SourceLabel { text, .. } => text.chars().count(),
+            | Mode::SourceLabel { text, .. }
+            | Mode::BookmarkNote { text, .. } => text.chars().count(),
             Mode::HidePattern(prompt) => prompt.text.chars().count(),
             _ => 0,
         };
@@ -4820,11 +4911,13 @@ impl AppState {
             | Mode::LoadFilters(input)
             | Mode::ExportSchemas(input)
             | Mode::ImportSchemas(input)
+            | Mode::ExportIncident(input)
             | Mode::Extractor(input)
             | Mode::LogSchema(input)
             | Mode::EditFilter { text: input, .. }
             | Mode::EditSearch { text: input, .. }
-            | Mode::SourceLabel { text: input, .. } => Some(input),
+            | Mode::SourceLabel { text: input, .. }
+            | Mode::BookmarkNote { text: input, .. } => Some(input),
             Mode::HidePattern(prompt) => Some(&mut prompt.text),
             _ => None,
         }
@@ -4840,11 +4933,17 @@ impl AppState {
             Mode::LoadFilters(folder) => self.submit_load_filters(folder),
             Mode::ExportSchemas(folder) => self.submit_export_schemas(folder),
             Mode::ImportSchemas(folder) => self.submit_import_schemas(folder),
+            Mode::ExportIncident(path) => self.submit_export_incident(path),
             Mode::Extractor(text) => self.submit_extractor(text),
             Mode::LogSchema(text) => self.submit_schema_definition(text),
             Mode::EditFilter { index, text } => self.submit_edit_filter(index, text),
             Mode::EditSearch { index, text } => self.submit_edit_search(index, text),
             Mode::SourceLabel { file_id, text } => self.submit_source_label(file_id, text),
+            Mode::BookmarkNote {
+                file_id,
+                line_no,
+                text,
+            } => self.submit_bookmark_note(file_id, line_no, text),
             Mode::HidePattern(prompt) => {
                 self.submit_hide_pattern(prompt.text, prompt.field, prompt.exclude)
             }
@@ -5181,6 +5280,34 @@ impl AppState {
         } else {
             for rule in &self.project.filters.rules {
                 out.push_str(&format!("  - {}\n", rule.describe()));
+            }
+        }
+
+        out.push_str("\nBookmarks:\n");
+        if self.project.bookmarks.is_empty() {
+            out.push_str("  (none)\n");
+        } else {
+            for bookmark in &self.project.bookmarks {
+                let source = self
+                    .project
+                    .get_file(&bookmark.file_id)
+                    .map(|file| file.display_name.clone())
+                    .unwrap_or_else(|| bookmark.file_id.clone());
+                let note = if bookmark.note.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" note: {}", bookmark.note.trim())
+                };
+                let preview = self
+                    .bookmark_entry(bookmark)
+                    .map(|(file, entry)| {
+                        file.message(entry).lines().next().unwrap_or("").to_string()
+                    })
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  - {source}:{}{} | {}\n",
+                    bookmark.line_no, note, preview
+                ));
             }
         }
 
@@ -5823,18 +5950,21 @@ impl AppState {
             File,
             Filter,
             Search(usize),
+            Bookmark(usize),
             None,
         }
         let target = match self.sidebar_items().get(self.sidebar_selected) {
             Some(SidebarItem::File { .. }) => Target::File,
             Some(SidebarItem::Filter { .. } | SidebarItem::TimeFilter { .. }) => Target::Filter,
             Some(SidebarItem::Search { index, .. }) => Target::Search(*index),
+            Some(SidebarItem::Bookmark { index, .. }) => Target::Bookmark(*index),
             _ => Target::None,
         };
         match target {
             Target::File => self.remove_active_file(),
             Target::Filter => self.remove_selected_filter(),
             Target::Search(index) => self.remove_saved_search(index),
+            Target::Bookmark(index) => self.remove_bookmark(index),
             Target::None => {}
         }
     }
@@ -5986,6 +6116,10 @@ impl AppState {
                 if has_line {
                     commands.extend([
                         Command::Copy,
+                        Command::BookmarkLine,
+                        Command::EditBookmarkNote,
+                        Command::PreviousBookmark,
+                        Command::NextBookmark,
                         Command::HideSimilar,
                         Command::MarkElapsed,
                         Command::ShowDetail,
@@ -6007,6 +6141,7 @@ impl AppState {
             Command::ClearFilters,
             Command::ImportFilters,
             Command::ExportFilters,
+            Command::ExportIncident,
             Command::AskAi,
             Command::Undo,
             Command::Redo,
@@ -6050,8 +6185,15 @@ impl AppState {
             Command::ExportFilters => {
                 self.open_input(Mode::ExportFilters(self.default_filter_folder_input()))
             }
+            Command::ExportIncident => {
+                self.open_input(Mode::ExportIncident(self.default_incident_file_input()))
+            }
             Command::AskAi => self.open_ai_chat(),
             Command::Copy => self.copy_selection(),
+            Command::BookmarkLine => self.toggle_bookmark_current(),
+            Command::EditBookmarkNote => self.open_bookmark_note(),
+            Command::PreviousBookmark => self.jump_bookmark(false, 1),
+            Command::NextBookmark => self.jump_bookmark(true, 1),
             Command::HideSimilar => self.begin_hide(),
             Command::MarkElapsed => self.toggle_elapsed_mark(),
             Command::ShowDetail => self.open_entry_detail_popup(),
@@ -6802,6 +6944,10 @@ impl AppState {
                     let index = *index;
                     self.toggle_saved_search(index);
                 }
+                Some(SidebarItem::Bookmark { index, .. }) => {
+                    let index = *index;
+                    self.jump_bookmark_index(index);
+                }
                 _ => {}
             }
             return;
@@ -7361,6 +7507,389 @@ impl AppState {
         };
     }
 
+    fn bookmark_key_for_entry(
+        &self,
+        file: &LogFileModel,
+        entry: &LogEntry,
+    ) -> Option<(String, usize)> {
+        let file_id = if file.is_merged() {
+            file.sources
+                .get(entry.source as usize)
+                .map(|source| source.file_id.clone())
+                .or_else(|| file.merged_from.get(entry.source as usize).cloned())?
+        } else {
+            file.file_id.clone()
+        };
+        Some((file_id, entry.line_no))
+    }
+
+    fn bookmark_index(&self, file_id: &str, line_no: usize) -> Option<usize> {
+        self.project
+            .bookmarks
+            .iter()
+            .position(|bookmark| bookmark.file_id == file_id && bookmark.line_no == line_no)
+    }
+
+    fn is_bookmarked_entry(&self, file: &LogFileModel, entry: &LogEntry) -> bool {
+        self.bookmark_key_for_entry(file, entry)
+            .and_then(|(file_id, line_no)| self.bookmark_index(&file_id, line_no))
+            .is_some()
+    }
+
+    fn current_bookmark_target(&self) -> Option<(String, usize)> {
+        let (file, view) = self.active_file_view()?;
+        let entry = view.current_entry(file)?;
+        self.bookmark_key_for_entry(file, entry)
+    }
+
+    fn toggle_bookmark_current(&mut self) {
+        let Some((file_id, line_no)) = self.current_bookmark_target() else {
+            self.status = "no line selected".to_string();
+            return;
+        };
+        if let Some(index) = self.bookmark_index(&file_id, line_no) {
+            self.project.bookmarks.remove(index);
+            self.autosave_project();
+            self.status = format!("removed bookmark at line {line_no}");
+            return;
+        }
+
+        self.project.bookmarks.push(Bookmark {
+            file_id,
+            line_no,
+            note: String::new(),
+        });
+        self.autosave_project();
+        self.status = format!("bookmarked line {line_no}; M adds a note");
+    }
+
+    fn open_bookmark_note(&mut self) {
+        let Some((file_id, line_no)) = self.current_bookmark_target() else {
+            self.status = "no line selected".to_string();
+            return;
+        };
+        let text = self
+            .bookmark_index(&file_id, line_no)
+            .and_then(|index| self.project.bookmarks.get(index))
+            .map(|bookmark| bookmark.note.clone())
+            .unwrap_or_default();
+        self.open_input(Mode::BookmarkNote {
+            file_id,
+            line_no,
+            text,
+        });
+    }
+
+    fn submit_bookmark_note(&mut self, file_id: String, line_no: usize, text: String) {
+        let note = text.trim().to_string();
+        match self.bookmark_index(&file_id, line_no) {
+            Some(index) => self.project.bookmarks[index].note = note.clone(),
+            None => self.project.bookmarks.push(Bookmark {
+                file_id,
+                line_no,
+                note: note.clone(),
+            }),
+        }
+        self.autosave_project();
+        self.status = if note.is_empty() {
+            format!("bookmarked line {line_no}")
+        } else {
+            format!("saved bookmark note for line {line_no}")
+        };
+    }
+
+    fn remove_bookmark(&mut self, index: usize) {
+        if index >= self.project.bookmarks.len() {
+            return;
+        }
+        let removed = self.project.bookmarks.remove(index);
+        self.sidebar_selected = self
+            .sidebar_selected
+            .min(self.sidebar_items().len().saturating_sub(1));
+        self.autosave_project();
+        self.status = format!("removed bookmark at line {}", removed.line_no);
+    }
+
+    fn bookmark_positions_in_active_view(&self) -> Vec<(usize, usize)> {
+        let Some((file, view)) = self.active_file_view() else {
+            return Vec::new();
+        };
+        let mut positions = Vec::new();
+        for (position, global_index) in view.visible.iter().enumerate() {
+            let Some(entry) = file.entries.get(global_index) else {
+                continue;
+            };
+            let Some((file_id, line_no)) = self.bookmark_key_for_entry(file, entry) else {
+                continue;
+            };
+            if let Some(index) = self.bookmark_index(&file_id, line_no) {
+                positions.push((position, index));
+            }
+        }
+        positions
+    }
+
+    fn jump_bookmark(&mut self, forward: bool, count: usize) {
+        let positions = self.bookmark_positions_in_active_view();
+        if positions.is_empty() {
+            self.status = "no bookmarks in this view".to_string();
+            return;
+        }
+        let cursor = self.active_view().map(|view| view.cursor).unwrap_or(0);
+        let mut slot = if forward {
+            positions
+                .iter()
+                .position(|(position, _)| *position > cursor)
+                .unwrap_or(0)
+        } else {
+            positions
+                .iter()
+                .rposition(|(position, _)| *position < cursor)
+                .unwrap_or(positions.len() - 1)
+        };
+        for _ in 1..count.max(1) {
+            slot = if forward {
+                (slot + 1) % positions.len()
+            } else if slot == 0 {
+                positions.len() - 1
+            } else {
+                slot - 1
+            };
+        }
+        let (position, bookmark_index) = positions[slot];
+        if let Some(view) = self.active_view_mut() {
+            view.move_cursor_to(position);
+        }
+        self.focus = Focus::Pane;
+        self.status = self
+            .project
+            .bookmarks
+            .get(bookmark_index)
+            .map(|bookmark| format!("bookmark line {}", bookmark.line_no))
+            .unwrap_or_else(|| "bookmark".to_string());
+    }
+
+    fn jump_bookmark_index(&mut self, index: usize) {
+        let Some(bookmark) = self.project.bookmarks.get(index).cloned() else {
+            return;
+        };
+        if !self.active_view_source_ids().contains(&bookmark.file_id) {
+            self.open_file_in_focused(&bookmark.file_id);
+        }
+        if let Some(position) = self.bookmark_position_in_active_view(&bookmark) {
+            if let Some(view) = self.active_view_mut() {
+                view.move_cursor_to(position);
+            }
+            self.focus = Focus::Pane;
+            self.status = format!("bookmark line {}", bookmark.line_no);
+        } else {
+            self.status = "bookmark is hidden by the current filters".to_string();
+        }
+    }
+
+    fn bookmark_position_in_active_view(&self, bookmark: &Bookmark) -> Option<usize> {
+        let (file, view) = self.active_file_view()?;
+        for (position, global_index) in view.visible.iter().enumerate() {
+            let Some(entry) = file.entries.get(global_index) else {
+                continue;
+            };
+            let Some((file_id, line_no)) = self.bookmark_key_for_entry(file, entry) else {
+                continue;
+            };
+            if file_id == bookmark.file_id && line_no == bookmark.line_no {
+                return Some(position);
+            }
+        }
+        None
+    }
+
+    fn bookmark_entry<'a>(
+        &'a self,
+        bookmark: &Bookmark,
+    ) -> Option<(&'a LogFileModel, &'a LogEntry)> {
+        let file = self.project.get_file(&bookmark.file_id)?;
+        let entry = file
+            .entries
+            .iter()
+            .find(|entry| entry.line_no == bookmark.line_no)?;
+        Some((file, entry))
+    }
+
+    fn bookmark_sidebar_label(&self, bookmark: &Bookmark) -> String {
+        let source = self
+            .project
+            .get_file(&bookmark.file_id)
+            .map(|file| file.display_name.clone())
+            .unwrap_or_else(|| bookmark.file_id.clone());
+        let preview = if bookmark.note.trim().is_empty() {
+            self.bookmark_entry(bookmark)
+                .map(|(file, entry)| field_value_preview(&file.message(entry)))
+                .unwrap_or_default()
+        } else {
+            field_value_preview(&bookmark.note)
+        };
+        if preview.is_empty() {
+            format!("{source}:{}", bookmark.line_no)
+        } else {
+            format!("{source}:{}  {preview}", bookmark.line_no)
+        }
+    }
+
+    fn bookmark_detail_lines(&self, bookmark: &Bookmark, width: usize) -> Vec<Line<'static>> {
+        let value_width = width.saturating_sub(DETAIL_LABEL_WIDTH + 1).max(8);
+        let plain = Style::default();
+        let mut lines = Vec::new();
+        let source = self
+            .project
+            .get_file(&bookmark.file_id)
+            .map(|file| file.display_name.clone())
+            .unwrap_or_else(|| bookmark.file_id.clone());
+        push_detail(&mut lines, "source", &source, value_width, plain);
+        push_detail(
+            &mut lines,
+            "line",
+            &bookmark.line_no.to_string(),
+            value_width,
+            plain,
+        );
+        push_detail(&mut lines, "note", &bookmark.note, value_width, plain);
+        if let Some((file, entry)) = self.bookmark_entry(bookmark) {
+            push_detail(
+                &mut lines,
+                "message",
+                &file.message(entry),
+                value_width,
+                plain,
+            );
+            push_detail(&mut lines, "raw", &entry.raw, value_width, plain);
+        } else {
+            push_detail(&mut lines, "status", "line not loaded", value_width, plain);
+        }
+        lines
+    }
+
+    fn submit_export_incident(&mut self, input: String) {
+        let path = self.incident_file_from_input(&input);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                self.status = format!("export failed: {error}");
+                return;
+            }
+        }
+        let body = self.incident_markdown();
+        match std::fs::write(&path, body.as_bytes()) {
+            Ok(()) => self.status = format!("exported incident notes to {}", path.display()),
+            Err(error) => self.status = format!("export failed: {error}"),
+        }
+    }
+
+    fn incident_markdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# Log Scouter Incident Notes\n\n");
+        out.push_str(&format!("- Project: `{}`\n", self.project.root.display()));
+        out.push_str(&format!(
+            "- Generated: {}\n\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        ));
+
+        out.push_str("## Selected Lines\n\n");
+        let selected = self.incident_selected_lines();
+        if selected.is_empty() {
+            out.push_str("No selected line.\n\n");
+        } else {
+            for (source, line_no, raw) in selected {
+                out.push_str(&format!("### {source}:{line_no}\n\n"));
+                out.push_str(&markdown_code_block(&raw));
+                out.push('\n');
+            }
+        }
+
+        out.push_str("## Bookmarks\n\n");
+        if self.project.bookmarks.is_empty() {
+            out.push_str("No bookmarks.\n\n");
+        } else {
+            for bookmark in &self.project.bookmarks {
+                let source = self
+                    .project
+                    .get_file(&bookmark.file_id)
+                    .map(|file| file.display_name.clone())
+                    .unwrap_or_else(|| bookmark.file_id.clone());
+                out.push_str(&format!("### {source}:{}\n\n", bookmark.line_no));
+                if !bookmark.note.trim().is_empty() {
+                    out.push_str(&format!("Note: {}\n\n", bookmark.note.trim()));
+                }
+                match self.bookmark_entry(bookmark) {
+                    Some((_, entry)) => {
+                        out.push_str(&markdown_code_block(&entry.raw));
+                        out.push('\n');
+                    }
+                    None => out.push_str("Line not loaded.\n\n"),
+                }
+            }
+        }
+
+        out.push_str("## Filters\n\n");
+        if self.project.filters.rules.is_empty() {
+            out.push_str("No filters.\n\n");
+        } else {
+            for rule in &self.project.filters.rules {
+                let state = if rule.enabled { "on" } else { "off" };
+                out.push_str(&format!("- [{state}] {}\n", rule.describe()));
+            }
+            out.push('\n');
+        }
+        if let Some(view) = self.active_view() {
+            if !view.query_text.trim().is_empty() {
+                out.push_str(&format!(
+                    "- Active search: `{}` with +/-{} context\n\n",
+                    view.query_text, view.context
+                ));
+            }
+        }
+
+        out.push_str("## AI Summary\n\n");
+        match self.latest_ai_summary() {
+            Some(summary) => {
+                out.push_str(summary.trim());
+                out.push_str("\n");
+            }
+            None => out.push_str("No AI summary yet.\n"),
+        }
+        out
+    }
+
+    fn incident_selected_lines(&self) -> Vec<(String, usize, String)> {
+        let Some((file, _)) = self.active_file_view() else {
+            return Vec::new();
+        };
+        self.target_globals()
+            .iter()
+            .filter_map(|global| file.entries.get(*global))
+            .map(|entry| {
+                (
+                    self.entry_source_label(file, entry),
+                    entry.line_no,
+                    entry.raw.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn entry_source_label(&self, file: &LogFileModel, entry: &LogEntry) -> String {
+        file.source_name(entry)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| file.display_name.clone())
+    }
+
+    fn latest_ai_summary(&self) -> Option<String> {
+        self.ai.as_ref().and_then(|ai| {
+            ai.transcript.iter().rev().find_map(|line| match line {
+                ChatLine::Assistant(text) if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            })
+        })
+    }
+
     /// The first line of the message of every targeted entry.
     fn target_messages(&self) -> Vec<String> {
         let Some(file) = self
@@ -7750,6 +8279,18 @@ impl AppState {
         self.status = format!("sidebar width {}", self.effective_sidebar_width(body_width));
     }
 
+    fn resize_sidebar_or_start_bookmark_nav(&mut self, forward: bool, count: usize) {
+        let pending = BookmarkNavPending {
+            forward,
+            count: count.max(1),
+            previous_sidebar_width: self.workspace.sidebar_width,
+            previous_show_sidebar: self.workspace.show_sidebar,
+            previous_focus_mode: self.workspace.focus_mode,
+        };
+        self.resize_sidebar(if forward { 4 } else { -4 });
+        self.bookmark_nav_pending = Some(pending);
+    }
+
     /// Set the sidebar width from a separator drag to `column`, relative to the body's left.
     fn drag_sidebar_to(&mut self, column: u16) {
         let width = column.saturating_sub(self.body_area.x);
@@ -7959,6 +8500,7 @@ impl AppState {
             SidebarItem::Search { index, text, .. } => {
                 self.open_input(Mode::EditSearch { index, text });
             }
+            SidebarItem::Bookmark { index, .. } => self.jump_bookmark_index(index),
             // `none - t` under Time. Enter on it is the obvious way to make one.
             SidebarItem::Hint(label) if label.trim() == "none - t" => self.open_time_picker(),
             _ => {}
@@ -8173,6 +8715,24 @@ impl AppState {
         }
     }
 
+    fn default_incident_file_input(&self) -> String {
+        format!("{CONFIG_DIR}/incident.md")
+    }
+
+    fn incident_file_from_input(&self, input: &str) -> PathBuf {
+        let trimmed = input.trim();
+        let path = if trimmed.is_empty() {
+            PathBuf::from(self.default_incident_file_input())
+        } else {
+            expand_tilde(trimmed)
+        };
+        if path.is_absolute() {
+            path
+        } else {
+            self.project.root.join(path)
+        }
+    }
+
     fn schema_folder_from_input(&self, input: &str) -> PathBuf {
         self.folder_from_input(input, Self::default_schema_folder_path)
     }
@@ -8311,6 +8871,18 @@ impl AppState {
             }
         }
 
+        items.push(SidebarItem::Section("Bookmarks".to_string()));
+        if self.project.bookmarks.is_empty() {
+            items.push(SidebarItem::Hint("none - m".to_string()));
+        } else {
+            for (index, bookmark) in self.project.bookmarks.iter().enumerate() {
+                items.push(SidebarItem::Bookmark {
+                    index,
+                    label: self.bookmark_sidebar_label(bookmark),
+                });
+            }
+        }
+
         items
     }
 
@@ -8355,6 +8927,14 @@ fn base64_encode(input: &[u8]) -> String {
         });
     }
     out
+}
+
+fn markdown_code_block(text: &str) -> String {
+    let mut fence = "```".to_string();
+    while text.contains(&fence) {
+        fence.push('`');
+    }
+    format!("{fence}text\n{text}\n{fence}\n")
 }
 
 /// Attach the project filters but do not apply them: the caller queues a recompute so
@@ -8592,6 +9172,19 @@ fn describe_change(before: &Snapshot, after: &Snapshot) -> String {
     }
     if before.saved_searches != after.saved_searches {
         return "changed saved searches".to_string();
+    }
+    if before.bookmarks != after.bookmarks {
+        let (b, a) = (&before.bookmarks, &after.bookmarks);
+        if a.len() > b.len() {
+            return match a.iter().find(|bookmark| !b.contains(bookmark)) {
+                Some(bookmark) => format!("bookmarked line {}", bookmark.line_no),
+                None => "added bookmark".to_string(),
+            };
+        }
+        if a.len() < b.len() {
+            return "removed bookmark".to_string();
+        }
+        return "edited bookmark note".to_string();
     }
 
     let queries = |snapshot: &Snapshot| -> Vec<String> {
@@ -9183,11 +9776,18 @@ fn row_line(
     at_cursor: bool,
     picked: bool,
     matched: bool,
+    bookmarked: bool,
     elapsed_from: Option<NaiveDateTime>,
 ) -> String {
     let cursor = if at_cursor { ">" } else { " " };
     let pick_mark = if picked { "+" } else { " " };
-    let match_mark = if matched { "*" } else { " " };
+    let match_mark = if matched {
+        "*"
+    } else if bookmarked {
+        "m"
+    } else {
+        " "
+    };
     let timestamp = pad(&timestamp_column(file, entry, elapsed_from), 23);
     let module = pad(&file.get_field(entry, "module"), 14);
     let level = pad(&file.get_field(entry, "level"), 8);
@@ -9304,6 +9904,7 @@ Project/files
   In the sidebar: Space on a log adds/removes it, merging the logs by timestamp
                   Space on a filter enables/disables it; d/Delete removes it
                   Space on a saved search runs it, or clears it if running; d removes it
+                  Space/Enter on a bookmark jumps to it; d removes it
                   Enter edits that log's schema, that filter, or that search
                   Enter on the Time row (or its 'none - t') reopens the time picker
   Enter also jumps to the selected search result
@@ -9323,6 +9924,9 @@ Select/copy
   Drag across rows  select whole rows; Ctrl+click toggles one row
   Mouse drag        also selects lines in the detail panel
   y                 copy the substring, else the selected raw lines, else the row
+  m                 bookmark/unbookmark the current line
+  M                 add or edit the current line's bookmark note
+  ]m / [m           next / previous bookmark in the current view
   Right-click       copy the substring, the clicked/selected rows, or detail text
   Esc               clear the selection, then the search
 
@@ -9339,6 +9943,7 @@ Filter/search
     bars to build a time-range filter (a click zooms to one bucket)
   x export filters  L import filters
   X export schemas  I import schemas (merges; existing names are kept)
+  E export selected lines, bookmarks, filters, and latest AI summary as Markdown
   Time range picker presets count back from the newest entry, not from now
   Moving onto a preset fills Start/End from it; Enter applies what they show
   Raw filter syntax (Tab from the builder): [schema=\"name\"] field op [include|exclude] value
@@ -11436,6 +12041,97 @@ mod tests {
         assert!(
             matches!(app.mode, Mode::FilterBuilder(_)),
             "Enter ran Add text filter (opens the guided builder)"
+        );
+    }
+
+    #[test]
+    fn bookmarks_toggle_notes_render_in_sidebar_and_navigate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 6);
+
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.project.bookmarks.len(), 1);
+        assert_eq!(app.project.bookmarks[0].line_no, 1);
+
+        press(&mut app, KeyCode::Char('M'));
+        assert!(matches!(app.mode, Mode::BookmarkNote { .. }));
+        type_text(&mut app, "first failure");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.project.bookmarks[0].note, "first failure");
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.project.bookmarks.len(), 2);
+        assert_eq!(app.project.bookmarks[1].line_no, 3);
+
+        let items = app.sidebar_items();
+        assert!(items
+            .iter()
+            .any(|item| matches!(item, SidebarItem::Section(label) if label == "Bookmarks")));
+        assert!(items.iter().any(
+            |item| matches!(item, SidebarItem::Bookmark { label, .. } if label.contains("first failure"))
+        ));
+
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.active_view().unwrap().cursor, 0);
+
+        let sidebar_width = app.workspace.sidebar_width;
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.bookmark_nav_pending.is_some());
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.active_view().unwrap().cursor, 2);
+        assert_eq!(app.workspace.sidebar_width, sidebar_width);
+
+        press(&mut app, KeyCode::Char('['));
+        press(&mut app, KeyCode::Char('m'));
+        assert_eq!(app.active_view().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn incident_markdown_exports_selection_bookmarks_filters_and_ai_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 4);
+
+        press(&mut app, KeyCode::Char('m'));
+        press(&mut app, KeyCode::Char('M'));
+        type_text(&mut app, "suspect queue buildup");
+        press(&mut app, KeyCode::Enter);
+
+        app.mutate_filters(|filters| {
+            filters.add(FilterRule::new("message", "contains", "queued", "include"))
+        });
+        app.finish_work();
+
+        app.open_ai_chat();
+        app.ai
+            .as_mut()
+            .unwrap()
+            .transcript
+            .push(ChatLine::Assistant(
+                "Queue buildup is the likely symptom.".to_string(),
+            ));
+
+        let body = app.incident_markdown();
+        assert!(body.contains("## Selected Lines"), "{body}");
+        assert!(body.contains("Distribution Service Trigger"), "{body}");
+        assert!(body.contains("## Bookmarks"), "{body}");
+        assert!(body.contains("suspect queue buildup"), "{body}");
+        assert!(body.contains("## Filters"), "{body}");
+        assert!(body.contains("queued"), "{body}");
+        assert!(
+            body.contains("Queue buildup is the likely symptom."),
+            "{body}"
+        );
+
+        app.submit_export_incident("incident.md".to_string());
+        let saved = std::fs::read_to_string(tmp.path().join("incident.md")).unwrap();
+        assert!(saved.contains("# Log Scouter Incident Notes"));
+        assert!(
+            app.status.starts_with("exported incident notes"),
+            "{}",
+            app.status
         );
     }
 

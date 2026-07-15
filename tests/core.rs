@@ -10,7 +10,7 @@ use log_scouter::core::filters::{
     FilterRule, FilterSet,
 };
 use log_scouter::core::models::{merge_files, LogFileModel, ViewModel, VisibleIndices};
-use log_scouter::core::project::{text_files_in_dir, Project};
+use log_scouter::core::project::{text_files_in_dir, Bookmark, Project};
 use log_scouter::core::search::{compile_query, parse_datetime};
 use std::path::PathBuf;
 
@@ -426,11 +426,9 @@ fn common_pattern_generalises_differing_tokens_in_place() {
 
 #[test]
 fn common_pattern_escapes_regex_metacharacters() {
-    let pattern = common_message_pattern(&[
-        "UserSession::TimeOut() id=1",
-        "UserSession::TimeOut() id=2",
-    ])
-    .unwrap();
+    let pattern =
+        common_message_pattern(&["UserSession::TimeOut() id=1", "UserSession::TimeOut() id=2"])
+            .unwrap();
     let regex = regex::Regex::new(&pattern).unwrap();
     assert!(regex.is_match("UserSession::TimeOut() id=9"));
     // `()` was escaped, not treated as an empty group that matches anything.
@@ -767,6 +765,30 @@ fn project_persists_compatible_json() {
 }
 
 #[test]
+fn project_persists_bookmarks_and_prunes_removed_file_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log_path = tmp.path().join("a.log");
+    std::fs::write(&log_path, SAMPLE).unwrap();
+
+    let mut project = Project::load(tmp.path());
+    let file_id = project.add_file(&log_path, None).file_id.clone();
+    project.bookmarks.push(Bookmark {
+        file_id: file_id.clone(),
+        line_no: 3,
+        note: "first failing request".to_string(),
+    });
+    project.save().unwrap();
+
+    let mut reloaded = Project::load(tmp.path());
+    assert_eq!(reloaded.bookmarks.len(), 1);
+    assert_eq!(reloaded.bookmarks[0].line_no, 3);
+    assert_eq!(reloaded.bookmarks[0].note, "first failing request");
+
+    reloaded.remove_file(&file_id);
+    assert!(reloaded.bookmarks.is_empty());
+}
+
+#[test]
 fn project_autosaves_and_restores_filters() {
     let tmp = tempfile::tempdir().unwrap();
 
@@ -825,8 +847,9 @@ fn filter_rules_can_be_scoped_to_a_log_schema() {
     );
     let simple = simple_model("simple", &["10:00:01 Trace: same word different schema"]);
     let mut filters = FilterSet::default();
-    filters
-        .add(FilterRule::new("level", "equals", "Trace", "exclude").for_log_schema("Bracketed default"));
+    filters.add(
+        FilterRule::new("level", "equals", "Trace", "exclude").for_log_schema("Bracketed default"),
+    );
 
     assert!(!filters.visible(&bracketed, &bracketed.entries[0]));
     assert!(filters.visible(&simple, &simple.entries[0]));
@@ -844,8 +867,9 @@ fn scoped_include_filters_do_not_hide_other_schemas() {
     );
     let simple = simple_model("simple", &["10:00:01 WARN: disk almost full"]);
     let mut filters = FilterSet::default();
-    filters
-        .add(FilterRule::new("level", "equals", "Error", "include").for_log_schema("Bracketed default"));
+    filters.add(
+        FilterRule::new("level", "equals", "Error", "include").for_log_schema("Bracketed default"),
+    );
 
     assert!(!filters.visible(&bracketed, &bracketed.entries[0]));
     assert!(filters.visible(&simple, &simple.entries[0]));
@@ -950,11 +974,7 @@ fn user_schema_dir_sits_beside_the_filter_library() {
     let Some(dir) = user_schema_dir() else {
         return; // $HOME unset in this environment
     };
-    assert!(
-        dir.ends_with(".log-scouter/schemas"),
-        "{}",
-        dir.display()
-    );
+    assert!(dir.ends_with(".log-scouter/schemas"), "{}", dir.display());
 }
 
 #[test]
@@ -1186,7 +1206,11 @@ fn detection_tolerates_multiline_continuations() {
 fn detection_returns_none_when_nothing_explains_the_file() {
     let bracketed = default_extractor();
     let compact = compact_schema();
-    assert!(detect(vec![&bracketed, &compact], &lines("just prose\nmore prose\n")).is_none());
+    assert!(detect(
+        vec![&bracketed, &compact],
+        &lines("just prose\nmore prose\n")
+    )
+    .is_none());
     assert!(detect(vec![&bracketed], &[]).is_none());
 }
 
