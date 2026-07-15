@@ -189,7 +189,13 @@ impl Extractor {
         // Anchored: a format template describes a line from its start. The leading field
         // is unconstrained, so an unanchored search would match at 0 anyway -- but the
         // engine would still try every offset first, which dominates on long lines.
-        let mut pattern = String::from("^");
+        //
+        // `(?s)` so `.` matches newlines: a block schema (`{ ... }` over many physical
+        // lines) has fields -- and, worse, a `message` value -- that straddle line breaks.
+        // Without it the whole-entry regex refuses such a record, extraction returns no
+        // fields, and every column but the raw message renders blank. `field_pattern`
+        // carries the same flag for the same reason.
+        let mut pattern = String::from("(?s)^");
         let mut names = Vec::with_capacity(placeholders.len());
         let mut pos = 0;
         // Byte length of `pattern` just before the last placeholder's group is appended,

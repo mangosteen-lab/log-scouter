@@ -2285,3 +2285,49 @@ fn a_leftover_wider_range_does_not_reopen_the_window() {
     broken.dedupe_time_range();
     assert_eq!(inside(&broken), narrow_count);
 }
+
+/// A block schema whose `message` *value* itself spans several physical lines. Without
+/// `(?s)` on the whole-entry regex the record fails to parse: `level`/`host` come back
+/// blank and the row collapses to a bare `{`. The message must survive with its newlines,
+/// and the other fields must still extract.
+#[test]
+fn multiline_block_schema_extracts_a_message_value_that_spans_lines() {
+    let format = "{\n                'timestamp':'<timestamp>',\n                'level': '<level>',\n                'serviceName': '<service>',\n                'className': '<class>',\n                'methodName': '<method>',\n                'message': '<message>',\n                'host': '<host>'\n            }";
+    let mut extractor =
+        Extractor::with_timestamp_format("python-block", format, "%Y-%m-%d %H:%M:%S,%f").unwrap();
+    extractor.entry_start = r"^\s*\{\s*$".to_string();
+    extractor.entry_end = r"^\s*\}\s*$".to_string();
+    extractor.compile().unwrap();
+
+    let body = "{\n                'timestamp':'2026-07-14 10:01:36,088',\n                'level': 'INFO',\n                'serviceName': 'MSTRBAK-REFRESH',\n                'className': 'IServerV2',\n                'methodName': 'get_iserver_state',\n                'message': 'current iserver state: <state>starting</state>\n<memory_state>normal</memory_state>\n',\n                'host': 'env-oplssbz618oe2fkp-iserver-0'\n            }";
+
+    let mut model = LogFileModel::new(
+        "f1",
+        "r.log",
+        extractor.name.clone(),
+        "",
+        Some(extractor.clone()),
+    );
+    model.load_from_lines(body.lines());
+
+    assert_eq!(model.entries.len(), 1);
+    assert_eq!(model.get_field(&model.entries[0], "level"), "INFO");
+    assert_eq!(model.get_field(&model.entries[0], "service"), "MSTRBAK-REFRESH");
+    assert_eq!(
+        model.get_field(&model.entries[0], "host"),
+        "env-oplssbz618oe2fkp-iserver-0"
+    );
+    assert_eq!(
+        model.get_field(&model.entries[0], "message"),
+        "current iserver state: <state>starting</state>\n<memory_state>normal</memory_state>\n"
+    );
+    assert_eq!(
+        model.timestamp(&model.entries[0]),
+        Some(
+            NaiveDate::from_ymd_opt(2026, 7, 14)
+                .unwrap()
+                .and_hms_milli_opt(10, 1, 36, 88)
+                .unwrap()
+        )
+    );
+}
