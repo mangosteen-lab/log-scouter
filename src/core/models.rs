@@ -166,6 +166,18 @@ impl LogFileModel {
         let first_line = entry.raw.split_once('\n').map(|(head, _)| head);
         let head_line = first_line.unwrap_or(&entry.raw);
 
+        if first_line.is_some() && extractor.format.contains('\n') {
+            let Some(captures) = extractor.captures(&entry.raw) else {
+                return if is_message {
+                    visit(&entry.raw)
+                } else {
+                    visit("")
+                };
+            };
+            let value = captures.name(&concrete).map(|m| m.as_str()).unwrap_or("");
+            return visit(value);
+        }
+
         let Some((captures, tail_start)) = extractor.head_captures(head_line) else {
             return if is_message {
                 visit(&entry.raw)

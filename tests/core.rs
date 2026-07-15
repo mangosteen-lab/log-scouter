@@ -117,6 +117,98 @@ fn multiline_continuation_is_appended() {
 }
 
 #[test]
+fn multiline_block_schema_groups_and_extracts_entries() {
+    let format = "{\n                'timestamp':'<timestamp>',\n                'level': '<level>',\n                'serviceName': '<service>',\n                'className': '<class>',\n                'methodName': '<method>',\n                'message': '<message>',\n                'host': '<host>'\n            }";
+    let mut extractor =
+        Extractor::with_timestamp_format("python-block", format, "%Y-%m-%d %H:%M:%S,%f").unwrap();
+    extractor.entry_start = r"^\s*\{\s*$".to_string();
+    extractor.entry_end = r"^\s*\}\s*$".to_string();
+    extractor.compile().unwrap();
+
+    let body = "{\n                'timestamp':'2026-07-14 07:14:40,530',\n                'level': 'INFO',\n                'serviceName': 'MSTRBAK-RESTORE',\n                'className': 'mstrbak-main',\n                'methodName': 'main',\n                'message': 'Starting mstrbak restore container...',\n                'host': 'tec-l-1225084-iserver-0'\n            }\n{\n                'timestamp':'2026-07-14 07:14:40,531',\n                'level': 'INFO',\n                'serviceName': 'MSTRBAK-RESTORE',\n                'className': 'mstrbak-main',\n                'methodName': 'main',\n                'message': 'env info: {'python_version': '3.13.11', 'feature_flag': {'collaboration_service': True}}',\n                'host': 'tec-l-1225084-iserver-0'\n            }";
+
+    let mut model = LogFileModel::new(
+        "f1",
+        "restore.log",
+        extractor.name.clone(),
+        "",
+        Some(extractor.clone()),
+    );
+    model.load_from_lines(body.lines());
+
+    assert_eq!(model.entries.len(), 2);
+    assert_eq!(model.entries[0].line_no, 1);
+    assert_eq!(model.entries[1].line_no, 10);
+    assert_eq!(
+        model.get_field(&model.entries[0], "timestamp"),
+        "2026-07-14 07:14:40,530"
+    );
+    assert_eq!(model.get_field(&model.entries[0], "level"), "INFO");
+    assert_eq!(
+        model.get_field(&model.entries[0], "service"),
+        "MSTRBAK-RESTORE"
+    );
+    assert_eq!(
+        model.get_field(&model.entries[1], "message"),
+        "env info: {'python_version': '3.13.11', 'feature_flag': {'collaboration_service': True}}"
+    );
+    assert_eq!(
+        model.timestamp(&model.entries[1]),
+        Some(
+            NaiveDate::from_ymd_opt(2026, 7, 14)
+                .unwrap()
+                .and_hms_milli_opt(7, 14, 40, 531)
+                .unwrap()
+        )
+    );
+    assert_eq!(extractor.match_score(&lines(body)), 2);
+    assert_eq!(
+        detect(vec![&extractor], &lines(body)).unwrap().name,
+        "python-block"
+    );
+}
+
+#[test]
+fn explicit_entry_start_merges_exception_continuations() {
+    let mut extractor = Extractor::with_timestamp_format(
+        "mixed",
+        "[<level>] <timestamp> - <message>",
+        "%Y-%m-%d %H:%M:%S,%f",
+    )
+    .unwrap();
+    extractor.entry_start = r"^\[[A-Za-z]+\]\s+\d{4}-\d{2}-\d{2}\s+".to_string();
+    extractor.compile().unwrap();
+
+    let mut model = LogFileModel::new(
+        "f1",
+        "mixed.log",
+        extractor.name.clone(),
+        "",
+        Some(extractor),
+    );
+    model.load_from_lines([
+        "[Info] 2026-07-14 07:14:40,530 - Starting mstrbak restore container...",
+        "[Error] 2026-07-14 07:14:40,531 - Failed to start mstrbak restore container due to the following error:",
+        "Traceback (most recent call last):",
+        "  File \"/usr/local/lib/python3.13/site-packages/mstrbak/main.py\",",
+        "    main()",
+        "  File \"/usr/local/lib/python3.13/site-packages/mstrbak/restore.py\",",
+        "    perform_restore()",
+        "[Warn] 2026-07-14 07:14:40,532 - The restore process encountered a warning.",
+    ]);
+
+    assert_eq!(model.entries.len(), 3);
+    assert_eq!(model.level(&model.entries[1]), "Error");
+    let message = model.message(&model.entries[1]);
+    assert!(
+        message.contains("Traceback (most recent call last):"),
+        "{message}"
+    );
+    assert!(message.contains("perform_restore()"), "{message}");
+    assert_eq!(model.level(&model.entries[2]), "Warn");
+}
+
+#[test]
 fn logical_field_aliases_work() {
     let model = sample_model();
     let entry = &model.entries[0];

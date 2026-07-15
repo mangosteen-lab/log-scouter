@@ -7964,7 +7964,7 @@ impl AppState {
 
     fn submit_extractor(&mut self, text: String) {
         let text = text.trim();
-        if !text.contains('|') {
+        if !text.contains('|') && !looks_like_schema_json_input(text) {
             self.apply_existing_schema_to_target(text);
             return;
         }
@@ -7998,7 +7998,7 @@ impl AppState {
             self.status = "schema name cannot be empty".to_string();
             return;
         }
-        if !text.contains('|') {
+        if !text.contains('|') && !looks_like_schema_json_input(text) {
             if !self.project.extractors.contains_key(text) {
                 self.status = format!("unknown log schema: {text}");
                 return;
@@ -8501,18 +8501,14 @@ impl AppState {
             return;
         };
 
-        let sample: Vec<String> = match crate::core::parser::read_first_lines(&path, 25) {
-            Ok(lines) => lines
-                .into_iter()
-                .filter(|line| !line.trim().is_empty())
-                .take(20)
-                .collect(),
+        let sample: Vec<String> = match crate::core::parser::read_first_lines(&path, 80) {
+            Ok(lines) => lines.into_iter().take(80).collect(),
             Err(error) => {
                 self.status = format!("could not read the file: {error}");
                 return;
             }
         };
-        if sample.is_empty() {
+        if sample.iter().all(|line| line.trim().is_empty()) {
             self.status = "the file has no lines to sample".to_string();
             return;
         }
@@ -8588,6 +8584,17 @@ impl AppState {
                     .map(|extractor| (file.display_name, extractor))
             })
             .map(|(_, extractor)| {
+                if extractor.format.contains('\n')
+                    || extractor.uses_explicit_entry_boundary()
+                    || !extractor.field_patterns.is_empty()
+                {
+                    return serde_json::to_string_pretty(&extractor).unwrap_or_else(|_| {
+                        format!(
+                            "{} | {} | {}",
+                            extractor.name, extractor.format, extractor.timestamp_format
+                        )
+                    });
+                }
                 if extractor.description.is_empty() {
                     format!(
                         "{} | {} | {}",
@@ -10363,16 +10370,25 @@ fn schema_infer_prompt() -> String {
      A schema is a `format` string made of `<field>` placeholders separated by the literal \
      text that appears between fields in the log (brackets, colons, spaces). Use `<field?>` \
      for a field only some lines carry; it also consumes the literal separator right before \
-     it. Exactly one field is the timestamp and it MUST be named <timestamp>.\n\n\
+     it. Exactly one field is the timestamp and it MUST be named <timestamp>.\n\
+     The format may contain literal newline characters when one logical log entry spans \
+     multiple physical lines. If records span multiple lines, include `entry_start` as a \
+     regex matching the first physical line of each record. Include `entry_end` when there \
+     is a reliable closing line. For mostly single-line logs with stack traces or exception \
+     chains, keep a one-line format and set `entry_start` to the regex for ordinary log \
+     header lines; non-matching lines will be merged into the previous entry. Use \
+     `field_patterns` only when a field needs a tighter regex than the default.\n\n\
      Reply with ONLY a JSON object -- no prose, no code fence:\n\
      {\"name\": \"<short name>\", \"format\": \"<the format string>\", \
      \"timestamp_format\": \"<chrono strftime for the timestamp, e.g. %Y-%m-%d %H:%M:%S%.3f>\", \
-     \"description\": \"<one line>\"}\n\n\
+     \"entry_start\": \"<optional regex>\", \"entry_end\": \"<optional regex>\", \
+     \"field_patterns\": {\"field\": \"<optional regex>\"}, \"description\": \"<one line>\"}\n\n\
      With each <field> replaced by that line's value, the format must reproduce the sample \
      lines exactly. Prefer specific literals so it does not over-match. Example: for the line\n\
      [2026-06-16 10:09:43.288][Kernel][Info] service started\n\
      use format `[<timestamp>][<module>][<level>] <message>` and timestamp_format \
-     `%Y-%m-%d %H:%M:%S%.3f`."
+     `%Y-%m-%d %H:%M:%S%.3f`. For a block beginning with `{` and ending with `}`, use \
+     entry_start `^\\s*\\{\\s*$` and entry_end `^\\s*\\}\\s*$`."
         .to_string()
 }
 
@@ -10384,11 +10400,48 @@ fn parse_inferred_schema(text: &str) -> Result<Extractor, String> {
     let json = extract_json_object(text).ok_or("no JSON object in the reply")?;
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|error| format!("bad JSON: {error}"))?;
+    extractor_from_schema_json(&value, "AI schema")
+}
+
+fn extractor_from_schema_json(
+    value: &serde_json::Value,
+    fallback_name: &str,
+) -> Result<Extractor, String> {
+    let schema_value = value.get("schema").unwrap_or(value);
+    if schema_value.get("name").is_some() {
+        if let Ok(mut extractor) = serde_json::from_value::<Extractor>(schema_value.clone()) {
+            if extractor.description.trim().is_empty() {
+                extractor.description = value
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+            if extractor.name.trim().is_empty() {
+                extractor.name = value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(fallback_name)
+                    .trim()
+                    .to_string();
+            }
+            extractor.compile()?;
+            return Ok(extractor);
+        }
+    }
+
     let str_field = |key: &str| {
-        value
+        schema_value
             .get(key)
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
+            .or_else(|| {
+                value
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+            })
     };
 
     let format = str_field("format")
@@ -10396,12 +10449,45 @@ fn parse_inferred_schema(text: &str) -> Result<Extractor, String> {
         .ok_or("the reply has no \"format\"")?;
     let name = str_field("name")
         .filter(|value| !value.is_empty())
-        .unwrap_or("AI schema");
+        .unwrap_or(fallback_name);
     let timestamp = str_field("timestamp_format")
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_TIMESTAMP_FORMAT);
     let mut extractor = Extractor::with_timestamp_format(name, format, timestamp)?;
+    extractor.entry_start = [
+        "entry_start",
+        "entry_start_regex",
+        "start_regex",
+        "start_pattern",
+    ]
+    .into_iter()
+    .find_map(|key| str_field(key).filter(|value| !value.is_empty()))
+    .unwrap_or("")
+    .to_string();
+    extractor.entry_end = ["entry_end", "entry_end_regex", "end_regex", "end_pattern"]
+        .into_iter()
+        .find_map(|key| str_field(key).filter(|value| !value.is_empty()))
+        .unwrap_or("")
+        .to_string();
+    if let Some(patterns) = schema_value
+        .get("field_patterns")
+        .and_then(serde_json::Value::as_object)
+    {
+        extractor.field_patterns.clear();
+        for (name, pattern) in patterns {
+            if let Some(pattern) = pattern
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                extractor
+                    .field_patterns
+                    .insert(name.trim().to_string(), pattern.to_string());
+            }
+        }
+    }
     extractor.description = str_field("description").unwrap_or("").to_string();
+    extractor.compile()?;
     Ok(extractor)
 }
 
@@ -10438,13 +10524,23 @@ fn extract_json_object(text: &str) -> Option<String> {
 }
 
 fn parse_log_schema_input(input: &str) -> Result<Extractor, String> {
-    let parts: Vec<&str> = input.splitn(4, '|').map(str::trim).collect();
+    if looks_like_schema_json_input(input) {
+        let json = extract_json_object(input).ok_or("no JSON object in the schema input")?;
+        let value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|error| format!("bad JSON: {error}"))?;
+        return extractor_from_schema_json(&value, "Custom schema");
+    }
+
+    let parts: Vec<&str> = input.splitn(6, '|').map(str::trim).collect();
     if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err("schema needs: name | format | timestamp format | description".to_string());
+        return Err(
+            "schema needs: name | format | timestamp format | description | entry start regex | entry end regex"
+                .to_string(),
+        );
     }
 
     let (timestamp_format, description) = match parts.as_slice() {
-        [_, _, timestamp_format, description] => (
+        [_, _, timestamp_format, description, ..] => (
             if timestamp_format.is_empty() {
                 DEFAULT_TIMESTAMP_FORMAT
             } else {
@@ -10458,7 +10554,19 @@ fn parse_log_schema_input(input: &str) -> Result<Extractor, String> {
     };
     let mut extractor = Extractor::with_timestamp_format(parts[0], parts[1], timestamp_format)?;
     extractor.description = description.to_string();
+    if let Some(entry_start) = parts.get(4).filter(|value| !value.trim().is_empty()) {
+        extractor.entry_start = (*entry_start).to_string();
+    }
+    if let Some(entry_end) = parts.get(5).filter(|value| !value.trim().is_empty()) {
+        extractor.entry_end = (*entry_end).to_string();
+    }
+    extractor.compile()?;
     Ok(extractor)
+}
+
+fn looks_like_schema_json_input(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with("```")
 }
 
 fn format_filter_datetime(value: NaiveDateTime) -> String {
@@ -11807,6 +11915,30 @@ mod tests {
             .unwrap();
         assert_eq!(fields.get("level").map(String::as_str), Some("INFO"));
         assert_eq!(fields.get("message").map(String::as_str), Some("hi"));
+    }
+
+    #[test]
+    fn inferred_schema_accepts_multiline_entry_boundaries() {
+        let reply = r#"{
+            "name": "py-block",
+            "format": "{\n  'timestamp':'<timestamp>',\n  'level': '<level>',\n  'message': '<message>'\n}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S,%f",
+            "entry_start": "^\\s*\\{\\s*$",
+            "entry_end": "^\\s*\\}\\s*$",
+            "field_patterns": {"level": "[A-Z]+"},
+            "description": "python dict blocks"
+        }"#;
+        let extractor = parse_inferred_schema(reply).expect("usable schema");
+        assert!(extractor.is_start("{"));
+        assert!(extractor.is_end("}"));
+        assert_eq!(
+            extractor.field_patterns.get("level").map(String::as_str),
+            Some("[A-Z]+")
+        );
+        let fields = extractor
+            .extract("{\n  'timestamp':'2026-07-14 07:14:40,530',\n  'level': 'INFO',\n  'message': 'hello'\n}")
+            .unwrap();
+        assert_eq!(fields.get("message").map(String::as_str), Some("hello"));
     }
 
     #[test]

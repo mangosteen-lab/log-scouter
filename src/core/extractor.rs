@@ -77,6 +77,14 @@ pub struct Extractor {
     pub timestamp_format: String,
     #[serde(default)]
     pub field_patterns: HashMap<String, String>,
+    /// Optional regex tested against each physical line. When present, a matching line
+    /// starts a new logical log entry even if the full format spans several lines.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub entry_start: String,
+    /// Optional regex tested against each physical line. When present, a matching line
+    /// closes the current logical log entry after that line is appended.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub entry_end: String,
     /// Lines this schema must parse correctly. Empty is allowed, but then nothing stops
     /// the schema from being subtly wrong.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -92,6 +100,8 @@ pub struct Extractor {
     /// Name of that trailing field, whose value is the rest of the line.
     #[serde(skip)]
     tail_field: Option<String>,
+    #[serde(skip)]
+    end_regex: Option<Regex>,
     #[serde(skip)]
     pub field_names: Vec<String>,
 }
@@ -123,11 +133,14 @@ impl Extractor {
             timestamp_field: default_timestamp_field(),
             timestamp_format: default_timestamp_format(),
             field_patterns: HashMap::new(),
+            entry_start: String::new(),
+            entry_end: String::new(),
             samples: Vec::new(),
             regex: None,
             start_regex: None,
             head_regex: None,
             tail_field: None,
+            end_regex: None,
             field_names: Vec::new(),
         };
         extractor.compile()?;
@@ -223,8 +236,20 @@ impl Extractor {
 
         let regex =
             Regex::new(&pattern).map_err(|exc| format!("Invalid extractor pattern: {exc}"))?;
-        let start_regex =
-            build_start_regex(&self.format, &placeholders).unwrap_or_else(|| regex.clone());
+        let start_regex = if self.entry_start.trim().is_empty() {
+            build_start_regex(&self.format, &placeholders).unwrap_or_else(|| regex.clone())
+        } else {
+            Regex::new(self.entry_start.trim())
+                .map_err(|exc| format!("Invalid entry_start pattern: {exc}"))?
+        };
+        let end_regex = if self.entry_end.trim().is_empty() {
+            None
+        } else {
+            Some(
+                Regex::new(self.entry_end.trim())
+                    .map_err(|exc| format!("Invalid entry_end pattern: {exc}"))?,
+            )
+        };
 
         // The trailing field is "everything after the header", so it needs no group.
         let (head_regex, tail_field) = match head_len {
@@ -239,6 +264,7 @@ impl Extractor {
         self.start_regex = Some(start_regex);
         self.head_regex = head_regex;
         self.tail_field = tail_field;
+        self.end_regex = end_regex;
         self.field_names = names;
         Ok(())
     }
@@ -283,11 +309,23 @@ impl Extractor {
 
     /// How many of `lines` this schema parses. `detect` compares schemas on this.
     pub fn match_score(&self, lines: &[String]) -> usize {
-        lines
+        self.match_coverage(lines).0
+    }
+
+    /// `(matching entries, total entries)` after applying this schema's entry-boundary
+    /// rules. Block formats often match zero physical lines but every grouped record.
+    pub fn match_coverage(&self, lines: &[String]) -> (usize, usize) {
+        let entries = crate::core::parser::build_entries(lines, Some(self));
+        let total = entries
             .iter()
-            .filter(|line| !line.trim().is_empty())
-            .filter(|line| self.captures(line).is_some())
-            .count()
+            .filter(|entry| !entry.raw.trim().is_empty())
+            .count();
+        let matched = entries
+            .iter()
+            .filter(|entry| !entry.raw.trim().is_empty())
+            .filter(|entry| self.captures(&entry.raw).is_some())
+            .count();
+        (matched, total)
     }
 
     /// A rough "how much does this format actually assert" measure, used only to break a
@@ -393,6 +431,17 @@ impl Extractor {
         self.start_regex()
             .map(|regex| regex.is_match(line))
             .unwrap_or(true)
+    }
+
+    pub fn is_end(&self, line: &str) -> bool {
+        self.end_regex
+            .as_ref()
+            .map(|regex| regex.is_match(line))
+            .unwrap_or(false)
+    }
+
+    pub fn uses_explicit_entry_boundary(&self) -> bool {
+        !self.entry_start.trim().is_empty() || !self.entry_end.trim().is_empty()
     }
 
     pub fn captures<'a>(&self, line: &'a str) -> Option<Captures<'a>> {
@@ -542,9 +591,9 @@ where
     });
 
     ordered.into_iter().find(|extractor| {
-        let score = extractor.match_score(lines);
-        // A quarter of the lines: enough to rule out an accidental match, loose enough
-        // for a log that is mostly multi-line stack traces.
+        let (score, considered) = extractor.match_coverage(lines);
+        // A quarter of the grouped entries: enough to rule out an accidental match,
+        // loose enough for a log that is mostly multi-line stack traces.
         score > 0 && score * 4 >= considered
     })
 }
@@ -709,8 +758,8 @@ fn build_start_regex(format: &str, placeholders: &[Placeholder]) -> Option<Regex
 }
 
 fn normalize_python_fraction(raw: &str) -> Option<String> {
-    let dot = raw.rfind('.')?;
-    let fraction_start = dot + 1;
+    let separator = raw.rfind(|ch| ch == '.' || ch == ',')?;
+    let fraction_start = separator + 1;
     let fraction_len = raw[fraction_start..]
         .chars()
         .take_while(|ch| ch.is_ascii_digit())

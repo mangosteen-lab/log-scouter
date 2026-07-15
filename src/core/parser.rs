@@ -21,6 +21,14 @@ impl EntryBuilder {
 
     pub fn push_line(&mut self, raw: &str, extractor: Option<&Extractor>) {
         let line = trim_line_end(raw);
+        let explicit_boundary = extractor
+            .map(Extractor::uses_explicit_entry_boundary)
+            .unwrap_or(false);
+        if self.current.is_none() && explicit_boundary && line.trim().is_empty() {
+            self.line_index += 1;
+            return;
+        }
+
         let is_continuation = self.current.is_some()
             && extractor
                 .map(|extractor| !extractor.is_start(line))
@@ -32,15 +40,19 @@ impl EntryBuilder {
                 entry.raw.push_str(line);
             }
         } else {
-            if let Some(entry) = self.current.take() {
-                self.entries.push(entry);
-            }
+            self.flush_current();
             self.current = Some(LogEntry {
                 index: self.entries.len(),
                 line_no: self.line_index + 1,
                 raw: line.to_string(),
                 source: 0,
             });
+        }
+        if extractor
+            .map(|extractor| extractor.is_end(line))
+            .unwrap_or(false)
+        {
+            self.flush_current();
         }
         self.line_index += 1;
     }
@@ -50,10 +62,14 @@ impl EntryBuilder {
     }
 
     pub fn finish(mut self) -> Vec<LogEntry> {
+        self.flush_current();
+        self.entries
+    }
+
+    fn flush_current(&mut self) {
         if let Some(entry) = self.current.take() {
             self.entries.push(entry);
         }
-        self.entries
     }
 }
 

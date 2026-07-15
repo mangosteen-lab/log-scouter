@@ -114,9 +114,9 @@ together they explain what the app is built out of and how the pieces fit and ru
 - **AI skills.** Drop a markdown file in `~/.log-scouter/skills/` and switch it on with
   `/skill <name>` in the chat; its text is appended to the assistant's instructions, so you
   can teach it how your team triages a class of incident. `/skills` lists what you have.
-- **Source labels.** Press `r` on a log source to give it a short label and a note. They
-  show in the sidebar detail and are handed to the assistant, so it knows that `app.log` is,
-  say, "auth service — handles login". Saved with the project.
+- **Source metadata.** Press `Enter` on a log source to edit its short name, description,
+  tag, and schema. The metadata shows in sidebar detail and is handed to the assistant, so
+  it knows that `app.log` is, say, "auth service — handles login". Saved with the project.
 
 ## Quick Start
 
@@ -337,13 +337,10 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `Space` (sidebar log) | add/remove that log from the view, merged by timestamp |
 | `Space` (sidebar filter) | enable/disable that filter (`d` removes it) |
 | `Space` (sidebar search) | run that saved search, or clear it if it is running (`d` removes it) |
-| `Enter` (sidebar log) | edit that log's format |
+| `Enter` (sidebar log) | edit that log source's name, description, tag, and schema |
 | `Enter` (sidebar filter) | edit that filter rule |
 | `Enter` (sidebar search) | edit that saved search |
-| `S` | define a reusable log format |
-| `e` | assign or edit the focused file's log format |
-| `i` | infer the focused file's log format with the configured LLM, and apply it |
-| `r` | label the focused source (`short label \| description`, shown in Detail and given to the AI) |
+| `i` / `e` / `L` / `X` (source schema row) | infer, edit, load, or save that source's schema |
 | `|` / `-` / `w` | split columns / split rows / close pane |
 | `[` / `]` | narrow / widen the sidebar (or drag its separator) |
 | `Ctrl+←/→`, `Ctrl+↑/↓` | resize the focused pane (or drag the border between panes) |
@@ -381,8 +378,7 @@ The list is **context-aware** — it leads with what makes sense for what's focu
 general actions:
 
 - **On a log line:** copy, hide/keep similar, mark elapsed time, show detail, ask AI.
-- **On a source:** open, add to view (merge), change schema, infer schema with AI, label,
-  delete.
+- **On a source:** open, add to view (merge), edit source metadata and schema, delete.
 - **On a filter or search:** enable/disable, edit, delete.
 - **On a pane:** split into columns or rows, close.
 
@@ -863,10 +859,12 @@ removing it, discards the merge.
 
 ## Log Formats
 
-A log format is the parser definition that turns a raw line into named fields.
+A log format is the parser definition that turns a raw log entry into named fields.
 It has a name, expression, optional description, timestamp field, and timestamp
-format. Users define formats in the project; a format is then assigned **per
-file**, so one project can hold logs of different shapes.
+format. It may also carry `entry_start` and `entry_end` regexes that merge several
+physical lines into one logical entry before fields are extracted. Users define formats
+in the project; a format is then assigned **per file**, so one project can hold logs of
+different shapes.
 
 Two formats are built in. `Bracketed default` reads the bracketed server log. `Generic line`
 reads anything: its expression is a bare `<message>`, so every line is its own entry and
@@ -875,35 +873,47 @@ wins a file no other format explains -- which is the point, because under a form
 matches nothing at all, no line starts a record and the whole file folds into one entry.
 A file whose stored format explains none of its opening lines is re-detected on load.
 
-Press `S` to provide a reusable log format:
+Select a source in the sidebar and press `Enter` to edit its short name, description,
+tag, and schema. In the schema row, press `e` to edit the schema manually, `i` to infer it
+with the configured LLM, `L` to load one from the user schema library, or `X` to save the
+current schema to that library.
 
 ```text
-name | expression | [timestamp strptime format] | [description]
+name | expression | [timestamp strptime format] | [description] | [entry start regex] | [entry end regex]
 ```
 
 For example, `simple | <timestamp> <level>: <message> | %H:%M:%S | compact service log` turns
 `10:00:01 WARN: disk almost full` into a `WARN` level, which then drives the level
 colouring, `level=` searches, and `level` filters.
 
-Press `e` with a file focused to choose the log format that file uses. Type an
-existing format name, such as `simple`, to assign it. You can also paste the full
-format definition into `e`; that saves the format and applies it to the focused
-file in one step. Applying a format re-reads the file, because multi-line grouping
-depends on it. Format definitions and per-file assignments are saved in
-`project.json`.
+For multiline formats, JSON is usually clearer because the `format` can contain literal
+newlines and optional boundary regexes:
 
-`Enter` on a log in the sidebar opens the same editor as `e`.
+```json
+{
+  "name": "python-block",
+  "format": "{\n  'timestamp':'<timestamp>',\n  'level': '<level>',\n  'message': '<message>'\n}",
+  "timestamp_format": "%Y-%m-%d %H:%M:%S,%f",
+  "entry_start": "^\\s*\\{\\s*$",
+  "entry_end": "^\\s*\\}\\s*$"
+}
+```
+
+Applying a format re-reads the file, because multi-line grouping depends on it. Format
+definitions and per-file assignments are saved in `project.json`.
 
 ### Inferring a Schema with the LLM
 
 When the built-in detection can't structure a log — it falls back to `Generic line`, one
-entry per line with nothing extracted — press `i` on that source to have the configured LLM
-work out the format for you. It sends the first ~20 lines to the model (see
+entry per line with nothing extracted — open that source with `Enter`, move to the schema
+row, and press `i` to have the configured LLM work out the format for you. It sends the
+first ~80 physical lines to the model (see
 [AI Assistant](#ai-assistant) for setting a provider and key with `logscout config set`),
-which returns a format expression, timestamp field, and timestamp format; log-scouter builds
-that schema and applies it to the file. Applying re-parses the file, so the extracted fields
-appear immediately — if the guess is off, press `e` to tweak it or `i` to try again. Needs an
-LLM configured; otherwise the status line tells you to run `logscout config set`.
+which returns a format expression, timestamp format, and optional entry boundary regexes;
+log-scouter builds that schema and applies it to the file. Applying re-parses the file, so
+the extracted fields and grouped entries appear immediately. If the guess is off, press `e`
+on the schema row to tweak it or `i` to try again. Needs an LLM configured; otherwise the
+status line tells you to run `logscout config set`.
 
 Press `T` on a line to make it the origin. The timestamp column then shows every line's
 signed offset from it, so "how long did this take" is a glance rather than arithmetic:
@@ -926,10 +936,11 @@ When a file is added without an explicit format, its first 200 lines are matched
 every log format in the project and the best fit wins. Formats are tried **most specific
 first**, not best-scoring first: a permissive format such as a bare `<message>` matches
 every line of every file, so scoring alone would hand it every log. A format only has to
-explain a quarter of the lines to win, because the continuation lines of multi-line records
-legitimately do not match. The status bar names the format that was chosen.
+explain a quarter of the grouped entries to win, because continuation lines and block
+records are merged before the score is evaluated. The status bar names the format that was
+chosen.
 
-If nothing matches, the file falls back to the built-in `Bracketed default`.
+If nothing matches, the file falls back to the built-in `Generic line`.
 
 ## Schema Validation
 
@@ -990,8 +1001,8 @@ rather than overwritten. Silently replacing it would change how every file using
 parses. Rename the incoming schema if you mean to replace one. A schema whose `format`
 does not compile is reported at import rather than failing on the first log line.
 
-Importing a schema does not assign it to anything; press `e` (or `Enter` in the sidebar)
-on a file to apply it.
+Importing a schema does not assign it to anything; press `Enter` on a file in the sidebar,
+move to the schema row, then press `L` to apply one from the user library.
 
 ## Performance
 
@@ -1086,7 +1097,7 @@ An absent optional field reads as the empty string, so `error_code=` matches lin
 that have no code. Put optional fields between two required ones; an optional field
 in the very first position has no separator in front of it to absorb.
 
-Press `e` and enter:
+Open a source with `Enter`, move to the schema row, press `e`, and enter:
 
 ```text
 format name
