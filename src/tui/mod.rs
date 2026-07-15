@@ -6,7 +6,7 @@ use crate::core::extractor::{
     BRACKETED_DEFAULT_FORMAT, DEFAULT_TIMESTAMP_FORMAT, USER_SCHEMAS_SUBDIR,
 };
 use crate::core::filters::{
-    common_message_pattern, expand_tilde, export_filters_to_folder, hide_like,
+    common_message_pattern, expand_tilde, export_filters_to_folder, hide_like, home_dir,
     load_filters_from_folder, message_template, pattern_candidates, user_filter_dir, FilterRule,
     FilterSet, PatternOption, USER_DIR, USER_FILTERS_SUBDIR,
 };
@@ -33,7 +33,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
+use std::fs;
 use std::io::{self, BufRead, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -53,6 +55,250 @@ enum Focus {
 enum SplitMode {
     Horizontal,
     Vertical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ThemeName {
+    Classic,
+    Light,
+    Amber,
+    Mono,
+}
+
+impl Default for ThemeName {
+    fn default() -> Self {
+        Self::Classic
+    }
+}
+
+impl ThemeName {
+    const ALL: [Self; 4] = [Self::Classic, Self::Light, Self::Amber, Self::Mono];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Light => "light",
+            Self::Amber => "amber",
+            Self::Mono => "mono",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Classic => "blue chrome with bright semantic colors",
+            Self::Light => "light chrome for bright terminal backgrounds",
+            Self::Amber => "warm high-contrast incident-room palette",
+            Self::Mono => "minimal monochrome with restrained accents",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UiConfig {
+    #[serde(default)]
+    theme: ThemeName,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: ThemeName::Classic,
+        }
+    }
+}
+
+impl UiConfig {
+    fn load() -> Self {
+        ui_config_path()
+            .and_then(|path| Self::load_from(&path).ok())
+            .unwrap_or_default()
+    }
+
+    fn load_from(path: &Path) -> std::io::Result<Self> {
+        let body = fs::read_to_string(path)?;
+        let config = serde_json::from_str(&body).map_err(std::io::Error::other)?;
+        Ok(config)
+    }
+
+    fn save(&self) -> std::io::Result<()> {
+        let path = ui_config_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not find your home directory (set HOME or USERPROFILE)",
+            )
+        })?;
+        self.save_to(&path)
+    }
+
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let body = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        fs::write(path, body)
+    }
+}
+
+fn ui_config_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(USER_DIR).join("ui.json"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Theme {
+    name: ThemeName,
+}
+
+impl Theme {
+    fn new(name: ThemeName) -> Self {
+        Self { name }
+    }
+
+    fn header(self) -> Style {
+        match self.name {
+            ThemeName::Classic => Style::default().bg(Color::Blue).fg(Color::White),
+            ThemeName::Light => Style::default().bg(Color::White).fg(Color::Black),
+            ThemeName::Amber => Style::default().bg(Color::Yellow).fg(Color::Black),
+            ThemeName::Mono => Style::default().bg(Color::DarkGray).fg(Color::White),
+        }
+    }
+
+    fn status(self) -> Style {
+        match self.name {
+            ThemeName::Classic => Style::default().bg(Color::DarkGray).fg(Color::White),
+            ThemeName::Light => Style::default().bg(Color::Gray).fg(Color::Black),
+            ThemeName::Amber => Style::default().bg(Color::Black).fg(Color::Yellow),
+            ThemeName::Mono => Style::default().bg(Color::Black).fg(Color::White),
+        }
+    }
+
+    fn accent(self) -> Color {
+        match self.name {
+            ThemeName::Classic => Color::Cyan,
+            ThemeName::Light => Color::Blue,
+            ThemeName::Amber => Color::Yellow,
+            ThemeName::Mono => Color::White,
+        }
+    }
+
+    fn dim(self) -> Style {
+        match self.name {
+            ThemeName::Classic | ThemeName::Mono => Style::default().fg(Color::DarkGray),
+            ThemeName::Light => Style::default().fg(Color::Gray),
+            ThemeName::Amber => Style::default().fg(Color::Yellow),
+        }
+    }
+
+    fn selected(self) -> Style {
+        match self.name {
+            ThemeName::Classic => Style::default().bg(Color::Gray).fg(Color::Black),
+            ThemeName::Light => Style::default().bg(Color::Blue).fg(Color::White),
+            ThemeName::Amber => Style::default().bg(Color::Yellow).fg(Color::Black),
+            ThemeName::Mono => Style::default().bg(Color::White).fg(Color::Black),
+        }
+    }
+
+    fn selected_strong(self) -> Style {
+        match self.name {
+            ThemeName::Classic => Style::default().bg(Color::LightBlue).fg(Color::Black),
+            ThemeName::Light => Style::default().bg(Color::Blue).fg(Color::White),
+            ThemeName::Amber => Style::default().bg(Color::Yellow).fg(Color::Black),
+            ThemeName::Mono => Style::default().bg(Color::White).fg(Color::Black),
+        }
+    }
+
+    fn section(self) -> Style {
+        Style::default()
+            .fg(self.accent())
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn subsection(self) -> Style {
+        match self.name {
+            ThemeName::Classic => Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            ThemeName::Light => Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            ThemeName::Amber => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            ThemeName::Mono => Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn filter(self) -> Style {
+        match self.name {
+            ThemeName::Classic | ThemeName::Light => Style::default().fg(Color::Yellow),
+            ThemeName::Amber => Style::default().fg(Color::Yellow),
+            ThemeName::Mono => Style::default().fg(Color::White),
+        }
+    }
+
+    fn time_filter(self) -> Style {
+        match self.name {
+            ThemeName::Classic | ThemeName::Light => Style::default().fg(Color::Magenta),
+            ThemeName::Amber => Style::default().fg(Color::Yellow),
+            ThemeName::Mono => Style::default().fg(Color::White),
+        }
+    }
+
+    fn saved_search(self) -> Style {
+        match self.name {
+            ThemeName::Classic | ThemeName::Light => Style::default().fg(Color::Green),
+            ThemeName::Amber => Style::default().fg(Color::Yellow),
+            ThemeName::Mono => Style::default().fg(Color::White),
+        }
+    }
+
+    fn bookmark(self) -> Style {
+        match self.name {
+            ThemeName::Classic | ThemeName::Light => Style::default().fg(Color::Magenta),
+            ThemeName::Amber => Style::default().fg(Color::Yellow),
+            ThemeName::Mono => Style::default().fg(Color::White),
+        }
+    }
+
+    fn matched(self) -> Style {
+        match self.name {
+            ThemeName::Classic | ThemeName::Light => Style::default().fg(Color::Yellow),
+            ThemeName::Amber => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            ThemeName::Mono => Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn search_hit(self) -> Style {
+        match self.name {
+            ThemeName::Classic | ThemeName::Light => Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            ThemeName::Amber => Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            ThemeName::Mono => Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn inline_input(self) -> Style {
+        match self.name {
+            ThemeName::Classic => Style::default().bg(Color::DarkGray).fg(Color::White),
+            ThemeName::Light => Style::default().bg(Color::Gray).fg(Color::Black),
+            ThemeName::Amber => Style::default().bg(Color::Black).fg(Color::Yellow),
+            ThemeName::Mono => Style::default().bg(Color::Black).fg(Color::White),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -494,6 +740,35 @@ impl FilterBuilder {
 }
 
 #[derive(Debug, Clone)]
+struct ThemePicker {
+    selected: usize,
+}
+
+impl ThemePicker {
+    fn new(current: ThemeName) -> Self {
+        let selected = ThemeName::ALL
+            .iter()
+            .position(|theme| *theme == current)
+            .unwrap_or(0);
+        Self { selected }
+    }
+
+    fn pick(&mut self, delta: isize) {
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(ThemeName::ALL.len().saturating_sub(1));
+    }
+
+    fn theme(&self) -> ThemeName {
+        ThemeName::ALL
+            .get(self.selected)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
 enum Mode {
     Normal,
     Search(String),
@@ -555,6 +830,7 @@ enum Mode {
     /// The guided filter builder (`f`): dropdowns for schema/field/op/action/value with a
     /// live match-count preview, an alternative to the raw filter grammar.
     FilterBuilder(FilterBuilder),
+    ThemePicker(ThemePicker),
 }
 
 /// A user action the palette can run. Both the palette and the keyboard funnel through
@@ -601,6 +877,7 @@ enum Command {
     ToggleDetail,
     ToggleResults,
     ToggleChat,
+    ChooseTheme,
     AddFileBrowse,
     OpenFolder,
     Help,
@@ -649,6 +926,7 @@ impl Command {
             Command::ToggleDetail => "Toggle detail panel",
             Command::ToggleResults => "Toggle results panel",
             Command::ToggleChat => "Toggle chat panel",
+            Command::ChooseTheme => "Choose theme",
             Command::AddFileBrowse => "Add a log file",
             Command::OpenFolder => "Open a folder",
             Command::Help => "Help",
@@ -697,6 +975,7 @@ impl Command {
             Command::ToggleDetail => "",
             Command::ToggleResults => "",
             Command::ToggleChat => "",
+            Command::ChooseTheme => "",
             Command::AddFileBrowse => "a",
             Command::OpenFolder => "o",
             Command::Help => "?",
@@ -1435,10 +1714,12 @@ struct AppState {
     /// Set by undo/redo so the surrounding commit does not re-record their effect.
     did_undo_redo: bool,
     action_log: Vec<ActionEntry>,
+    ui_config: UiConfig,
 }
 
 impl AppState {
     fn new(project: Project) -> Self {
+        let ui_config = UiConfig::load();
         let mut app = Self {
             project,
             panes: Vec::new(),
@@ -1480,9 +1761,14 @@ impl AppState {
             undo_pending: None,
             did_undo_redo: false,
             action_log: Vec::new(),
+            ui_config,
         };
         app.restore_session();
         app
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::new(self.ui_config.theme)
     }
 
     // ---- session ---------------------------------------------------------------
@@ -2487,17 +2773,14 @@ impl AppState {
             .split(inner);
         frame.render_widget(
             Gauge::default()
-                .gauge_style(Style::default().fg(Color::Cyan))
+                .gauge_style(Style::default().fg(self.theme().accent()))
                 .ratio(ratio)
                 .label(format!("{percent}%")),
             rows[0],
         );
         if rows[1].height > 0 {
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    "Esc to cancel",
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Paragraph::new(Span::styled("Esc to cancel", self.theme().dim())),
                 rows[1],
             );
         }
@@ -2508,10 +2791,7 @@ impl AppState {
             " Log Scouter  {}  q quit  / search  f filter  t time  H hide  y copy  ? help ",
             self.project.root.display()
         );
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().bg(Color::Blue).fg(Color::White)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(text).style(self.theme().header()), area);
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
@@ -2545,14 +2825,14 @@ impl AppState {
             }
         }
         frame.render_widget(
-            Paragraph::new(format!(" {status}"))
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+            Paragraph::new(format!(" {status}")).style(self.theme().status()),
             area,
         );
     }
 
     fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         let items = self.sidebar_items();
+        let theme = self.theme();
         if self.sidebar_selected >= items.len() {
             self.sidebar_selected = items.len().saturating_sub(1);
         }
@@ -2563,40 +2843,20 @@ impl AppState {
             .map(|(index, item)| {
                 let selected = self.focus == Focus::Sidebar && index == self.sidebar_selected;
                 let (label, style) = match item {
-                    SidebarItem::Section(label) => (
-                        label.clone(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    SidebarItem::SubSection(label) => (
-                        format!("  {label}"),
-                        Style::default()
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    SidebarItem::Section(label) => (label.clone(), theme.section()),
+                    SidebarItem::SubSection(label) => (format!("  {label}"), theme.subsection()),
                     SidebarItem::File { label, .. } => (format!("  {label}"), Style::default()),
-                    SidebarItem::Filter { label, .. } => {
-                        (format!("    {label}"), Style::default().fg(Color::Yellow))
-                    }
+                    SidebarItem::Filter { label, .. } => (format!("    {label}"), theme.filter()),
                     SidebarItem::TimeFilter { label, .. } => {
-                        (format!("    {label}"), Style::default().fg(Color::Magenta))
+                        (format!("    {label}"), theme.time_filter())
                     }
                     SidebarItem::Search { label, .. } => {
-                        (format!("  {label}"), Style::default().fg(Color::Green))
+                        (format!("  {label}"), theme.saved_search())
                     }
-                    SidebarItem::Bookmark { label, .. } => {
-                        (format!("  {label}"), Style::default().fg(Color::Magenta))
-                    }
-                    SidebarItem::Hint(label) => {
-                        (format!("  {label}"), Style::default().fg(Color::DarkGray))
-                    }
+                    SidebarItem::Bookmark { label, .. } => (format!("  {label}"), theme.bookmark()),
+                    SidebarItem::Hint(label) => (format!("  {label}"), theme.dim()),
                 };
-                let style = if selected {
-                    style.bg(Color::Gray).fg(Color::Black)
-                } else {
-                    style
-                };
+                let style = if selected { theme.selected() } else { style };
                 ListItem::new(Line::from(Span::styled(
                     truncate_label(&label, label_width),
                     style,
@@ -2605,7 +2865,7 @@ impl AppState {
             .collect();
 
         let border_style = if self.focus == Focus::Sidebar {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(theme.accent())
         } else {
             Style::default()
         };
@@ -2670,7 +2930,7 @@ impl AppState {
             .title(title)
             .borders(Borders::ALL)
             .border_style(if focused {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(self.theme().accent())
             } else {
                 Style::default()
             });
@@ -2695,10 +2955,10 @@ impl AppState {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    ChatLine::Assistant(_) => ("ai  ", Style::default().fg(Color::Cyan)),
+                    ChatLine::Assistant(_) => ("ai  ", Style::default().fg(self.theme().accent())),
                     ChatLine::Action(_) => ("  » ", Style::default().fg(Color::Green)),
                     ChatLine::Error(_) => ("  ! ", Style::default().fg(Color::Red)),
-                    ChatLine::Info(_) => ("  · ", Style::default().fg(Color::DarkGray)),
+                    ChatLine::Info(_) => ("  · ", self.theme().dim()),
                 };
                 let body = match entry {
                     ChatLine::User(text)
@@ -2767,7 +3027,7 @@ impl AppState {
         let block = Block::default()
             .title("Detail")
             .borders(Borders::ALL)
-            .border_style(Style::default());
+            .border_style(Style::default().fg(self.theme().accent()));
         let inner = block.inner(area);
         self.detail_area = inner;
         frame.render_widget(block, area);
@@ -2925,6 +3185,7 @@ impl AppState {
     }
 
     fn draw_pane(&mut self, frame: &mut Frame, area: Rect, pane_index: usize) {
+        let theme = self.theme();
         let focused = self.focus == Focus::Pane && self.focused_pane == pane_index;
         let Some(file_id) = self
             .panes
@@ -2985,7 +3246,7 @@ impl AppState {
             .borders(Borders::ALL)
             .title(title)
             .border_style(if focused {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme.accent())
             } else {
                 Style::default()
             });
@@ -3048,10 +3309,10 @@ impl AppState {
             let line = crop(&raw_line, view.scroll_x, list_area.width as usize);
             let search_ranges = query_highlight_ranges(view.query.as_ref(), &raw_line);
             let style = match (picked, at_cursor) {
-                (true, true) => Style::default().bg(Color::LightBlue).fg(Color::Black),
-                (true, false) => Style::default().bg(Color::Blue).fg(Color::White),
-                (false, true) => Style::default().bg(Color::DarkGray),
-                (false, false) if matched => Style::default().fg(Color::Yellow),
+                (true, true) => theme.selected_strong(),
+                (true, false) => theme.selected(),
+                (false, true) => theme.selected(),
+                (false, false) if matched => theme.matched(),
                 (false, false) => level_style(&file.get_field(entry, "level")),
             };
 
@@ -3068,7 +3329,7 @@ impl AppState {
                     &search_ranges,
                     view.scroll_x,
                     style,
-                    search_hit_style(),
+                    theme.search_hit(),
                 ),
                 None => Line::from(Span::styled(line, style)),
             }));
@@ -3095,7 +3356,7 @@ impl AppState {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 padded,
-                Style::default().bg(Color::DarkGray).fg(Color::White),
+                self.theme().inline_input(),
             ))),
             area,
         );
@@ -3159,6 +3420,7 @@ impl AppState {
     }
 
     fn draw_search_results(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme();
         let positions = self.active_result_positions();
         let count = positions.len();
         if self.results_selected >= count {
@@ -3184,7 +3446,7 @@ impl AppState {
             .title(title)
             .borders(Borders::ALL)
             .border_style(if self.focus == Focus::Results {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(theme.accent())
             } else {
                 Style::default()
             });
@@ -3238,16 +3500,16 @@ impl AppState {
                 message
             );
             let style = if selected {
-                Style::default().bg(Color::DarkGray)
+                theme.selected()
             } else {
-                Style::default().fg(Color::Yellow)
+                theme.matched()
             };
             let line = crop(&raw_line, 0, inner.width as usize);
             let search_ranges = query_highlight_ranges(view.query.as_ref(), &raw_line);
             rows.push(ListItem::new(if search_ranges.is_empty() {
                 Line::from(Span::styled(line, style))
             } else {
-                highlighted_ranges(&line, &search_ranges, 0, style, search_hit_style())
+                highlighted_ranges(&line, &search_ranges, 0, style, theme.search_hit())
             }));
         }
 
@@ -3382,6 +3644,7 @@ impl AppState {
             }
             Mode::Palette(palette) => self.draw_palette(frame, root, palette),
             Mode::FilterBuilder(builder) => self.draw_filter_builder(frame, root, &builder),
+            Mode::ThemePicker(picker) => self.draw_theme_picker(frame, root, &picker),
             Mode::ActionLog => self.draw_action_log(frame, root),
         }
     }
@@ -3476,6 +3739,7 @@ impl AppState {
     }
 
     fn draw_palette(&self, frame: &mut Frame, root: Rect, palette: Palette) {
+        let theme = self.theme();
         let filtered = palette.filtered();
         let width = 62.min(root.width);
         // query + blank + up to 12 rows, inside the border.
@@ -3490,7 +3754,7 @@ impl AppState {
         let mut lines = vec![
             Line::from(Span::styled(
                 format!("> {}", palette.query),
-                Style::default().fg(Color::Cyan),
+                theme.section(),
             )),
             Line::from(""),
         ];
@@ -3508,7 +3772,7 @@ impl AppState {
                 .max(1);
             let row = format!("{marker}{label}{}{hint}", " ".repeat(gap));
             let style = if selected {
-                Style::default().bg(Color::DarkGray)
+                theme.selected()
             } else {
                 Style::default()
             };
@@ -3517,7 +3781,7 @@ impl AppState {
         if filtered.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (no matching action)",
-                Style::default().fg(Color::DarkGray),
+                theme.dim(),
             )));
         }
 
@@ -3525,6 +3789,47 @@ impl AppState {
         // Caret sits in the query line, right after what has been typed.
         let caret = (2 + palette.query.chars().count()).min(text_width.saturating_sub(1));
         frame.set_cursor_position((inner.x + caret as u16, inner.y));
+    }
+
+    fn draw_theme_picker(&self, frame: &mut Frame, root: Rect, picker: &ThemePicker) {
+        let theme = self.theme();
+        let width = 72.min(root.width);
+        let height = (ThemeName::ALL.len() as u16 + 4).min(root.height.max(7));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title("Theme  Enter save  Esc cancel")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent()));
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+
+        let mut lines = Vec::new();
+        for (index, option) in ThemeName::ALL.iter().copied().enumerate() {
+            let selected = index == picker.selected;
+            let current = option == self.ui_config.theme;
+            let marker = match (selected, current) {
+                (true, true) => ">*",
+                (true, false) => "> ",
+                (false, true) => " *",
+                (false, false) => "  ",
+            };
+            let row = format!("{marker} {:<9} {}", option.label(), option.description());
+            let style = if selected {
+                theme.selected()
+            } else if current {
+                theme.section()
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(crop(&row, 0, text_width), style)));
+        }
+        lines.push(Line::from(Span::styled(
+            "Saved to ~/.log-scouter/ui.json",
+            theme.dim(),
+        )));
+
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     fn draw_action_log(&self, frame: &mut Frame, root: Rect) {
@@ -4095,6 +4400,7 @@ impl AppState {
             Mode::OpenFolder(_) => 6,
             Mode::Palette(_) => 7,
             Mode::FilterBuilder(_) => 8,
+            Mode::ThemePicker(_) => 9,
         };
 
         match mode_kind {
@@ -4110,6 +4416,7 @@ impl AppState {
             6 => self.handle_folder_browser_key(key),
             7 => self.handle_palette_key(key),
             8 => self.handle_filter_builder_key(key),
+            9 => self.handle_theme_picker_key(key),
             _ => Ok(false),
         }
     }
@@ -6397,6 +6704,7 @@ impl AppState {
             Command::ToggleDetail,
             Command::ToggleResults,
             Command::ToggleChat,
+            Command::ChooseTheme,
             Command::AddFileBrowse,
             Command::OpenFolder,
             Command::Help,
@@ -6469,6 +6777,7 @@ impl AppState {
             Command::ToggleDetail => self.toggle_detail(),
             Command::ToggleResults => self.toggle_results_panel(),
             Command::ToggleChat => self.toggle_chat_panel(),
+            Command::ChooseTheme => self.open_theme_picker(),
             Command::AddFileBrowse => self.open_file_browser(),
             Command::OpenFolder => self.open_folder_browser(),
             Command::Help => self.mode = Mode::Help,
@@ -6526,6 +6835,42 @@ impl AppState {
         }
         self.mode = Mode::Palette(palette);
         Ok(false)
+    }
+
+    fn open_theme_picker(&mut self) {
+        self.mode = Mode::ThemePicker(ThemePicker::new(self.ui_config.theme));
+    }
+
+    fn handle_theme_picker_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::ThemePicker(mut picker) = self.mode.clone() else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                let theme = picker.theme();
+                self.mode = Mode::Normal;
+                self.apply_theme(theme);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.pick(-1);
+                self.mode = Mode::ThemePicker(picker);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.pick(1);
+                self.mode = Mode::ThemePicker(picker);
+            }
+            _ => self.mode = Mode::ThemePicker(picker),
+        }
+        Ok(false)
+    }
+
+    fn apply_theme(&mut self, theme: ThemeName) {
+        self.ui_config.theme = theme;
+        match self.ui_config.save() {
+            Ok(()) => self.status = format!("theme: {}", theme.label()),
+            Err(error) => self.status = format!("theme not saved: {error}"),
+        }
     }
 
     // ---- Guided filter builder --------------------------------------------------------
@@ -10519,13 +10864,6 @@ fn visible_ranges(
     merged
 }
 
-fn search_hit_style() -> Style {
-    Style::default()
-        .bg(Color::Yellow)
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD)
-}
-
 fn query_highlight_ranges(query: Option<&Query>, line: &str) -> Vec<(usize, usize)> {
     let Some(query) = query else {
         return Vec::new();
@@ -10745,6 +11083,7 @@ Layout
   Drag a panel's top border to resize its height: results, detail, or chat
   z                 focus mode: show only the active pane (again to restore)
   Toggle the sidebar, detail, results, and chat panels from the palette (Ctrl+P or :)
+  Choose theme from the palette; saved in ~/.log-scouter/ui.json
   Enter on a log row opens a larger detail popup with parsed fields and raw text
   Detail panel (left, bottom) shows the selected line or project item details
   A star marks files open in a pane, enabled filters, and the running search
@@ -10851,6 +11190,7 @@ mod tests {
     fn boot(mut project: Project, log: &std::path::Path) -> AppState {
         project.add_file(log, None);
         let mut app = AppState::new(project);
+        app.ui_config = UiConfig::default();
         app.queue_initial_loads();
         app.finish_work();
         app
@@ -12877,6 +13217,48 @@ mod tests {
             matches!(app.mode, Mode::FilterBuilder(_)),
             "Enter ran Add text filter (opens the guided builder)"
         );
+    }
+
+    #[test]
+    fn ui_config_saves_and_loads_the_selected_theme() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/ui.json");
+        let config = UiConfig {
+            theme: ThemeName::Amber,
+        };
+
+        config.save_to(&path).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains(r#""theme": "amber""#), "{body}");
+        assert_eq!(UiConfig::load_from(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn ui_config_defaults_to_classic_when_theme_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ui.json");
+        std::fs::write(&path, "{}").unwrap();
+
+        assert_eq!(
+            UiConfig::load_from(&path).unwrap().theme,
+            ThemeName::Classic
+        );
+    }
+
+    #[test]
+    fn command_palette_opens_the_theme_picker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        app.ui_config.theme = ThemeName::Amber;
+
+        assert!(app.palette_commands().contains(&Command::ChooseTheme));
+        app.dispatch_command(Command::ChooseTheme).unwrap();
+
+        let Mode::ThemePicker(picker) = app.mode.clone() else {
+            panic!("expected the theme picker, got {:?}", app.mode);
+        };
+        assert_eq!(picker.theme(), ThemeName::Amber);
     }
 
     #[test]
@@ -15210,8 +15592,13 @@ mod tests {
         let ranges = query_highlight_ranges(Some(&query), line);
         assert_eq!(ranges, vec![(0, 5), (12, 17)]);
 
-        let highlighted =
-            highlighted_ranges(line, &ranges, 0, Style::default(), search_hit_style());
+        let highlighted = highlighted_ranges(
+            line,
+            &ranges,
+            0,
+            Style::default(),
+            Theme::new(ThemeName::Classic).search_hit(),
+        );
         let texts: Vec<String> = highlighted
             .spans
             .iter()
