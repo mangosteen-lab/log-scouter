@@ -9,7 +9,9 @@ use log_scouter::core::filters::{
     load_filters_from_folder, message_template, pattern_candidates, user_filter_dir, FilterFile,
     FilterRule, FilterSet,
 };
-use log_scouter::core::models::{merge_files, LogFileModel, ViewModel, VisibleIndices};
+use log_scouter::core::models::{
+    merge_files, LiveSourceConfig, LiveSourceKind, LogFileModel, ViewModel, VisibleIndices,
+};
 use log_scouter::core::project::{text_files_in_dir, Bookmark, Project};
 use log_scouter::core::search::{
     compile_query, default_search_library, export_searches_to_folder,
@@ -1448,6 +1450,117 @@ fn adding_a_folder_loads_direct_text_files_only() {
         .map(|file| file.display_name.as_str())
         .collect();
     assert_eq!(names, ["a.txt", "b.log"]);
+}
+
+#[test]
+fn live_source_config_builds_supported_follow_commands() {
+    let kube = LiveSourceConfig {
+        kind: LiveSourceKind::Kubernetes,
+        namespace: "prod".to_string(),
+        pod: "api-7d9".to_string(),
+        container: "web".to_string(),
+        context: "cluster-a".to_string(),
+        tail: "200".to_string(),
+        since: "10m".to_string(),
+        ..LiveSourceConfig::default()
+    };
+    assert_eq!(
+        kube.command_parts(),
+        (
+            "kubectl".to_string(),
+            vec![
+                "--context",
+                "cluster-a",
+                "logs",
+                "-f",
+                "-n",
+                "prod",
+                "-c",
+                "web",
+                "--tail",
+                "200",
+                "--since",
+                "10m",
+                "api-7d9",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        )
+    );
+
+    let docker = LiveSourceConfig {
+        kind: LiveSourceKind::Docker,
+        docker_container: "worker".to_string(),
+        tail: "50".to_string(),
+        ..LiveSourceConfig::default()
+    };
+    assert_eq!(
+        docker.command_parts(),
+        (
+            "docker".to_string(),
+            vec!["logs", "-f", "--tail", "50", "worker"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        )
+    );
+
+    let journal = LiveSourceConfig {
+        kind: LiveSourceKind::Journalctl,
+        unit: "nginx.service".to_string(),
+        since: "2026-07-15 09:00:00".to_string(),
+        ..LiveSourceConfig::default()
+    };
+    assert_eq!(
+        journal.command_parts(),
+        (
+            "journalctl".to_string(),
+            vec![
+                "-f",
+                "-u",
+                "nginx.service",
+                "--since",
+                "2026-07-15 09:00:00"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        )
+    );
+}
+
+#[test]
+fn project_persists_live_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut project = Project::new(tmp.path());
+    let config = LiveSourceConfig {
+        kind: LiveSourceKind::Docker,
+        docker_container: "api".to_string(),
+        tail: "100".to_string(),
+        ..LiveSourceConfig::default()
+    };
+    let file_id = project
+        .add_live_source(config.clone(), "docker api", None)
+        .file_id
+        .clone();
+    {
+        let file = project.get_file_mut(&file_id).unwrap();
+        file.description = "application container".to_string();
+        file.tag = "app_log".to_string();
+    }
+    project.save().unwrap();
+
+    let reloaded = Project::load(tmp.path());
+    let file = reloaded.get_file(&file_id).unwrap();
+    assert_eq!(file.display_name, "docker api");
+    assert_eq!(file.extractor_name, GENERIC_EXTRACTOR_NAME);
+    assert_eq!(file.description, "application container");
+    assert_eq!(file.tag, "app_log");
+    assert_eq!(file.live.as_ref(), Some(&config));
+    assert!(file
+        .path
+        .ends_with(std::path::Path::new(".logscouter/live/f1.log")));
 }
 
 /// An explicit schema name still wins over detection.

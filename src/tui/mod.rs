@@ -3,7 +3,8 @@ use crate::ai::message::{ChatMsg, ToolResult};
 use crate::ai::{tools as ai_tools, AgentRequest, AiWorker};
 use crate::core::extractor::{
     export_schemas_to_folder, load_schemas_from_folder, user_schema_dir, Extractor,
-    BRACKETED_DEFAULT_FORMAT, DEFAULT_TIMESTAMP_FORMAT, USER_SCHEMAS_SUBDIR,
+    BRACKETED_DEFAULT_FORMAT, DEFAULT_TIMESTAMP_FORMAT, GENERIC_EXTRACTOR_NAME,
+    USER_SCHEMAS_SUBDIR,
 };
 use crate::core::filters::{
     common_message_pattern, expand_tilde, export_filters_to_folder, hide_like, home_dir,
@@ -11,7 +12,10 @@ use crate::core::filters::{
     sanitize_file_component, user_filter_dir, FilterRule, FilterSet, PatternOption, USER_DIR,
     USER_FILTERS_SUBDIR,
 };
-use crate::core::models::{apply_context, LogEntry, LogFileModel, ViewModel, VisibleIndices};
+use crate::core::models::{
+    apply_context, merge_files, LiveSourceConfig, LiveSourceKind, LogEntry, LogFileModel,
+    ViewModel, VisibleIndices,
+};
 use crate::core::parser::{self, EntryBuilder};
 use crate::core::project::{Bookmark, PaneSession, Project, Session, CONFIG_DIR};
 use crate::core::search::{
@@ -35,15 +39,20 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, BufRead, Stdout, Write};
+use std::io::{self, BufRead, Read, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 const CONTEXT_CYCLE: &[usize] = &[0, 3, 10];
 const DETAIL_LABEL_WIDTH: usize = 14;
 const USER_BOOKMARKS_SUBDIR: &str = "bookmarks";
+const SCHEMA_INFER_SAMPLE_LINES: usize = 100;
+const SOURCE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BookmarkFile {
@@ -827,11 +836,238 @@ impl SourceEditor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveSourceField {
+    Kind,
+    ShortName,
+    Description,
+    Tag,
+    Namespace,
+    Pod,
+    Container,
+    Context,
+    DockerContainer,
+    Unit,
+    Since,
+    Tail,
+    Schema,
+}
+
+#[derive(Debug, Clone)]
+struct LiveSourceEditor {
+    file_id: Option<String>,
+    row: usize,
+    kind: LiveSourceKind,
+    short_name: String,
+    description: String,
+    tag: String,
+    namespace: String,
+    pod: String,
+    container: String,
+    context: String,
+    docker_container: String,
+    unit: String,
+    since: String,
+    tail: String,
+    schema: String,
+}
+
+impl LiveSourceEditor {
+    fn new() -> Self {
+        Self {
+            file_id: None,
+            row: 0,
+            kind: LiveSourceKind::Kubernetes,
+            short_name: String::new(),
+            description: String::new(),
+            tag: String::new(),
+            namespace: String::new(),
+            pod: String::new(),
+            container: String::new(),
+            context: String::new(),
+            docker_container: String::new(),
+            unit: String::new(),
+            since: String::new(),
+            tail: String::new(),
+            schema: GENERIC_EXTRACTOR_NAME.to_string(),
+        }
+    }
+
+    fn from_file(file: &LogFileModel) -> Self {
+        let config = file.live.clone().unwrap_or_default();
+        Self {
+            file_id: Some(file.file_id.clone()),
+            row: 0,
+            kind: config.kind,
+            short_name: source_default_short_name(file),
+            description: file.description.clone(),
+            tag: file.tag.clone(),
+            namespace: config.namespace,
+            pod: config.pod,
+            container: config.container,
+            context: config.context,
+            docker_container: config.docker_container,
+            unit: config.unit,
+            since: config.since,
+            tail: config.tail,
+            schema: file.extractor_name.clone(),
+        }
+    }
+
+    fn rows(&self) -> Vec<(LiveSourceField, &'static str, String)> {
+        let mut rows = vec![
+            (LiveSourceField::Kind, "Type", self.kind.label().to_string()),
+            (
+                LiveSourceField::ShortName,
+                "Short name",
+                self.short_name.clone(),
+            ),
+            (
+                LiveSourceField::Description,
+                "Description",
+                self.description.clone(),
+            ),
+            (LiveSourceField::Tag, "Tag", self.tag.clone()),
+        ];
+        match self.kind {
+            LiveSourceKind::Kubernetes => rows.extend([
+                (
+                    LiveSourceField::Namespace,
+                    "Namespace",
+                    self.namespace.clone(),
+                ),
+                (LiveSourceField::Pod, "Pod", self.pod.clone()),
+                (
+                    LiveSourceField::Container,
+                    "Container",
+                    self.container.clone(),
+                ),
+                (LiveSourceField::Context, "Context", self.context.clone()),
+            ]),
+            LiveSourceKind::Docker => rows.push((
+                LiveSourceField::DockerContainer,
+                "Container",
+                self.docker_container.clone(),
+            )),
+            LiveSourceKind::Journalctl => {
+                rows.push((LiveSourceField::Unit, "Unit", self.unit.clone()));
+            }
+        }
+        rows.extend([
+            (LiveSourceField::Since, "Since", self.since.clone()),
+            (LiveSourceField::Tail, "Tail lines", self.tail.clone()),
+            (LiveSourceField::Schema, "Schema", self.schema.clone()),
+        ]);
+        rows
+    }
+
+    fn pick(&mut self, delta: isize) {
+        self.row = self
+            .row
+            .saturating_add_signed(delta)
+            .min(self.rows().len().saturating_sub(1));
+    }
+
+    fn cycle_kind(&mut self, delta: isize) {
+        let kinds = [
+            LiveSourceKind::Kubernetes,
+            LiveSourceKind::Docker,
+            LiveSourceKind::Journalctl,
+        ];
+        let current = kinds
+            .iter()
+            .position(|kind| *kind == self.kind)
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(kinds.len().saturating_sub(1));
+        self.kind = kinds[next];
+        self.row = self.row.min(self.rows().len().saturating_sub(1));
+    }
+
+    fn set_kind(&mut self, kind: LiveSourceKind) {
+        self.kind = kind;
+        self.row = self.row.min(self.rows().len().saturating_sub(1));
+    }
+
+    fn field_for_row(&self) -> LiveSourceField {
+        self.rows()
+            .get(self.row)
+            .map(|(field, _, _)| *field)
+            .unwrap_or(LiveSourceField::Kind)
+    }
+
+    fn focus_field(&mut self, field: LiveSourceField) {
+        if let Some(index) = self
+            .rows()
+            .iter()
+            .position(|(candidate, _, _)| *candidate == field)
+        {
+            self.row = index;
+        }
+    }
+
+    fn field_mut(&mut self) -> Option<&mut String> {
+        match self.field_for_row() {
+            LiveSourceField::Kind => None,
+            LiveSourceField::ShortName => Some(&mut self.short_name),
+            LiveSourceField::Description => Some(&mut self.description),
+            LiveSourceField::Tag => Some(&mut self.tag),
+            LiveSourceField::Namespace => Some(&mut self.namespace),
+            LiveSourceField::Pod => Some(&mut self.pod),
+            LiveSourceField::Container => Some(&mut self.container),
+            LiveSourceField::Context => Some(&mut self.context),
+            LiveSourceField::DockerContainer => Some(&mut self.docker_container),
+            LiveSourceField::Unit => Some(&mut self.unit),
+            LiveSourceField::Since => Some(&mut self.since),
+            LiveSourceField::Tail => Some(&mut self.tail),
+            LiveSourceField::Schema => Some(&mut self.schema),
+        }
+    }
+
+    fn config(&self) -> LiveSourceConfig {
+        LiveSourceConfig {
+            kind: self.kind,
+            namespace: self.namespace.trim().to_string(),
+            pod: self.pod.trim().to_string(),
+            container: self.container.trim().to_string(),
+            context: self.context.trim().to_string(),
+            docker_container: self.docker_container.trim().to_string(),
+            unit: self.unit.trim().to_string(),
+            since: self.since.trim().to_string(),
+            tail: self.tail.trim().to_string(),
+            follow: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SchemaLibraryPicker {
-    file_id: String,
+    target: SchemaPickerTarget,
     options: Vec<Extractor>,
     selected: usize,
+}
+
+#[derive(Debug, Clone)]
+enum SchemaPickerTarget {
+    File(String),
+    LiveEditor(LiveSourceEditor),
+}
+
+#[derive(Debug, Clone)]
+struct LiveQuickPick {
+    editor: LiveSourceEditor,
+    target: LiveSourceField,
+    options: Vec<String>,
+    selected: usize,
+    loading: bool,
+    message: String,
+}
+
+struct LivePickResult {
+    target: LiveSourceField,
+    options: Vec<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -858,7 +1094,13 @@ enum Mode {
         text: String,
     },
     SourceEditor(SourceEditor),
+    LiveSourceEditor(LiveSourceEditor),
     SchemaLibraryPicker(SchemaLibraryPicker),
+    LiveQuickPick(LiveQuickPick),
+    LiveSchemaEditor {
+        editor: LiveSourceEditor,
+        text: String,
+    },
     /// Enter on a sidebar filter: edit that rule in place. `index` addresses
     /// `project.filters.rules`.
     EditFilter {
@@ -945,6 +1187,7 @@ enum Command {
     ToggleChat,
     ChooseTheme,
     AddFileBrowse,
+    AddLiveSource,
     OpenFolder,
     Help,
 }
@@ -993,6 +1236,7 @@ impl Command {
             Command::ToggleChat => "Toggle chat panel",
             Command::ChooseTheme => "Choose theme",
             Command::AddFileBrowse => "Add a log file",
+            Command::AddLiveSource => "Add live log source",
             Command::OpenFolder => "Open a folder",
             Command::Help => "Help",
         }
@@ -1041,6 +1285,7 @@ impl Command {
             Command::ToggleChat => "",
             Command::ChooseTheme => "",
             Command::AddFileBrowse => "a",
+            Command::AddLiveSource => "",
             Command::OpenFolder => "o",
             Command::Help => "?",
         }
@@ -1545,6 +1790,12 @@ struct Progress {
     total: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
 /// What to do once a recompute finishes; the caller cannot act on results immediately
 /// because the scan spans frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1570,10 +1821,62 @@ struct LoadJob {
     error: Option<String>,
 }
 
+enum LiveEvent {
+    Line(String),
+    Closed,
+}
+
+struct LiveRuntime {
+    child: Child,
+    rx: Receiver<LiveEvent>,
+    builder: EntryBuilder,
+    base_entries: usize,
+    open_pipes: usize,
+    exit_status: Option<ExitStatus>,
+}
+
+impl Drop for LiveRuntime {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 struct RecomputeJob {
     pane: usize,
     after: After,
     stage: Stage,
+}
+
+fn spawn_live_pipe_reader<R>(reader: R, tx: Sender<LiveEvent>, prefix: &'static str)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        for line in io::BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let raw = if prefix.is_empty() {
+                        line
+                    } else {
+                        format!("{prefix}{line}")
+                    };
+                    if tx.send(LiveEvent::Line(raw)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(LiveEvent::Line(format!(
+                        "[logscout stream read error] {error}"
+                    )));
+                    break;
+                }
+            }
+        }
+        let _ = tx.send(LiveEvent::Closed);
+    });
 }
 
 enum Stage {
@@ -1611,6 +1914,9 @@ pub fn run(project: Project) -> anyhow::Result<()> {
         }
         // A schema-inference reply may have arrived; open its suggestion for review.
         app.drain_schema_events();
+        app.drain_live_events();
+        app.drain_live_pick_events();
+        app.check_source_modifications();
 
         // Long work runs in slices between frames, so the progress bar animates and
         // Esc still gets through. Everything else waits until the work is done.
@@ -1630,7 +1936,11 @@ pub fn run(project: Project) -> anyhow::Result<()> {
         terminal.draw(|frame| app.draw(frame))?;
         // A chat turn or schema inference in flight arrives asynchronously, so poll briefly
         // instead of blocking a whole 100ms -- the reply then lands promptly.
-        let poll = if app.ai_busy() || app.schema_pending() {
+        let poll = if app.ai_busy()
+            || app.schema_pending()
+            || app.live_active()
+            || app.live_pick_rx.is_some()
+        {
             Duration::from_millis(30)
         } else {
             Duration::from_millis(100)
@@ -1751,6 +2061,11 @@ struct AppState {
     sidebar_anchor: Option<usize>,
     work: VecDeque<Job>,
     progress: Option<Progress>,
+    live_sources: HashMap<String, LiveRuntime>,
+    source_stamps: HashMap<String, SourceStamp>,
+    dirty_sources: HashSet<String>,
+    last_source_check: Instant,
+    live_pick_rx: Option<Receiver<LivePickResult>>,
     /// Char index of the edit caret within the active input popup.
     input_cursor: usize,
     /// Panes of the restored session that want a merge. A merge interleaves entries by
@@ -1818,6 +2133,11 @@ impl AppState {
             sidebar_anchor: None,
             work: VecDeque::new(),
             progress: None,
+            live_sources: HashMap::new(),
+            source_stamps: HashMap::new(),
+            dirty_sources: HashSet::new(),
+            last_source_check: Instant::now(),
+            live_pick_rx: None,
             input_cursor: 0,
             pending_merges: Vec::new(),
             ai: None,
@@ -2089,6 +2409,415 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    fn live_active(&self) -> bool {
+        !self.live_sources.is_empty()
+    }
+
+    fn drain_live_pick_events(&mut self) {
+        let Some(rx) = &self.live_pick_rx else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.live_pick_rx = None;
+        let Mode::LiveQuickPick(mut picker) = self.mode.clone() else {
+            return;
+        };
+        if picker.target != result.target {
+            return;
+        }
+        picker.loading = false;
+        picker.options = result.options;
+        picker.selected = 0;
+        picker.message = result
+            .error
+            .unwrap_or_else(|| format!("select {}", live_quick_pick_label(picker.target)));
+        self.mode = Mode::LiveQuickPick(picker);
+    }
+
+    fn drain_live_events(&mut self) {
+        let ids: Vec<String> = self.live_sources.keys().cloned().collect();
+        let mut dirty = Vec::new();
+        for file_id in ids {
+            let events: Vec<LiveEvent> = self
+                .live_sources
+                .get(&file_id)
+                .map(|runtime| runtime.rx.try_iter().collect())
+                .unwrap_or_default();
+            let mut closed_pipes = 0usize;
+            let mut lines = Vec::new();
+            for event in events {
+                match event {
+                    LiveEvent::Line(line) => lines.push(line),
+                    LiveEvent::Closed => closed_pipes += 1,
+                }
+            }
+            if let Some(runtime) = self.live_sources.get_mut(&file_id) {
+                runtime.open_pipes = runtime.open_pipes.saturating_sub(closed_pipes);
+            }
+            if lines.is_empty() {
+                continue;
+            }
+
+            let Some((path, extractor)) = self
+                .project
+                .get_file(&file_id)
+                .map(|file| (file.path.clone(), file.extractor.clone()))
+            else {
+                self.live_sources.remove(&file_id);
+                continue;
+            };
+
+            let mut append_error = None;
+            if let Some(parent) = path.parent() {
+                if let Err(error) = fs::create_dir_all(parent) {
+                    append_error = Some(error.to_string());
+                }
+            }
+            let mut spool = if append_error.is_none() {
+                match fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    Ok(handle) => Some(handle),
+                    Err(error) => {
+                        append_error = Some(error.to_string());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let Some(runtime) = self.live_sources.get_mut(&file_id) else {
+                continue;
+            };
+            for line in &lines {
+                if let Some(handle) = &mut spool {
+                    if let Err(error) = writeln!(handle, "{line}") {
+                        append_error = Some(error.to_string());
+                        spool = None;
+                    }
+                }
+                runtime.builder.push_line(line, extractor.as_ref());
+            }
+            let base_entries = runtime.base_entries;
+            let snapshot = runtime.builder.snapshot();
+
+            if let Some(file) = self.project.get_file_mut(&file_id) {
+                file.entries.truncate(base_entries);
+                file.entries.extend(snapshot.into_iter().map(|mut entry| {
+                    entry.index += base_entries;
+                    entry
+                }));
+                file.loaded = true;
+                match append_error {
+                    Some(error) => file.error = format!("live spool write error: {error}"),
+                    None if file.error.starts_with("live spool write error:") => {
+                        file.error.clear();
+                    }
+                    None => {}
+                }
+            }
+            self.record_source_stamp(&file_id);
+            dirty.push(file_id);
+        }
+
+        for file_id in dirty {
+            self.refresh_merged_views_for_source(&file_id);
+            for pane in self.panes_using_file(&file_id) {
+                self.queue_recompute(pane, After::Nothing);
+            }
+        }
+        self.collect_finished_live_sources();
+    }
+
+    fn collect_finished_live_sources(&mut self) {
+        let mut finished = Vec::new();
+        for (file_id, runtime) in &mut self.live_sources {
+            if runtime.exit_status.is_none() {
+                if let Ok(Some(status)) = runtime.child.try_wait() {
+                    runtime.exit_status = Some(status);
+                }
+            }
+            if runtime.open_pipes == 0 {
+                if let Some(status) = runtime.exit_status.take() {
+                    finished.push((file_id.clone(), status));
+                }
+            }
+        }
+
+        for (file_id, status) in finished {
+            self.live_sources.remove(&file_id);
+            if let Some(file) = self.project.get_file_mut(&file_id) {
+                if status.success() {
+                    if file.error.starts_with("live command exited") {
+                        file.error.clear();
+                    }
+                    self.status = format!("live source stopped: {}", file.display_name);
+                } else {
+                    file.error = format!("live command exited with {status}");
+                    self.status = format!("live source stopped with {status}");
+                }
+            }
+        }
+    }
+
+    fn start_ready_live_sources(&mut self) {
+        let ids: Vec<String> = self
+            .project
+            .files
+            .iter()
+            .filter(|file| {
+                file.is_live()
+                    && file.loaded
+                    && file.error.is_empty()
+                    && !self.live_sources.contains_key(&file.file_id)
+            })
+            .map(|file| file.file_id.clone())
+            .collect();
+        for file_id in ids {
+            self.start_live_source(&file_id);
+        }
+    }
+
+    fn start_live_source(&mut self, file_id: &str) {
+        if self.live_sources.contains_key(file_id) {
+            return;
+        }
+        let Some((config, display_name, path, entries_len)) =
+            self.project.get_file(file_id).and_then(|file| {
+                file.live.clone().map(|config| {
+                    (
+                        config,
+                        file.display_name.clone(),
+                        file.path.clone(),
+                        file.entries.len(),
+                    )
+                })
+            })
+        else {
+            return;
+        };
+        if let Err(error) = config.validate() {
+            if let Some(file) = self.project.get_file_mut(file_id) {
+                file.error = format!("live source not started: {error}");
+            }
+            return;
+        }
+        if let Some(parent) = path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                if let Some(file) = self.project.get_file_mut(file_id) {
+                    file.error = format!("live spool create failed: {error}");
+                }
+                return;
+            }
+        }
+
+        let (program, args) = config.command_parts();
+        let mut command = ProcessCommand::new(&program);
+        command
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(file) = self.project.get_file_mut(file_id) {
+                    file.error = format!("live command failed: {error}");
+                }
+                self.status = format!("live source failed: {}", config.command_preview());
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let mut open_pipes = 0usize;
+        if let Some(stdout) = child.stdout.take() {
+            open_pipes += 1;
+            spawn_live_pipe_reader(stdout, tx.clone(), "");
+        }
+        if let Some(stderr) = child.stderr.take() {
+            open_pipes += 1;
+            spawn_live_pipe_reader(stderr, tx, "[logscout stderr] ");
+        }
+
+        self.live_sources.insert(
+            file_id.to_string(),
+            LiveRuntime {
+                child,
+                rx,
+                builder: EntryBuilder::new(),
+                base_entries: entries_len,
+                open_pipes,
+                exit_status: None,
+            },
+        );
+        if let Some(file) = self.project.get_file_mut(file_id) {
+            file.loaded = true;
+            file.error.clear();
+        }
+        self.status = format!("live source started: {display_name}");
+    }
+
+    fn panes_using_file(&self, file_id: &str) -> Vec<usize> {
+        self.panes
+            .iter()
+            .enumerate()
+            .filter_map(|(pane, state)| {
+                if state.view.file_id == file_id {
+                    return Some(pane);
+                }
+                self.project
+                    .get_file(&state.view.file_id)
+                    .filter(|file| file.merged_from.iter().any(|id| id == file_id))
+                    .map(|_| pane)
+            })
+            .collect()
+    }
+
+    fn refresh_merged_views_for_source(&mut self, source_id: &str) {
+        let merged: Vec<(usize, String, Vec<String>)> = self
+            .project
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| file.merged_from.iter().any(|id| id == source_id))
+            .map(|(index, file)| (index, file.file_id.clone(), file.merged_from.clone()))
+            .collect();
+
+        for (index, merged_id, source_ids) in merged {
+            let refreshed = {
+                let sources: Vec<&LogFileModel> = source_ids
+                    .iter()
+                    .filter_map(|id| self.project.get_file(id))
+                    .collect();
+                if sources.len() != source_ids.len() {
+                    continue;
+                }
+                merge_files(merged_id, &sources)
+            };
+            if let Some(slot) = self.project.files.get_mut(index) {
+                *slot = refreshed;
+            }
+        }
+    }
+
+    fn source_stamp(path: &Path) -> Option<SourceStamp> {
+        let metadata = fs::metadata(path).ok()?;
+        Some(SourceStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn record_source_stamp(&mut self, file_id: &str) {
+        let Some(path) = self.project.get_file(file_id).map(|file| file.path.clone()) else {
+            self.source_stamps.remove(file_id);
+            return;
+        };
+        match Self::source_stamp(&path) {
+            Some(stamp) => {
+                self.source_stamps.insert(file_id.to_string(), stamp);
+            }
+            None => {
+                self.source_stamps.remove(file_id);
+            }
+        }
+    }
+
+    fn check_source_modifications(&mut self) {
+        if Instant::now().duration_since(self.last_source_check) < SOURCE_POLL_INTERVAL {
+            return;
+        }
+        self.last_source_check = Instant::now();
+
+        let sources: Vec<(String, String, PathBuf, bool)> = self
+            .project
+            .files
+            .iter()
+            .filter(|file| !file.is_merged() && file.loaded)
+            .map(|file| {
+                (
+                    file.file_id.clone(),
+                    file.display_name.clone(),
+                    file.path.clone(),
+                    file.is_live(),
+                )
+            })
+            .collect();
+
+        let mut changed = Vec::new();
+        for (file_id, display_name, path, is_live) in sources {
+            if self.live_sources.contains_key(&file_id) && is_live {
+                // Active live sources update the view through the stream path; their spool
+                // mtime changes are recorded there so they do not produce self-notifications.
+                continue;
+            }
+            let Some(current) = Self::source_stamp(&path) else {
+                continue;
+            };
+            match self.source_stamps.get(&file_id).copied() {
+                Some(previous) if previous != current => {
+                    if self.dirty_sources.insert(file_id) {
+                        changed.push(display_name);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.source_stamps.insert(file_id, current);
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            return;
+        }
+        self.status = match changed.as_slice() {
+            [one] => format!("{one} changed on disk; press r to refresh"),
+            _ => format!(
+                "{} log sources changed on disk; press r to refresh",
+                changed.len()
+            ),
+        };
+    }
+
+    fn refresh_dirty_sources(&mut self) {
+        let ids: Vec<String> = if self.dirty_sources.is_empty() {
+            self.schema_target().into_iter().collect()
+        } else {
+            self.dirty_sources.iter().cloned().collect()
+        };
+        if ids.is_empty() {
+            self.status = "no source to refresh".to_string();
+            return;
+        }
+
+        let mut queued = 0usize;
+        for file_id in ids {
+            let Some(file) = self.project.get_file(&file_id) else {
+                self.dirty_sources.remove(&file_id);
+                continue;
+            };
+            if file.is_merged() {
+                continue;
+            }
+            self.live_sources.remove(&file_id);
+            if let Some(file) = self.project.get_file_mut(&file_id) {
+                file.loaded = false;
+                file.entries.clear();
+                file.error.clear();
+            }
+            self.dirty_sources.remove(&file_id);
+            self.queue_load(&file_id);
+            queued += 1;
+        }
+
+        self.status = match queued {
+            0 => "no changed source to refresh".to_string(),
+            1 => "refreshing log source".to_string(),
+            n => format!("refreshing {n} log sources"),
+        };
+    }
+
     fn cancel_work(&mut self) {
         self.work.clear();
         self.progress = None;
@@ -2188,15 +2917,31 @@ impl AppState {
                 }
             }
         }
+        if self
+            .project
+            .get_file(&file_id)
+            .map(|file| file.error.is_empty())
+            .unwrap_or(false)
+        {
+            self.record_source_stamp(&file_id);
+            self.dirty_sources.remove(&file_id);
+            self.refresh_merged_views_for_source(&file_id);
+        }
 
         // Views built before the entries arrived hold an empty, stale result.
-        for pane in 0..self.panes.len() {
-            if self.panes[pane].view.file_id == file_id {
-                self.queue_recompute(pane, After::Nothing);
-            }
+        for pane in self.panes_using_file(&file_id) {
+            self.queue_recompute(pane, After::Nothing);
         }
         // A restored merged pane has been waiting for exactly this.
         self.apply_pending_merges();
+        let should_start_live = self
+            .project
+            .get_file(&file_id)
+            .map(|file| file.is_live() && file.error.is_empty())
+            .unwrap_or(false);
+        if should_start_live {
+            self.start_live_source(&file_id);
+        }
         true
     }
 
@@ -2357,6 +3102,17 @@ impl AppState {
         for pane in 0..self.panes.len() {
             self.queue_recompute(pane, After::Nothing);
         }
+        self.start_ready_live_sources();
+        let loaded_ids: Vec<String> = self
+            .project
+            .files
+            .iter()
+            .filter(|file| !file.is_merged() && file.loaded)
+            .map(|file| file.file_id.clone())
+            .collect();
+        for file_id in loaded_ids {
+            self.record_source_stamp(&file_id);
+        }
     }
 
     fn queue_load(&mut self, file_id: &str) {
@@ -2367,6 +3123,16 @@ impl AppState {
         let display_name = file.display_name.clone();
         let extractor = file.extractor.clone();
         let total = parser::file_size(&path);
+        let is_live = file.is_live();
+
+        if is_live && !path.exists() {
+            if let Some(file) = self.project.get_file_mut(file_id) {
+                file.loaded = true;
+                file.error.clear();
+            }
+            self.start_live_source(file_id);
+            return;
+        }
 
         match std::fs::File::open(&path) {
             Ok(handle) => self.work.push_back(Job::Load(Box::new(LoadJob {
@@ -2380,7 +3146,13 @@ impl AppState {
                 error: None,
             }))),
             Err(error) => {
-                if let Some(file) = self.project.get_file_mut(file_id) {
+                if is_live {
+                    if let Some(file) = self.project.get_file_mut(file_id) {
+                        file.loaded = true;
+                        file.error.clear();
+                    }
+                    self.start_live_source(file_id);
+                } else if let Some(file) = self.project.get_file_mut(file_id) {
                     file.error = format!("read error: {error}");
                 }
             }
@@ -3684,10 +4456,21 @@ impl AppState {
                 "schema name | description",
                 &text,
             ),
+            Mode::LiveSchemaEditor { text, .. } => self.draw_input_popup(
+                frame,
+                root,
+                "Edit Live Source Schema",
+                "schema name OR name | format template | [timestamp strptime format] | [description]",
+                &text,
+            ),
             Mode::SourceEditor(editor) => self.draw_source_editor(frame, root, &editor),
+            Mode::LiveSourceEditor(editor) => {
+                self.draw_live_source_editor(frame, root, &editor)
+            }
             Mode::SchemaLibraryPicker(picker) => {
                 self.draw_schema_library_picker(frame, root, &picker)
             }
+            Mode::LiveQuickPick(picker) => self.draw_live_quick_pick(frame, root, &picker),
             Mode::EditFilter { text, .. } => self.draw_input_popup(
                 frame,
                 root,
@@ -3960,6 +4743,117 @@ impl AppState {
                 "Use Up/Down or Tab to move; type to edit the focused field",
                 theme.dim(),
             )));
+        }
+
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn draw_live_source_editor(&self, frame: &mut Frame, root: Rect, editor: &LiveSourceEditor) {
+        let theme = self.theme();
+        let rows = editor.rows();
+        let width = root
+            .width
+            .saturating_sub(4)
+            .min(112)
+            .max(root.width.min(78));
+        let height = (rows.len() as u16 + 8).min(root.height.max(10));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let title = if editor.file_id.is_some() {
+            "Live Log Source  Enter save  Esc cancel"
+        } else {
+            "Live Log Source  Enter start  Esc cancel"
+        };
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent()));
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+        let label_width = 13usize;
+
+        let mut lines = Vec::new();
+        for (index, (_, label, value)) in rows.iter().enumerate() {
+            let marker = if index == editor.row { "> " } else { "  " };
+            let row = format!(
+                "{marker}{label:<label_width$} {}",
+                value,
+                label_width = label_width
+            );
+            let style = if index == editor.row {
+                theme.selected()
+            } else if rows[index].0 == LiveSourceField::Schema {
+                theme.section()
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(crop(&row, 0, text_width), style)));
+        }
+        lines.push(Line::from(""));
+        let preview = editor.config().command_preview();
+        lines.push(Line::from(Span::styled(
+            crop(&format!("Command: {preview}"), 0, text_width),
+            theme.dim(),
+        )));
+        let hint = match editor.field_for_row() {
+            LiveSourceField::Kind => "Type: Left/Right or k/d/j selects kubectl/docker/journalctl",
+            field if live_quick_pick_field(field) => {
+                "Right quick pick from the local runtime; type to edit manually"
+            }
+            LiveSourceField::Since => "Since is optional: examples 10m, 2026-07-15 09:00:00",
+            LiveSourceField::Tail => "Tail lines is optional; leave empty for the command default",
+            LiveSourceField::Schema => {
+                "Schema: i detect with LLM  e edit manually  L load library  X save to library"
+            }
+            _ => "Use Up/Down or Tab to move; type to edit the focused field",
+        };
+        lines.push(Line::from(Span::styled(hint, theme.dim())));
+
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    fn draw_live_quick_pick(&self, frame: &mut Frame, root: Rect, picker: &LiveQuickPick) {
+        let theme = self.theme();
+        let width = root.width.saturating_sub(4).min(86).max(root.width.min(56));
+        let rows = picker.options.len().clamp(1, 10) as u16;
+        let height = (rows + 5).min(root.height.max(7));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let title = format!(
+            "Quick Pick {}  Enter select  Esc back",
+            live_quick_pick_label(picker.target)
+        );
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent()));
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::styled(
+            crop(&picker.message, 0, text_width),
+            theme.dim(),
+        )));
+        lines.push(Line::from(""));
+
+        if picker.loading {
+            lines.push(Line::from(Span::styled("  loading...", theme.section())));
+        } else if picker.options.is_empty() {
+            lines.push(Line::from(Span::styled("  no options", theme.dim())));
+        } else {
+            for (index, option) in picker.options.iter().enumerate().take(10) {
+                let marker = if index == picker.selected { "> " } else { "  " };
+                let style = if index == picker.selected {
+                    theme.selected()
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    crop(&format!("{marker}{option}"), 0, text_width),
+                    style,
+                )));
+            }
         }
 
         frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -4596,6 +5490,7 @@ impl AppState {
             | Mode::ExportIncident(_)
             | Mode::Extractor(_)
             | Mode::SaveSourceSchema { .. }
+            | Mode::LiveSchemaEditor { .. }
             | Mode::EditFilter { .. }
             | Mode::EditSearch { .. }
             | Mode::BookmarkNote { .. }
@@ -4611,6 +5506,8 @@ impl AppState {
             Mode::Help => 10,
             Mode::SourceEditor(_) => 11,
             Mode::SchemaLibraryPicker(_) => 12,
+            Mode::LiveSourceEditor(_) => 13,
+            Mode::LiveQuickPick(_) => 14,
         };
 
         match mode_kind {
@@ -4630,6 +5527,8 @@ impl AppState {
             10 => self.handle_help_key(key),
             11 => self.handle_source_editor_key(key),
             12 => self.handle_schema_library_picker_key(key),
+            13 => self.handle_live_source_editor_key(key),
+            14 => self.handle_live_quick_pick_key(key),
             _ => Ok(false),
         }
     }
@@ -5348,6 +6247,7 @@ impl AppState {
             KeyCode::Char('E') => {
                 self.open_input(Mode::ExportIncident(self.default_incident_file_input()))
             }
+            KeyCode::Char('r') => self.refresh_dirty_sources(),
             KeyCode::Char('L') => self.open_library_load(),
             KeyCode::Char('X') => self.open_library_save(),
             KeyCode::Char('H') => self.begin_hide(),
@@ -5545,6 +6445,7 @@ impl AppState {
             | Mode::ExportIncident(text)
             | Mode::Extractor(text)
             | Mode::SaveSourceSchema { text, .. }
+            | Mode::LiveSchemaEditor { text, .. }
             | Mode::EditFilter { text, .. }
             | Mode::EditSearch { text, .. }
             | Mode::BookmarkNote { text, .. } => text.chars().count(),
@@ -5719,6 +6620,7 @@ impl AppState {
             | Mode::ExportIncident(input)
             | Mode::Extractor(input)
             | Mode::SaveSourceSchema { text: input, .. }
+            | Mode::LiveSchemaEditor { text: input, .. }
             | Mode::EditFilter { text: input, .. }
             | Mode::EditSearch { text: input, .. }
             | Mode::BookmarkNote { text: input, .. } => Some(input),
@@ -5745,6 +6647,10 @@ impl AppState {
             Mode::Extractor(text) => self.submit_extractor(text),
             Mode::SaveSourceSchema { file_id, text } => {
                 self.submit_save_source_schema(file_id, text)
+            }
+            Mode::LiveSchemaEditor { mut editor, text } => {
+                editor.schema = text.trim().to_string();
+                self.mode = Mode::LiveSourceEditor(editor);
             }
             Mode::EditFilter { index, text } => self.submit_edit_filter(index, text),
             Mode::EditSearch { index, text } => self.submit_edit_search(index, text),
@@ -6979,6 +7885,7 @@ impl AppState {
             Command::ToggleChat,
             Command::ChooseTheme,
             Command::AddFileBrowse,
+            Command::AddLiveSource,
             Command::OpenFolder,
             Command::Help,
         ]);
@@ -7055,6 +7962,7 @@ impl AppState {
             Command::ToggleChat => self.toggle_chat_panel(),
             Command::ChooseTheme => self.open_theme_picker(),
             Command::AddFileBrowse => self.open_file_browser(),
+            Command::AddLiveSource => self.open_live_source_editor(),
             Command::OpenFolder => self.open_folder_browser(),
             Command::Help => self.mode = Mode::Help,
         }
@@ -7149,6 +8057,306 @@ impl AppState {
         }
     }
 
+    fn open_live_source_editor(&mut self) {
+        self.mode = Mode::LiveSourceEditor(LiveSourceEditor::new());
+    }
+
+    fn handle_live_source_editor_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::LiveSourceEditor(mut editor) = self.mode.clone() else {
+            return Ok(false);
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.submit_live_source_editor(editor);
+            }
+            KeyCode::Up => {
+                editor.pick(-1);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                editor.pick(1);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::BackTab => {
+                editor.pick(-1);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Left if editor.field_for_row() == LiveSourceField::Kind => {
+                editor.cycle_kind(-1);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Right if editor.field_for_row() == LiveSourceField::Kind => {
+                editor.cycle_kind(1);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Right if live_quick_pick_field(editor.field_for_row()) => {
+                self.begin_live_quick_pick(editor);
+            }
+            KeyCode::Backspace => {
+                if let Some(field) = editor.field_mut() {
+                    field.pop();
+                }
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Char('u') if ctrl => {
+                if let Some(field) = editor.field_mut() {
+                    field.clear();
+                }
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Char('i') if editor.field_for_row() == LiveSourceField::Schema && !ctrl => {
+                if let Some(file_id) = editor.file_id.clone() {
+                    self.save_live_source_editor_fields(&editor);
+                    self.mode = Mode::Normal;
+                    self.infer_schema_ai_for(file_id);
+                } else {
+                    editor.focus_field(LiveSourceField::Schema);
+                    self.status =
+                        "start the live source before asking the LLM to detect its schema"
+                            .to_string();
+                    self.mode = Mode::LiveSourceEditor(editor);
+                }
+            }
+            KeyCode::Char('e') if editor.field_for_row() == LiveSourceField::Schema && !ctrl => {
+                if let Some(file_id) = editor.file_id.clone() {
+                    self.save_live_source_editor_fields(&editor);
+                    self.open_schema_input_for(&file_id);
+                } else {
+                    let text = editor.schema.clone();
+                    self.open_input(Mode::LiveSchemaEditor { editor, text });
+                }
+            }
+            KeyCode::Char('L') if editor.field_for_row() == LiveSourceField::Schema && !ctrl => {
+                if let Some(file_id) = editor.file_id.clone() {
+                    self.save_live_source_editor_fields(&editor);
+                    self.open_schema_library_picker(file_id);
+                } else {
+                    self.open_schema_library_picker_for_live_editor(editor);
+                }
+            }
+            KeyCode::Char('X') if editor.field_for_row() == LiveSourceField::Schema && !ctrl => {
+                if let Some(file_id) = editor.file_id.clone() {
+                    self.save_live_source_editor_fields(&editor);
+                    self.open_save_source_schema(file_id);
+                } else {
+                    editor.focus_field(LiveSourceField::Schema);
+                    self.status = "start the live source before saving its schema".to_string();
+                    self.mode = Mode::LiveSourceEditor(editor);
+                }
+            }
+            KeyCode::Char('k') if editor.field_for_row() == LiveSourceField::Kind && !ctrl => {
+                editor.set_kind(LiveSourceKind::Kubernetes);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Char('d') if editor.field_for_row() == LiveSourceField::Kind && !ctrl => {
+                editor.set_kind(LiveSourceKind::Docker);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Char('j') if editor.field_for_row() == LiveSourceField::Kind && !ctrl => {
+                editor.set_kind(LiveSourceKind::Journalctl);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(field) = editor.field_mut() {
+                    field.push(ch);
+                }
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            _ => self.mode = Mode::LiveSourceEditor(editor),
+        }
+        Ok(false)
+    }
+
+    fn save_live_source_editor_fields(&mut self, editor: &LiveSourceEditor) {
+        let Some(file_id) = editor.file_id.as_ref() else {
+            return;
+        };
+        let config = editor.config();
+        let display_name = if editor.short_name.trim().is_empty() {
+            config.default_name()
+        } else {
+            editor.short_name.trim().to_string()
+        };
+        if let Some(file) = self.project.get_file_mut(file_id) {
+            file.display_name = display_name.clone();
+            file.label = display_name;
+            file.description = editor.description.trim().to_string();
+            file.tag = editor.tag.trim().to_string();
+            self.autosave_project();
+        }
+    }
+
+    fn begin_live_quick_pick(&mut self, editor: LiveSourceEditor) {
+        let target = editor.field_for_row();
+        if !live_quick_pick_field(target) {
+            self.mode = Mode::LiveSourceEditor(editor);
+            return;
+        }
+        let request = editor.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match discover_live_quick_pick_options(&request, target) {
+                Ok(options) => LivePickResult {
+                    target,
+                    options,
+                    error: None,
+                },
+                Err(error) => LivePickResult {
+                    target,
+                    options: Vec::new(),
+                    error: Some(error),
+                },
+            };
+            let _ = tx.send(result);
+        });
+        self.live_pick_rx = Some(rx);
+        self.mode = Mode::LiveQuickPick(LiveQuickPick {
+            editor,
+            target,
+            options: Vec::new(),
+            selected: 0,
+            loading: true,
+            message: format!("discovering {}", live_quick_pick_label(target)),
+        });
+    }
+
+    fn handle_live_quick_pick_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::LiveQuickPick(mut picker) = self.mode.clone() else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.live_pick_rx = None;
+                picker.editor.focus_field(picker.target);
+                self.mode = Mode::LiveSourceEditor(picker.editor);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+                self.mode = Mode::LiveQuickPick(picker);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(picker.options.len().saturating_sub(1));
+                self.mode = Mode::LiveQuickPick(picker);
+            }
+            KeyCode::Enter if !picker.loading => {
+                if let Some(value) = picker.options.get(picker.selected).cloned() {
+                    apply_live_quick_pick_value(&mut picker.editor, picker.target, &value);
+                    self.status =
+                        format!("{} selected: {value}", live_quick_pick_label(picker.target));
+                }
+                picker.editor.focus_field(picker.target);
+                self.mode = Mode::LiveSourceEditor(picker.editor);
+            }
+            _ => self.mode = Mode::LiveQuickPick(picker),
+        }
+        Ok(false)
+    }
+
+    fn submit_live_source_editor(&mut self, editor: LiveSourceEditor) {
+        let config = editor.config();
+        if let Err(error) = config.validate() {
+            self.status = format!("live source not added: {error}");
+            return;
+        }
+        let schema = match self.schema_name_for_new_live_source(&editor.schema) {
+            Ok(schema) => schema,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let display_name = if editor.short_name.trim().is_empty() {
+            config.default_name()
+        } else {
+            editor.short_name.trim().to_string()
+        };
+        if let Some(file_id) = editor.file_id.clone() {
+            self.update_live_source(file_id, config, display_name, editor, schema);
+            return;
+        }
+        let file_id = {
+            let file = self
+                .project
+                .add_live_source(config, display_name.clone(), Some(schema));
+            file.label = display_name;
+            file.description = editor.description.trim().to_string();
+            file.tag = editor.tag.trim().to_string();
+            file.loaded = true;
+            file.file_id.clone()
+        };
+        self.open_file_in_focused(&file_id);
+        self.autosave_project();
+        self.start_live_source(&file_id);
+    }
+
+    fn update_live_source(
+        &mut self,
+        file_id: String,
+        config: LiveSourceConfig,
+        display_name: String,
+        editor: LiveSourceEditor,
+        schema: String,
+    ) {
+        let Some(file) = self.project.get_file(&file_id) else {
+            self.status = "live source is gone".to_string();
+            return;
+        };
+        let reset_stream = file.live.as_ref() != Some(&config) || file.extractor_name != schema;
+        let spool_path = file.path.clone();
+
+        if reset_stream {
+            self.live_sources.remove(&file_id);
+            if file.live.as_ref() != Some(&config) {
+                let _ = fs::remove_file(&spool_path);
+            }
+            if let Err(error) = self.project.set_file_extractor(&file_id, &schema) {
+                self.status = error;
+                return;
+            }
+        }
+
+        if let Some(file) = self.project.get_file_mut(&file_id) {
+            file.display_name = display_name.clone();
+            file.label = display_name;
+            file.description = editor.description.trim().to_string();
+            file.tag = editor.tag.trim().to_string();
+            file.live = Some(config);
+            if reset_stream {
+                file.loaded = false;
+            }
+        }
+
+        self.open_file_in_focused(&file_id);
+        self.autosave_project();
+        if reset_stream {
+            self.queue_load(&file_id);
+            self.requeue_all_panes();
+        } else {
+            self.status = "live source updated".to_string();
+        }
+    }
+
+    fn schema_name_for_new_live_source(&mut self, text: &str) -> Result<String, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(GENERIC_EXTRACTOR_NAME.to_string());
+        }
+        if !text.contains('|') && !looks_like_schema_json_input(text) {
+            if self.project.extractors.contains_key(text) {
+                return Ok(text.to_string());
+            }
+            return Err(format!("unknown log schema: {text}"));
+        }
+
+        let extractor = parse_log_schema_input(text)?;
+        let name = extractor.name.clone();
+        self.project.add_extractor(extractor)?;
+        Ok(name)
+    }
+
     fn handle_source_editor_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
         let Mode::SourceEditor(mut editor) = self.mode.clone() else {
             return Ok(false);
@@ -7211,7 +8419,7 @@ impl AppState {
             return Ok(false);
         };
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Esc => self.restore_schema_picker_target(picker.target),
             KeyCode::Up | KeyCode::Char('k') => {
                 picker.selected = picker.selected.saturating_sub(1);
                 self.mode = Mode::SchemaLibraryPicker(picker);
@@ -7222,10 +8430,18 @@ impl AppState {
             }
             KeyCode::Enter => {
                 let selected = picker.options.get(picker.selected).cloned();
-                let file_id = picker.file_id.clone();
-                self.mode = Mode::Normal;
                 if let Some(schema) = selected {
-                    self.apply_library_schema(file_id, schema);
+                    match picker.target {
+                        SchemaPickerTarget::File(file_id) => {
+                            self.mode = Mode::Normal;
+                            self.apply_library_schema(file_id, schema);
+                        }
+                        SchemaPickerTarget::LiveEditor(editor) => {
+                            self.apply_library_schema_to_live_editor(editor, schema);
+                        }
+                    }
+                } else {
+                    self.restore_schema_picker_target(picker.target);
                 }
             }
             _ => self.mode = Mode::SchemaLibraryPicker(picker),
@@ -8023,28 +9239,25 @@ impl AppState {
     }
 
     fn open_schema_library_picker(&mut self, file_id: String) {
+        self.open_schema_library_picker_for_target(SchemaPickerTarget::File(file_id));
+    }
+
+    fn open_schema_library_picker_for_live_editor(&mut self, editor: LiveSourceEditor) {
+        self.open_schema_library_picker_for_target(SchemaPickerTarget::LiveEditor(editor));
+    }
+
+    fn open_schema_library_picker_for_target(&mut self, target: SchemaPickerTarget) {
         let folder = self.default_schema_folder_path();
         if !folder.is_dir() {
             self.status = format!("no schema folder: {}", folder.display());
-            self.mode = Mode::SourceEditor(
-                self.project
-                    .get_file(&file_id)
-                    .map(SourceEditor::new)
-                    .unwrap_or_else(|| SourceEditor {
-                        file_id,
-                        row: SourceEditor::SCHEMA,
-                        short_name: String::new(),
-                        description: String::new(),
-                        tag: String::new(),
-                        schema: String::new(),
-                    }),
-            );
+            self.restore_schema_picker_target(target);
             return;
         }
         let loaded = match load_schemas_from_folder(&folder) {
             Ok(loaded) => loaded,
             Err(error) => {
                 self.status = format!("load failed: {error}");
+                self.restore_schema_picker_target(target);
                 return;
             }
         };
@@ -8061,13 +9274,37 @@ impl AppState {
         options.sort_by(|left, right| left.name.cmp(&right.name));
         if options.is_empty() {
             self.status = format!("no schema JSON files in {}", folder.display());
+            self.restore_schema_picker_target(target);
             return;
         }
         self.mode = Mode::SchemaLibraryPicker(SchemaLibraryPicker {
-            file_id,
+            target,
             options,
             selected: 0,
         });
+    }
+
+    fn restore_schema_picker_target(&mut self, target: SchemaPickerTarget) {
+        match target {
+            SchemaPickerTarget::File(file_id) => {
+                let mode = self.project.get_file(&file_id).map(|file| {
+                    if file.is_live() {
+                        let mut editor = LiveSourceEditor::from_file(file);
+                        editor.focus_field(LiveSourceField::Schema);
+                        Mode::LiveSourceEditor(editor)
+                    } else {
+                        let mut editor = SourceEditor::new(file);
+                        editor.row = SourceEditor::SCHEMA;
+                        Mode::SourceEditor(editor)
+                    }
+                });
+                self.mode = mode.unwrap_or(Mode::Normal);
+            }
+            SchemaPickerTarget::LiveEditor(mut editor) => {
+                editor.focus_field(LiveSourceField::Schema);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+        }
     }
 
     fn apply_library_schema(&mut self, file_id: String, schema: Extractor) {
@@ -8079,6 +9316,26 @@ impl AppState {
             }
         }
         self.apply_schema_to_file(&file_id, &name);
+    }
+
+    fn apply_library_schema_to_live_editor(
+        &mut self,
+        mut editor: LiveSourceEditor,
+        schema: Extractor,
+    ) {
+        let name = schema.name.clone();
+        if !self.project.extractors.contains_key(&name) {
+            if let Err(error) = self.project.add_extractor(schema) {
+                self.status = format!("schema import failed: {error}");
+                editor.focus_field(LiveSourceField::Schema);
+                self.mode = Mode::LiveSourceEditor(editor);
+                return;
+            }
+        }
+        editor.schema = name;
+        editor.focus_field(LiveSourceField::Schema);
+        self.mode = Mode::LiveSourceEditor(editor);
+        self.status = "schema selected".to_string();
     }
 
     fn open_save_source_schema(&mut self, file_id: String) {
@@ -8147,6 +9404,7 @@ impl AppState {
             .get_file(file_id)
             .map(|file| file.display_name.clone())
             .unwrap_or_default();
+        self.live_sources.remove(file_id);
         if let Err(error) = self.project.set_file_extractor(file_id, name) {
             self.autosave_project();
             self.status = error;
@@ -8448,6 +9706,10 @@ impl AppState {
             self.status = "a merged view has no source settings".to_string();
             return;
         }
+        if file.is_live() {
+            self.mode = Mode::LiveSourceEditor(LiveSourceEditor::from_file(file));
+            return;
+        }
         self.mode = Mode::SourceEditor(SourceEditor::new(file));
     }
 
@@ -8492,6 +9754,12 @@ impl AppState {
             return;
         }
         let path = file.path.clone();
+        let entry_sample: Vec<String> = file
+            .entries
+            .iter()
+            .flat_map(|entry| entry.raw.lines().map(str::to_string))
+            .take(SCHEMA_INFER_SAMPLE_LINES)
+            .collect();
 
         let config = AiConfig::load();
         let Some(key) = config.api_key() else {
@@ -8501,13 +9769,15 @@ impl AppState {
             return;
         };
 
-        let sample: Vec<String> = match crate::core::parser::read_first_lines(&path, 80) {
-            Ok(lines) => lines.into_iter().take(80).collect(),
-            Err(error) => {
-                self.status = format!("could not read the file: {error}");
-                return;
-            }
-        };
+        let sample: Vec<String> =
+            match crate::core::parser::read_first_lines(&path, SCHEMA_INFER_SAMPLE_LINES) {
+                Ok(lines) => lines.into_iter().take(SCHEMA_INFER_SAMPLE_LINES).collect(),
+                Err(_error) if !entry_sample.is_empty() => entry_sample,
+                Err(error) => {
+                    self.status = format!("could not read the file: {error}");
+                    return;
+                }
+            };
         if sample.iter().all(|line| line.trim().is_empty()) {
             self.status = "the file has no lines to sample".to_string();
             return;
@@ -9761,6 +11031,7 @@ impl AppState {
             return;
         }
 
+        self.live_sources.remove(&file_id);
         self.project.remove_file(&file_id);
         let fallback = self
             .project
@@ -10156,10 +11427,14 @@ impl AppState {
             .filter(|file| !file.is_merged())
             .collect();
         if real.is_empty() {
-            items.push(SidebarItem::Hint("none - press a".to_string()));
+            items.push(SidebarItem::Hint(
+                "none - press a or add live source".to_string(),
+            ));
         } else {
             for file in real {
-                let suffix = if !file.error.is_empty() {
+                let suffix = if self.live_sources.contains_key(&file.file_id) {
+                    format!(" live ({})", file.entries.len())
+                } else if !file.error.is_empty() {
                     " !".to_string()
                 } else if file.loaded {
                     format!(" ({})", file.entries.len())
@@ -11314,12 +12589,166 @@ fn source_default_short_name(file: &LogFileModel) -> String {
     if !file.label.trim().is_empty() {
         return file.label.clone();
     }
+    if file.is_live() && !file.display_name.trim().is_empty() {
+        return file.display_name.clone();
+    }
     file.path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .filter(|stem| !stem.trim().is_empty())
         .unwrap_or(&file.display_name)
         .to_string()
+}
+
+fn live_quick_pick_field(field: LiveSourceField) -> bool {
+    matches!(
+        field,
+        LiveSourceField::Namespace
+            | LiveSourceField::Pod
+            | LiveSourceField::Container
+            | LiveSourceField::DockerContainer
+    )
+}
+
+fn live_quick_pick_label(field: LiveSourceField) -> &'static str {
+    match field {
+        LiveSourceField::Namespace => "namespace",
+        LiveSourceField::Pod => "pod",
+        LiveSourceField::Container => "container",
+        LiveSourceField::DockerContainer => "docker container",
+        _ => "value",
+    }
+}
+
+fn apply_live_quick_pick_value(
+    editor: &mut LiveSourceEditor,
+    target: LiveSourceField,
+    value: &str,
+) {
+    match target {
+        LiveSourceField::Namespace => {
+            if editor.namespace != value {
+                editor.pod.clear();
+                editor.container.clear();
+            }
+            editor.namespace = value.to_string();
+        }
+        LiveSourceField::Pod => {
+            if let Some((namespace, pod)) = value.split_once('/') {
+                if editor.namespace != namespace {
+                    editor.namespace = namespace.to_string();
+                }
+                editor.pod = pod.to_string();
+            } else {
+                editor.pod = value.to_string();
+            }
+            editor.container.clear();
+        }
+        LiveSourceField::Container => editor.container = value.to_string(),
+        LiveSourceField::DockerContainer => editor.docker_container = value.to_string(),
+        _ => {}
+    }
+}
+
+fn discover_live_quick_pick_options(
+    editor: &LiveSourceEditor,
+    target: LiveSourceField,
+) -> Result<Vec<String>, String> {
+    match target {
+        LiveSourceField::DockerContainer => command_lines(
+            "docker",
+            &["ps", "-a", "--format", "{{.Names}}"],
+            "docker containers",
+        ),
+        LiveSourceField::Namespace => command_lines(
+            "kubectl",
+            &[
+                "get",
+                "namespaces",
+                "-o",
+                r#"jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}"#,
+            ],
+            "kubernetes namespaces",
+        ),
+        LiveSourceField::Pod => {
+            if editor.namespace.trim().is_empty() {
+                command_lines(
+                    "kubectl",
+                    &[
+                        "get",
+                        "pods",
+                        "--all-namespaces",
+                        "-o",
+                        r#"jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}"#,
+                    ],
+                    "kubernetes pods",
+                )
+            } else {
+                command_lines(
+                    "kubectl",
+                    &[
+                        "get",
+                        "pods",
+                        "-n",
+                        editor.namespace.trim(),
+                        "-o",
+                        r#"jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}"#,
+                    ],
+                    "kubernetes pods",
+                )
+            }
+        }
+        LiveSourceField::Container => {
+            let pod = editor.pod.trim();
+            if pod.is_empty() {
+                return Err("select or type a pod before picking a container".to_string());
+            }
+            let (namespace, pod) = pod
+                .split_once('/')
+                .map(|(namespace, pod)| (namespace, pod))
+                .unwrap_or((editor.namespace.trim(), pod));
+            let mut args = vec!["get", "pod", pod];
+            if !namespace.is_empty() {
+                args.extend(["-n", namespace]);
+            }
+            args.extend([
+                "-o",
+                r#"jsonpath={range .spec.containers[*]}{.name}{"\n"}{end}"#,
+            ]);
+            command_lines("kubectl", &args, "pod containers")
+        }
+        _ => Err("this field has no quick pick".to_string()),
+    }
+}
+
+fn command_lines(program: &str, args: &[&str], label: &str) -> Result<Vec<String>, String> {
+    let output = ProcessCommand::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run {program}: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
+        return if message.is_empty() {
+            Err(format!("{program} exited with {}", output.status))
+        } else {
+            Err(format!("{program}: {message}"))
+        };
+    }
+
+    let mut options: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    options.sort();
+    options.dedup();
+    if options.is_empty() {
+        Err(format!("no {label} found"))
+    } else {
+        Ok(options)
+    }
 }
 
 fn push_detail(
@@ -11774,12 +13203,13 @@ Command palette
 
 Project/files
   a browse for a file  o browse for a folder      d delete selected item      Ctrl+s save
+  Ctrl+P Add live source; Right quick-picks Docker/Kubernetes names; r refreshes sources
   d/Delete delete what the cursor is on: a log source, filter, or saved search
   In the browser: j/k or arrows move, Enter opens './' or a folder (or adds the file),
                   Right enters, Left/Backspace goes up, '.' shows hidden, Esc cancels
                   a's file picker also lists files; Enter adds one, or 'p' types a path
   Enter on a log source edits its short name, description, tag, and schema
-  In the source schema row: i infer with LLM, e edit manually, L load library, X save library
+  In source/live schema rows: i infer with LLM, e edit, L load library, X save library
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
   In the sidebar: Space on a log adds/removes it, merging the logs by timestamp
                   Space on a filter enables/disables it; d/Delete removes it
@@ -14117,6 +15547,61 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_opens_the_live_source_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        assert!(app.palette_commands().contains(&Command::AddLiveSource));
+        app.dispatch_command(Command::AddLiveSource).unwrap();
+        let Mode::LiveSourceEditor(editor) = &app.mode else {
+            panic!("expected live source editor, got {:?}", app.mode);
+        };
+        assert_eq!(editor.kind, LiveSourceKind::Kubernetes);
+        assert_eq!(editor.schema, GENERIC_EXTRACTOR_NAME);
+        assert!(editor
+            .rows()
+            .iter()
+            .any(|(field, _, _)| *field == LiveSourceField::Pod));
+    }
+
+    #[test]
+    fn live_source_quick_pick_values_update_dependent_fields() {
+        let mut editor = LiveSourceEditor::new();
+        editor.namespace = "old".to_string();
+        editor.pod = "old-pod".to_string();
+        editor.container = "old-container".to_string();
+
+        apply_live_quick_pick_value(&mut editor, LiveSourceField::Namespace, "prod");
+        assert_eq!(editor.namespace, "prod");
+        assert_eq!(editor.pod, "");
+        assert_eq!(editor.container, "");
+
+        apply_live_quick_pick_value(&mut editor, LiveSourceField::Pod, "prod/api-7d9");
+        assert_eq!(editor.namespace, "prod");
+        assert_eq!(editor.pod, "api-7d9");
+        assert_eq!(editor.container, "");
+
+        apply_live_quick_pick_value(&mut editor, LiveSourceField::DockerContainer, "worker");
+        assert_eq!(editor.docker_container, "worker");
+    }
+
+    #[test]
+    fn library_schema_can_be_selected_before_live_source_is_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(Project::new(tmp.path()));
+        let editor = LiveSourceEditor::new();
+        let schema = Extractor::new("picked", "<message>").unwrap();
+
+        app.apply_library_schema_to_live_editor(editor, schema);
+
+        let Mode::LiveSourceEditor(editor) = &app.mode else {
+            panic!("expected live source editor, got {:?}", app.mode);
+        };
+        assert_eq!(editor.schema, "picked");
+        assert!(app.project.extractors.contains_key("picked"));
+    }
+
+    #[test]
     fn ui_config_saves_and_loads_the_selected_theme() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config/ui.json");
@@ -15479,6 +16964,94 @@ mod tests {
         assert_eq!(editor.description, "");
         assert_eq!(editor.tag, "");
         assert_eq!(editor.schema, "Bracketed default");
+    }
+
+    #[test]
+    fn enter_on_a_live_log_source_opens_the_live_source_editor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::new(tmp.path());
+        project.add_live_source(
+            LiveSourceConfig {
+                kind: LiveSourceKind::Journalctl,
+                unit: "nginx.service".to_string(),
+                tail: "100".to_string(),
+                ..LiveSourceConfig::default()
+            },
+            "nginx journal",
+            None,
+        );
+        let mut app = AppState::new(project);
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = 1;
+
+        press(&mut app, KeyCode::Enter);
+        let Mode::LiveSourceEditor(editor) = &app.mode else {
+            panic!("expected the live source editor, got {:?}", app.mode);
+        };
+        assert_eq!(editor.kind, LiveSourceKind::Journalctl);
+        assert_eq!(editor.short_name, "nginx journal");
+        assert_eq!(editor.unit, "nginx.service");
+        assert_eq!(editor.tail, "100");
+    }
+
+    #[test]
+    fn changed_source_files_notify_and_refresh_with_r() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 2);
+        let file_id = app.active_view().unwrap().file_id.clone();
+        let log = tmp.path().join("many.log");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .write_all(b"2026-06-16 10:09:02.000 [HOST:h][SERVER:S][PID:5][THR:9][Kernel][Trace][UID:0][SID:0][OID:0][D.cpp:2] Distribution Service Trigger: 2 queued\n")
+            .unwrap();
+
+        app.last_source_check = Instant::now() - SOURCE_POLL_INTERVAL;
+        app.check_source_modifications();
+
+        assert!(app.dirty_sources.contains(&file_id));
+        assert!(
+            app.status.contains("press r to refresh"),
+            "status was {}",
+            app.status
+        );
+
+        press(&mut app, KeyCode::Char('r'));
+        let file = app.project.get_file(&file_id).unwrap();
+        assert_eq!(file.entries.len(), 3);
+        assert!(!app.dirty_sources.contains(&file_id));
+    }
+
+    #[test]
+    fn live_source_schema_row_routes_schema_shortcuts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::new(tmp.path());
+        project.add_live_source(
+            LiveSourceConfig {
+                kind: LiveSourceKind::Journalctl,
+                unit: "nginx.service".to_string(),
+                ..LiveSourceConfig::default()
+            },
+            "nginx journal",
+            None,
+        );
+        let mut app = AppState::new(project);
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = 1;
+
+        press(&mut app, KeyCode::Enter);
+        let Mode::LiveSourceEditor(mut editor) = app.mode.clone() else {
+            panic!("expected live source editor, got {:?}", app.mode);
+        };
+        editor.focus_field(LiveSourceField::Schema);
+        app.mode = Mode::LiveSourceEditor(editor.clone());
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(app.mode, Mode::Extractor(_)));
+
+        app.mode = Mode::LiveSourceEditor(editor);
+        press(&mut app, KeyCode::Char('X'));
+        assert!(matches!(app.mode, Mode::SaveSourceSchema { .. }));
     }
 
     #[test]

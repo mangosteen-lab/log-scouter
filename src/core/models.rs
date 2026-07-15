@@ -3,6 +3,7 @@ use crate::core::filters::FilterSet;
 use crate::core::parser;
 use crate::core::search::Query;
 use chrono::NaiveDateTime;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,206 @@ pub struct SourceInfo {
     pub display_name: String,
     pub extractor_name: String,
     pub extractor: Option<Extractor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSourceKind {
+    Kubernetes,
+    Docker,
+    Journalctl,
+}
+
+impl LiveSourceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Kubernetes => "kubectl",
+            Self::Docker => "docker",
+            Self::Journalctl => "journalctl",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveSourceConfig {
+    pub kind: LiveSourceKind,
+    #[serde(default)]
+    pub namespace: String,
+    #[serde(default)]
+    pub pod: String,
+    #[serde(default)]
+    pub container: String,
+    #[serde(default)]
+    pub context: String,
+    #[serde(default)]
+    pub docker_container: String,
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default)]
+    pub since: String,
+    #[serde(default)]
+    pub tail: String,
+    #[serde(default = "default_live_follow")]
+    pub follow: bool,
+}
+
+impl Default for LiveSourceConfig {
+    fn default() -> Self {
+        Self {
+            kind: LiveSourceKind::Kubernetes,
+            namespace: String::new(),
+            pod: String::new(),
+            container: String::new(),
+            context: String::new(),
+            docker_container: String::new(),
+            unit: String::new(),
+            since: String::new(),
+            tail: String::new(),
+            follow: true,
+        }
+    }
+}
+
+impl LiveSourceConfig {
+    pub fn default_name(&self) -> String {
+        match self.kind {
+            LiveSourceKind::Kubernetes => {
+                if self.pod.trim().is_empty() {
+                    "kubectl logs".to_string()
+                } else if self.container.trim().is_empty() {
+                    format!("kubectl {}", self.pod.trim())
+                } else {
+                    format!("kubectl {}/{}", self.pod.trim(), self.container.trim())
+                }
+            }
+            LiveSourceKind::Docker => {
+                if self.docker_container.trim().is_empty() {
+                    "docker logs".to_string()
+                } else {
+                    format!("docker {}", self.docker_container.trim())
+                }
+            }
+            LiveSourceKind::Journalctl => {
+                if self.unit.trim().is_empty() {
+                    "journalctl".to_string()
+                } else {
+                    format!("journalctl {}", self.unit.trim())
+                }
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self.kind {
+            LiveSourceKind::Kubernetes => {
+                if self.pod.trim().is_empty() {
+                    return Err("pod name is required".to_string());
+                }
+            }
+            LiveSourceKind::Docker => {
+                if self.docker_container.trim().is_empty() {
+                    return Err("container name is required".to_string());
+                }
+            }
+            LiveSourceKind::Journalctl => {
+                if self.unit.trim().is_empty() {
+                    return Err("systemd unit is required".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn command_parts(&self) -> (String, Vec<String>) {
+        let mut args = Vec::new();
+        match self.kind {
+            LiveSourceKind::Kubernetes => {
+                if !self.context.trim().is_empty() {
+                    args.push("--context".to_string());
+                    args.push(self.context.trim().to_string());
+                }
+                args.push("logs".to_string());
+                if self.follow {
+                    args.push("-f".to_string());
+                }
+                if !self.namespace.trim().is_empty() {
+                    args.push("-n".to_string());
+                    args.push(self.namespace.trim().to_string());
+                }
+                if !self.container.trim().is_empty() {
+                    args.push("-c".to_string());
+                    args.push(self.container.trim().to_string());
+                }
+                if !self.tail.trim().is_empty() {
+                    args.push("--tail".to_string());
+                    args.push(self.tail.trim().to_string());
+                }
+                if !self.since.trim().is_empty() {
+                    args.push("--since".to_string());
+                    args.push(self.since.trim().to_string());
+                }
+                args.push(self.pod.trim().to_string());
+                ("kubectl".to_string(), args)
+            }
+            LiveSourceKind::Docker => {
+                args.push("logs".to_string());
+                if self.follow {
+                    args.push("-f".to_string());
+                }
+                if !self.tail.trim().is_empty() {
+                    args.push("--tail".to_string());
+                    args.push(self.tail.trim().to_string());
+                }
+                if !self.since.trim().is_empty() {
+                    args.push("--since".to_string());
+                    args.push(self.since.trim().to_string());
+                }
+                args.push(self.docker_container.trim().to_string());
+                ("docker".to_string(), args)
+            }
+            LiveSourceKind::Journalctl => {
+                if self.follow {
+                    args.push("-f".to_string());
+                }
+                args.push("-u".to_string());
+                args.push(self.unit.trim().to_string());
+                if !self.tail.trim().is_empty() {
+                    args.push("-n".to_string());
+                    args.push(self.tail.trim().to_string());
+                }
+                if !self.since.trim().is_empty() {
+                    args.push("--since".to_string());
+                    args.push(self.since.trim().to_string());
+                }
+                ("journalctl".to_string(), args)
+            }
+        }
+    }
+
+    pub fn command_preview(&self) -> String {
+        let (program, args) = self.command_parts();
+        std::iter::once(program)
+            .chain(args)
+            .map(|part| shell_quote(&part))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn default_live_follow() -> bool {
+    true
+}
+
+fn shell_quote(part: &str) -> String {
+    if part.is_empty()
+        || part
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\' | '$' | '`'))
+    {
+        format!("'{}'", part.replace('\'', "'\\''"))
+    } else {
+        part.to_string()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +245,9 @@ pub struct LogFileModel {
     pub sources: Vec<SourceInfo>,
     /// File ids this model was merged from; empty for a real file on disk.
     pub merged_from: Vec<String>,
+    /// A command-backed log stream. Its output is also spooled at `path` so reopening a
+    /// project can show the already captured lines before reconnecting.
+    pub live: Option<LiveSourceConfig>,
     concrete: HashMap<String, Option<String>>,
 }
 
@@ -82,12 +286,17 @@ impl LogFileModel {
             error: String::new(),
             sources: Vec::new(),
             merged_from: Vec::new(),
+            live: None,
             concrete: HashMap::new(),
         }
     }
 
     pub fn is_merged(&self) -> bool {
         !self.merged_from.is_empty()
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live.is_some()
     }
 
     /// The schema that parsed this entry. Merged models keep one per source file.

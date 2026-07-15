@@ -1,9 +1,10 @@
 use crate::core::extractor::{
     builtin_extractors, default_extractor, detect, extractor_from_project, Extractor,
     BRACKETED_DEFAULT_FORMAT, BRACKETED_LEGACY_FORMAT, DEFAULT_EXTRACTOR_NAME, DETECT_LINES,
+    GENERIC_EXTRACTOR_NAME,
 };
 use crate::core::filters::FilterSet;
-use crate::core::models::{display_name, merge_files, LogFileModel};
+use crate::core::models::{display_name, merge_files, LiveSourceConfig, LogFileModel};
 use crate::core::parser;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_DIR: &str = ".logscouter";
 pub const CONFIG_FILE: &str = "project.json";
+const LIVE_DIR: &str = "live";
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -136,6 +138,8 @@ struct FileData {
     description: String,
     #[serde(default)]
     tag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live: Option<LiveSourceConfig>,
 }
 
 impl Project {
@@ -271,6 +275,34 @@ impl Project {
         self.files.last_mut().expect("just pushed file")
     }
 
+    pub fn add_live_source(
+        &mut self,
+        config: LiveSourceConfig,
+        display_name: impl Into<String>,
+        extractor_name: Option<String>,
+    ) -> &mut LogFileModel {
+        self.file_counter += 1;
+        let file_id = format!("f{}", self.file_counter);
+        let path = self
+            .config_dir()
+            .join(LIVE_DIR)
+            .join(format!("{file_id}.log"));
+        let extractor_name = extractor_name.unwrap_or_else(|| GENERIC_EXTRACTOR_NAME.to_string());
+        let extractor = Some(self.get_extractor(&extractor_name));
+        let display_name = {
+            let name = display_name.into();
+            if name.trim().is_empty() {
+                config.default_name()
+            } else {
+                name
+            }
+        };
+        let mut model = LogFileModel::new(file_id, path, extractor_name, display_name, extractor);
+        model.live = Some(config);
+        self.files.push(model);
+        self.files.last_mut().expect("just pushed live source")
+    }
+
     pub fn remove_file(&mut self, file_id: &str) {
         self.files.retain(|file| file.file_id != file_id);
         self.bookmarks
@@ -401,7 +433,7 @@ impl Project {
             .files
             .iter()
             .enumerate()
-            .filter(|(_, file)| !file.is_merged() && !file.loaded)
+            .filter(|(_, file)| !file.is_merged() && !file.is_live() && !file.loaded)
             .map(|(index, file)| (index, file.path.clone()))
             .collect();
 
@@ -449,6 +481,10 @@ impl Project {
             }
             file.refresh_extractor(Some(extractor));
             if !file.loaded && file.error.is_empty() {
+                if file.is_live() && !file.path.exists() {
+                    file.loaded = true;
+                    continue;
+                }
                 if let Err(exc) = file.load() {
                     file.error = format!("read error: {exc}");
                 }
@@ -496,6 +532,7 @@ impl Project {
             model.label = file_data.label;
             model.description = file_data.description;
             model.tag = file_data.tag;
+            model.live = file_data.live;
             self.files.push(model);
         }
     }
@@ -517,6 +554,7 @@ impl Project {
                     label: file.label.clone(),
                     description: file.description.clone(),
                     tag: file.tag.clone(),
+                    live: file.live.clone(),
                 })
                 .collect(),
             extractors: self.extractors.values().cloned().collect(),

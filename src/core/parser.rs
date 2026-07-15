@@ -61,6 +61,16 @@ impl EntryBuilder {
         self.entries.len()
     }
 
+    pub fn snapshot(&self) -> Vec<LogEntry> {
+        let mut entries = self.entries.clone();
+        if let Some(entry) = &self.current {
+            let mut entry = entry.clone();
+            entry.index = entries.len();
+            entries.push(entry);
+        }
+        entries
+    }
+
     pub fn finish(mut self) -> Vec<LogEntry> {
         self.flush_current();
         self.entries
