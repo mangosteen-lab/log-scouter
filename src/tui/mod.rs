@@ -13,7 +13,10 @@ use crate::core::filters::{
 use crate::core::models::{apply_context, LogEntry, LogFileModel, ViewModel, VisibleIndices};
 use crate::core::parser::{self, EntryBuilder};
 use crate::core::project::{Bookmark, PaneSession, Project, Session, CONFIG_DIR};
-use crate::core::search::{compile_query, parse_datetime, Query};
+use crate::core::search::{
+    compile_query, export_searches_to_folder, install_default_search_library,
+    load_searches_from_folder, parse_datetime, user_search_dir, Query, USER_SEARCHES_SUBDIR,
+};
 use chrono::{Duration as ChronoDuration, NaiveDateTime};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -500,6 +503,8 @@ enum Mode {
     TimePicker(TimePicker),
     ExportFilters(String),
     LoadFilters(String),
+    ExportSearches(String),
+    ImportSearches(String),
     ExportSchemas(String),
     ImportSchemas(String),
     ExportIncident(String),
@@ -557,6 +562,8 @@ enum Command {
     TimeRange,
     ImportFilters,
     ExportFilters,
+    ImportSearches,
+    ExportSearches,
     ExportIncident,
     AskAi,
     Copy,
@@ -602,6 +609,8 @@ impl Command {
             Command::TimeRange => "Set time range",
             Command::ImportFilters => "Import filter pack",
             Command::ExportFilters => "Export filter pack",
+            Command::ImportSearches => "Import saved-search library",
+            Command::ExportSearches => "Export saved-search library",
             Command::ExportIncident => "Export incident Markdown",
             Command::AskAi => "Ask AI to help",
             Command::Copy => "Copy selection",
@@ -647,6 +656,8 @@ impl Command {
             Command::TimeRange => "t",
             Command::ImportFilters => "L",
             Command::ExportFilters => "x",
+            Command::ImportSearches => "",
+            Command::ExportSearches => "",
             Command::ExportIncident => "E",
             Command::AskAi => "A",
             Command::Copy => "y",
@@ -3220,6 +3231,20 @@ impl AppState {
                 "Folder of exported filter JSON files to merge into this project",
                 &text,
             ),
+            Mode::ExportSearches(text) => self.draw_input_popup(
+                frame,
+                root,
+                "Export Saved Searches",
+                "Folder to write one JSON file per saved search",
+                &text,
+            ),
+            Mode::ImportSearches(text) => self.draw_input_popup(
+                frame,
+                root,
+                "Import Saved Searches",
+                "Folder of saved-search JSON files to merge into this project",
+                &text,
+            ),
             Mode::ExportSchemas(text) => self.draw_input_popup(
                 frame,
                 root,
@@ -3955,6 +3980,8 @@ impl AppState {
             | Mode::Filter(_)
             | Mode::ExportFilters(_)
             | Mode::LoadFilters(_)
+            | Mode::ExportSearches(_)
+            | Mode::ImportSearches(_)
             | Mode::ExportSchemas(_)
             | Mode::ImportSchemas(_)
             | Mode::ExportIncident(_)
@@ -4781,6 +4808,8 @@ impl AppState {
             | Mode::Filter(text)
             | Mode::ExportFilters(text)
             | Mode::LoadFilters(text)
+            | Mode::ExportSearches(text)
+            | Mode::ImportSearches(text)
             | Mode::ExportSchemas(text)
             | Mode::ImportSchemas(text)
             | Mode::ExportIncident(text)
@@ -4909,6 +4938,8 @@ impl AppState {
             | Mode::Filter(input)
             | Mode::ExportFilters(input)
             | Mode::LoadFilters(input)
+            | Mode::ExportSearches(input)
+            | Mode::ImportSearches(input)
             | Mode::ExportSchemas(input)
             | Mode::ImportSchemas(input)
             | Mode::ExportIncident(input)
@@ -4931,6 +4962,8 @@ impl AppState {
             Mode::Filter(text) => self.submit_filter(text),
             Mode::ExportFilters(folder) => self.submit_export_filters(folder),
             Mode::LoadFilters(folder) => self.submit_load_filters(folder),
+            Mode::ExportSearches(folder) => self.submit_export_searches(folder),
+            Mode::ImportSearches(folder) => self.submit_import_searches(folder),
             Mode::ExportSchemas(folder) => self.submit_export_schemas(folder),
             Mode::ImportSchemas(folder) => self.submit_import_schemas(folder),
             Mode::ExportIncident(path) => self.submit_export_incident(path),
@@ -6141,6 +6174,8 @@ impl AppState {
             Command::ClearFilters,
             Command::ImportFilters,
             Command::ExportFilters,
+            Command::ImportSearches,
+            Command::ExportSearches,
             Command::ExportIncident,
             Command::AskAi,
             Command::Undo,
@@ -6184,6 +6219,12 @@ impl AppState {
             }
             Command::ExportFilters => {
                 self.open_input(Mode::ExportFilters(self.default_filter_folder_input()))
+            }
+            Command::ImportSearches => {
+                self.open_input(Mode::ImportSearches(self.default_search_folder_input()))
+            }
+            Command::ExportSearches => {
+                self.open_input(Mode::ExportSearches(self.default_search_folder_input()))
             }
             Command::ExportIncident => {
                 self.open_input(Mode::ExportIncident(self.default_incident_file_input()))
@@ -6730,6 +6771,71 @@ impl AppState {
             }
         });
         self.status = format!("loaded {count} filter(s) from {}", folder.display());
+    }
+
+    fn submit_export_searches(&mut self, folder: String) {
+        let folder = self.search_folder_from_input(&folder);
+        match export_searches_to_folder(&self.project.saved_searches, &folder) {
+            Ok(0) => self.status = "no saved searches to export".to_string(),
+            Ok(count) => {
+                self.status = format!("exported {count} saved search(es) to {}", folder.display());
+            }
+            Err(error) => {
+                self.status = format!("export failed: {error}");
+            }
+        }
+    }
+
+    fn submit_import_searches(&mut self, folder: String) {
+        let folder = self.search_folder_from_input(&folder);
+        match self.install_default_search_library_if_default(&folder) {
+            Ok(_) | Err(None) => {}
+            Err(Some(error)) => {
+                self.status = format!("load failed: {error}");
+                return;
+            }
+        }
+        if !folder.is_dir() {
+            self.status = format!("no saved-search folder: {}", folder.display());
+            return;
+        }
+
+        let loaded = match load_searches_from_folder(&folder) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.status = format!("load failed: {error}");
+                return;
+            }
+        };
+        if loaded.is_empty() {
+            self.status = format!("no saved-search JSON files in {}", folder.display());
+            return;
+        }
+
+        let mut added = 0;
+        let mut skipped = 0;
+        for search in loaded {
+            let query = search.query.trim().to_string();
+            if query.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            if self.project.saved_searches.contains(&query) {
+                skipped += 1;
+                continue;
+            }
+            self.project.saved_searches.push(query);
+            added += 1;
+        }
+
+        self.autosave_project();
+        self.status = match skipped {
+            0 => format!("loaded {added} saved search(es) from {}", folder.display()),
+            skipped => format!(
+                "loaded {added} saved search(es), skipped {skipped} from {}",
+                folder.display()
+            ),
+        };
     }
 
     fn submit_export_schemas(&mut self, folder: String) {
@@ -8697,6 +8803,24 @@ impl AppState {
         }
     }
 
+    fn project_search_folder_path(&self) -> PathBuf {
+        self.project.root.join(CONFIG_DIR).join("searches")
+    }
+
+    fn default_search_folder_path(&self) -> PathBuf {
+        user_search_dir().unwrap_or_else(|| self.project_search_folder_path())
+    }
+
+    fn default_search_folder_input(&self) -> String {
+        if user_search_dir().is_some() {
+            format!("~/{}/{}", USER_DIR, USER_SEARCHES_SUBDIR)
+        } else {
+            self.default_search_folder_path()
+                .to_string_lossy()
+                .to_string()
+        }
+    }
+
     fn project_schema_folder_path(&self) -> PathBuf {
         self.project.root.join(CONFIG_DIR).join("schemas")
     }
@@ -8739,6 +8863,20 @@ impl AppState {
 
     fn filter_folder_from_input(&self, input: &str) -> PathBuf {
         self.folder_from_input(input, Self::default_filter_folder_path)
+    }
+
+    fn search_folder_from_input(&self, input: &str) -> PathBuf {
+        self.folder_from_input(input, Self::default_search_folder_path)
+    }
+
+    fn install_default_search_library_if_default(
+        &self,
+        folder: &Path,
+    ) -> Result<usize, Option<io::Error>> {
+        if folder != self.default_search_folder_path() {
+            return Err(None);
+        }
+        install_default_search_library(folder).map_err(Some)
     }
 
     /// `~` expands, an absolute path is taken as-is, and a relative one resolves inside
@@ -9942,6 +10080,7 @@ Filter/search
   b timeline histogram: cycle off / by level / by module / by source; drag across its
     bars to build a time-range filter (a click zooms to one bucket)
   x export filters  L import filters
+  Saved-search library import/export is in the command palette (Ctrl+P or :)
   X export schemas  I import schemas (merges; existing names are kept)
   E export selected lines, bookmarks, filters, and latest AI summary as Markdown
   Time range picker presets count back from the newest entry, not from now
@@ -13918,6 +14057,37 @@ mod tests {
             app.project.saved_searches.contains(&"queued 4".to_string()),
             "{:?}",
             app.project.saved_searches
+        );
+    }
+
+    #[test]
+    fn saved_search_library_exports_imports_and_is_in_the_palette() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        app.project.saved_searches = vec!["level=Error".to_string(), "queued 4".to_string()];
+
+        assert_eq!(app.default_search_folder_input(), "~/.log-scouter/searches");
+        assert!(app.palette_commands().contains(&Command::ImportSearches));
+        assert!(app.palette_commands().contains(&Command::ExportSearches));
+
+        let folder = tmp.path().join("search-library");
+        app.submit_export_searches(folder.to_string_lossy().to_string());
+        assert_eq!(
+            app.status,
+            format!("exported 2 saved search(es) to {}", folder.display())
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let mut target = app_with_lines(other.path(), 5);
+        target.submit_import_searches(folder.to_string_lossy().to_string());
+        assert_eq!(
+            target.project.saved_searches,
+            vec!["level=Error".to_string(), "queued 4".to_string()]
+        );
+        assert!(
+            target.status.starts_with("loaded 2 saved search(es)"),
+            "{}",
+            target.status
         );
     }
 

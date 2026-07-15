@@ -1,7 +1,27 @@
 use crate::core::filters::contains_ignore_case;
+use crate::core::filters::{home_dir, json_file_paths, sanitize_file_component, USER_DIR};
 use crate::core::models::{LogEntry, LogFileModel};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+pub const USER_SEARCHES_SUBDIR: &str = "searches";
+
+/// `~/.log-scouter/searches`, or `None` when no home directory can be resolved.
+pub fn user_search_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(USER_DIR).join(USER_SEARCHES_SUBDIR))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFile {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub query: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -109,6 +129,113 @@ pub fn compile_query(text: &str) -> Query {
         predicates,
         error: errors.join("; "),
     }
+}
+
+pub fn default_search_library() -> Vec<SearchFile> {
+    vec![
+        SearchFile {
+            name: "Authentication failures".to_string(),
+            description: "Login, token, authorization and HTTP 401/403 failures.".to_string(),
+            query: r#"/auth|login|signin|token|oauth|saml|ldap/ /fail(ed|ure)?|denied|invalid|unauthorized|forbidden|401|403/"#.to_string(),
+        },
+        SearchFile {
+            name: "Database connection exhaustion".to_string(),
+            description: "Database pool exhaustion, connection timeouts and max-connection pressure.".to_string(),
+            query: r#"/database|db|jdbc|sql|postgres|mysql|oracle/ /connection|pool/ /exhausted|timeout|timed[[:space:]]*out|max(ed)?[[:space:]]*out|too[[:space:]]+many|refused/"#.to_string(),
+        },
+        SearchFile {
+            name: "Kubernetes restart patterns".to_string(),
+            description: "Pod/container restarts, CrashLoopBackOff, OOM kills and probe failures.".to_string(),
+            query: r#"/kubernetes|k8s|pod|container|kubelet/ /restart|restarted|crashloopbackoff|oomkilled|back-off|liveness|readiness/"#.to_string(),
+        },
+        SearchFile {
+            name: "Java exception chains".to_string(),
+            description: "Java stack traces, exceptions and caused-by chains.".to_string(),
+            query: r#"/exception|caused[[:space:]]+by|stacktrace|java[.]|javax[.]|org[.]springframework/"#.to_string(),
+        },
+        SearchFile {
+            name: "Request-ID tracing".to_string(),
+            description: "Request, trace, correlation and span identifiers.".to_string(),
+            query: r#"/request[-_]?id|trace[-_]?id|correlation[-_]?id|x-request-id|span[-_]?id/"#.to_string(),
+        },
+    ]
+}
+
+pub fn install_default_search_library(folder: &Path) -> io::Result<usize> {
+    fs::create_dir_all(folder)?;
+    let mut written = 0;
+    for (index, search) in default_search_library().into_iter().enumerate() {
+        let path = folder.join(format!(
+            "{:03}-{}.json",
+            index + 1,
+            sanitize_file_component(&search.name)
+        ));
+        if path.exists() {
+            continue;
+        }
+        let body = serde_json::to_string_pretty(&search).map_err(io::Error::other)?;
+        fs::write(path, body)?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+pub fn export_searches_to_folder(searches: &[String], folder: &Path) -> io::Result<usize> {
+    fs::create_dir_all(folder)?;
+    for (index, query) in searches.iter().enumerate() {
+        let name = search_file_name(index + 1, query);
+        let search_file = SearchFile {
+            name: name.clone(),
+            description: String::new(),
+            query: query.clone(),
+        };
+        let path = folder.join(format!(
+            "{:03}-{}.json",
+            index + 1,
+            sanitize_file_component(&name)
+        ));
+        let body = serde_json::to_string_pretty(&search_file).map_err(io::Error::other)?;
+        fs::write(path, body)?;
+    }
+    Ok(searches.len())
+}
+
+pub fn load_searches_from_folder(folder: &Path) -> io::Result<Vec<SearchFile>> {
+    let mut paths = json_file_paths(folder)?;
+    paths.sort();
+
+    let mut searches = Vec::new();
+    for path in paths {
+        let body = fs::read_to_string(&path)?;
+        let search_file = parse_search_file(&body).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {error}", path.display()),
+            )
+        })?;
+        searches.push(search_file);
+    }
+    Ok(searches)
+}
+
+fn parse_search_file(body: &str) -> Result<SearchFile, serde_json::Error> {
+    serde_json::from_str::<SearchFile>(body).or_else(|_| {
+        let query = serde_json::from_str::<String>(body)?;
+        Ok(SearchFile {
+            name: search_file_name(1, &query),
+            description: String::new(),
+            query,
+        })
+    })
+}
+
+fn search_file_name(index: usize, query: &str) -> String {
+    let value = if query.chars().count() > 64 {
+        format!("{}...", query.chars().take(64).collect::<String>())
+    } else {
+        query.to_string()
+    };
+    format!("search-{index:03}-{value}")
 }
 
 pub fn parse_datetime(text: &str) -> Option<NaiveDateTime> {

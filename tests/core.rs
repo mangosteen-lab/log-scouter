@@ -11,7 +11,11 @@ use log_scouter::core::filters::{
 };
 use log_scouter::core::models::{merge_files, LogFileModel, ViewModel, VisibleIndices};
 use log_scouter::core::project::{text_files_in_dir, Bookmark, Project};
-use log_scouter::core::search::{compile_query, parse_datetime};
+use log_scouter::core::search::{
+    compile_query, default_search_library, export_searches_to_folder,
+    install_default_search_library, load_searches_from_folder, parse_datetime, user_search_dir,
+    USER_SEARCHES_SUBDIR,
+};
 use std::path::PathBuf;
 
 const SAMPLE: &str = include_str!("../fixtures/sample.log");
@@ -916,6 +920,71 @@ fn user_filter_dir_is_under_home() {
     let home = std::env::var("HOME").expect("HOME is set in this environment");
     let dir = user_filter_dir().expect("HOME is set, so a user filter dir exists");
     assert_eq!(dir, PathBuf::from(&home).join(".log-scouter/filters"));
+}
+
+#[test]
+fn user_search_dir_is_under_home() {
+    let home = std::env::var("HOME").expect("HOME is set in this environment");
+    let dir = user_search_dir().expect("HOME is set, so a user search dir exists");
+    assert_eq!(
+        dir,
+        PathBuf::from(&home).join(format!(".log-scouter/{USER_SEARCHES_SUBDIR}"))
+    );
+}
+
+#[test]
+fn saved_searches_export_load_and_default_queries_compile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("searches");
+    let searches = vec![
+        "level=Error".to_string(),
+        r#"/request[-_]?id|trace[-_]?id/"#.to_string(),
+    ];
+
+    assert_eq!(export_searches_to_folder(&searches, &folder).unwrap(), 2);
+    let loaded = load_searches_from_folder(&folder).unwrap();
+    assert_eq!(
+        loaded
+            .iter()
+            .map(|search| search.query.as_str())
+            .collect::<Vec<_>>(),
+        vec!["level=Error", r#"/request[-_]?id|trace[-_]?id/"#]
+    );
+
+    let defaults = default_search_library();
+    assert!(defaults
+        .iter()
+        .any(|search| search.name == "Authentication failures"));
+    assert!(defaults
+        .iter()
+        .any(|search| search.name == "Database connection exhaustion"));
+    assert!(defaults
+        .iter()
+        .any(|search| search.name == "Kubernetes restart patterns"));
+    assert!(defaults
+        .iter()
+        .any(|search| search.name == "Java exception chains"));
+    assert!(defaults
+        .iter()
+        .any(|search| search.name == "Request-ID tracing"));
+    for search in defaults {
+        let query = compile_query(&search.query);
+        assert!(
+            query.error.is_empty(),
+            "{} did not compile: {}",
+            search.name,
+            query.error
+        );
+    }
+
+    let defaults_dir = tmp.path().join("defaults");
+    assert_eq!(install_default_search_library(&defaults_dir).unwrap(), 5);
+    assert_eq!(
+        install_default_search_library(&defaults_dir).unwrap(),
+        0,
+        "installing defaults is idempotent"
+    );
+    assert_eq!(load_searches_from_folder(&defaults_dir).unwrap().len(), 5);
 }
 
 #[test]
