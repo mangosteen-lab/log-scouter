@@ -1822,7 +1822,11 @@ struct LoadJob {
 }
 
 enum LiveEvent {
-    Line(String),
+    /// A physical line off one of the child's pipes, plus the stream tag that pipe carries
+    /// (`[logscout stderr] ` for stderr, empty for stdout). The tag is applied later, in
+    /// `drain_live_events`, where the schema is known -- so it can land only on lines that
+    /// start an entry and leave continuation lines clean.
+    Line { text: String, prefix: &'static str },
     Closed,
 }
 
@@ -1850,6 +1854,31 @@ struct RecomputeJob {
     stage: Stage,
 }
 
+/// Tag a live line with its stream prefix, but only when the line *starts* a new entry.
+///
+/// stderr lines arrive tagged `[logscout stderr] ` so a merged live stream can tell the
+/// two pipes apart, and a schema's `entry_start` is written expecting that tag on the
+/// header line. Continuation lines -- the wrapped remainder of a multi-line message like a
+/// PostgreSQL `statement:` -- gain nothing from it and only read as noise, so they are
+/// left clean. The test is `is_start` on the *prefixed* candidate: a header keeps the tag
+/// (and still matches `entry_start`), a continuation drops it. stdout carries no prefix
+/// and is returned untouched; with no schema every line is treated as a start, preserving
+/// the old always-prefix behaviour.
+fn apply_live_prefix(text: String, prefix: &'static str, extractor: Option<&Extractor>) -> String {
+    if prefix.is_empty() {
+        return text;
+    }
+    let prefixed = format!("{prefix}{text}");
+    let starts_entry = extractor
+        .map(|extractor| extractor.is_start(&prefixed))
+        .unwrap_or(true);
+    if starts_entry {
+        prefixed
+    } else {
+        text
+    }
+}
+
 fn spawn_live_pipe_reader<R>(reader: R, tx: Sender<LiveEvent>, prefix: &'static str)
 where
     R: Read + Send + 'static,
@@ -1857,20 +1886,16 @@ where
     thread::spawn(move || {
         for line in io::BufReader::new(reader).lines() {
             match line {
-                Ok(line) => {
-                    let raw = if prefix.is_empty() {
-                        line
-                    } else {
-                        format!("{prefix}{line}")
-                    };
-                    if tx.send(LiveEvent::Line(raw)).is_err() {
+                Ok(text) => {
+                    if tx.send(LiveEvent::Line { text, prefix }).is_err() {
                         break;
                     }
                 }
                 Err(error) => {
-                    let _ = tx.send(LiveEvent::Line(format!(
-                        "[logscout stream read error] {error}"
-                    )));
+                    let _ = tx.send(LiveEvent::Line {
+                        text: format!("[logscout stream read error] {error}"),
+                        prefix: "",
+                    });
                     break;
                 }
             }
@@ -2446,17 +2471,17 @@ impl AppState {
                 .map(|runtime| runtime.rx.try_iter().collect())
                 .unwrap_or_default();
             let mut closed_pipes = 0usize;
-            let mut lines = Vec::new();
+            let mut raw_lines: Vec<(String, &'static str)> = Vec::new();
             for event in events {
                 match event {
-                    LiveEvent::Line(line) => lines.push(line),
+                    LiveEvent::Line { text, prefix } => raw_lines.push((text, prefix)),
                     LiveEvent::Closed => closed_pipes += 1,
                 }
             }
             if let Some(runtime) = self.live_sources.get_mut(&file_id) {
                 runtime.open_pipes = runtime.open_pipes.saturating_sub(closed_pipes);
             }
-            if lines.is_empty() {
+            if raw_lines.is_empty() {
                 continue;
             }
 
@@ -2468,6 +2493,11 @@ impl AppState {
                 self.live_sources.remove(&file_id);
                 continue;
             };
+
+            let lines: Vec<String> = raw_lines
+                .into_iter()
+                .map(|(text, prefix)| apply_live_prefix(text, prefix, extractor.as_ref()))
+                .collect();
 
             let mut append_error = None;
             if let Some(parent) = path.parent() {
@@ -9831,17 +9861,37 @@ impl AppState {
         match event.result {
             Err(error) => self.status = format!("schema inference failed: {error}"),
             Ok(assistant) => match parse_inferred_schema(&assistant.text) {
-                Ok(extractor) => {
+                Ok(mut extractor) => {
+                    let note = self.repair_inferred_schema(&file_id, &mut extractor);
                     let name = extractor.name.clone();
                     if let Err(error) = self.project.add_extractor(extractor) {
                         self.status = format!("the AI's schema did not compile: {error}");
                     } else {
                         self.apply_schema_to_file(&file_id, &name);
+                        if let Some(note) = note {
+                            self.status = format!("applied '{name}' -- {note}");
+                        }
                     }
                 }
                 Err(error) => self.status = format!("could not use the AI's schema: {error}"),
             },
         }
+    }
+
+    /// Repair the most common slip in an inferred schema: an explicit `entry_start` regex
+    /// that matches none of the file's header lines. The LLM produced `^\S+ \[HOST:` for a
+    /// `2026-06-12 10:17:44.944 [HOST:...]` line, but `\S+` stops at the space inside the
+    /// timestamp, so the regex matches nothing -- and a start regex that matches nothing
+    /// makes every line a continuation, folding the whole file into a single entry.
+    ///
+    /// If dropping the bad `entry_start` lets the format's own derived header probe group
+    /// the lines (for the case above, `^(.+?) \[HOST:`, whose `.+?` spans the space), drop
+    /// it. Returns a note when it changed something, or a warning when the schema still
+    /// collapses the sample so the user knows to edit it.
+    fn repair_inferred_schema(&self, file_id: &str, extractor: &mut Extractor) -> Option<String> {
+        let path = self.project.get_file(file_id).map(|file| file.path.clone())?;
+        let lines = crate::core::parser::read_first_lines(&path, SCHEMA_INFER_SAMPLE_LINES).ok()?;
+        repair_entry_start(extractor, &lines)
     }
 
     fn open_schema_input_for(&mut self, file_id: &str) {
@@ -11667,6 +11717,40 @@ fn schema_infer_prompt() -> String {
         .to_string()
 }
 
+/// Repair a schema whose `entry_start` matches none of `lines`, given the sample lines.
+/// A start regex that matches nothing makes every line a continuation, so the whole file
+/// folds into a single entry -- the "it matched all of the file as one record" symptom.
+/// When clearing the bad `entry_start` lets the format's own derived header probe group the
+/// lines, clear it and say so; otherwise warn. Pure, so the decision is unit-tested apart
+/// from the file I/O in `repair_inferred_schema`.
+fn repair_entry_start(extractor: &mut Extractor, lines: &[String]) -> Option<String> {
+    let non_empty: Vec<&String> = lines.iter().filter(|line| !line.trim().is_empty()).collect();
+    if non_empty.is_empty() {
+        return None;
+    }
+
+    let groups_the_sample =
+        |candidate: &Extractor| non_empty.iter().any(|line| candidate.is_start(line));
+
+    if groups_the_sample(extractor) {
+        return None; // grouping already works
+    }
+
+    if !extractor.entry_start.trim().is_empty() {
+        let mut derived = extractor.clone();
+        derived.entry_start = String::new();
+        if derived.compile_relaxed().is_ok() && groups_the_sample(&derived) {
+            *extractor = derived;
+            return Some("adjusted its entry_start so records group correctly".to_string());
+        }
+    }
+
+    Some(
+        "warning: its entry_start matches no lines, so the file stays one entry -- press e to fix it"
+            .to_string(),
+    )
+}
+
 /// Build an `Extractor` from the LLM's JSON reply. Tolerates surrounding prose or a code
 /// fence around the object. Built directly rather than through the `name | format | …` text
 /// grammar, because a format may itself contain `|` (pipe-delimited logs), which that grammar
@@ -13332,6 +13416,99 @@ mod tests {
         assert_eq!(extractor.description, "a service log");
         let fields = extractor.extract("[2026-07-13 10:00:01][INFO] hi").unwrap();
         assert_eq!(fields.get("level").map(String::as_str), Some("INFO"));
+    }
+
+    fn postgres_live_extractor() -> Extractor {
+        let mut extractor = Extractor::with_timestamp_format(
+            "postgresql_log",
+            "[logscout stderr] <timestamp> UTC [<pid>] <level>:  <message>",
+            "%Y-%m-%d %H:%M:%S%.3f",
+        )
+        .unwrap();
+        extractor.field_patterns.insert("pid".into(), r"\d+".into());
+        extractor.field_patterns.insert("level".into(), "LOG".into());
+        extractor.entry_start =
+            r"^\[logscout stderr\] \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC \[\d+\] \w+:"
+                .into();
+        extractor.compile().unwrap();
+        extractor
+    }
+
+    #[test]
+    fn live_prefix_tags_only_entry_starts() {
+        let extractor = postgres_live_extractor();
+        let prefix = "[logscout stderr] ";
+
+        // A header line keeps the tag, so `entry_start` still recognises it.
+        let header = apply_live_prefix(
+            "2025-10-18 08:43:44.296 UTC [35] LOG:  statement: ".into(),
+            prefix,
+            Some(&extractor),
+        );
+        assert_eq!(
+            header,
+            "[logscout stderr] 2025-10-18 08:43:44.296 UTC [35] LOG:  statement: "
+        );
+        assert!(extractor.is_start(&header));
+
+        // A continuation line (the wrapped SQL) is left clean and is not a new entry.
+        let continuation =
+            apply_live_prefix("            SELECT".into(), prefix, Some(&extractor));
+        assert_eq!(continuation, "            SELECT");
+        assert!(!extractor.is_start(&continuation));
+    }
+
+    #[test]
+    fn live_prefix_leaves_stdout_untouched_and_falls_back_without_a_schema() {
+        // stdout carries no prefix: returned verbatim.
+        assert_eq!(
+            apply_live_prefix("plain stdout line".into(), "", Some(&postgres_live_extractor())),
+            "plain stdout line"
+        );
+        // No schema: every line counts as a start, so the tag is always applied (the
+        // original behaviour).
+        assert_eq!(
+            apply_live_prefix("anything".into(), "[logscout stderr] ", None),
+            "[logscout stderr] anything"
+        );
+    }
+
+    #[test]
+    fn repair_clears_an_entry_start_that_matches_nothing() {
+        // The exact SearchService slip: `\S+` stops at the space inside the timestamp, so
+        // `^\S+ \[HOST:` matches no header line and the whole file folds into one entry.
+        let format = "<timestamp> [HOST:<host>][POD:<pod>][PID:<pid>][THR:<thread>][<service>][<level>][Tenant:<tenant?>] <message>";
+        let mut extractor =
+            Extractor::with_timestamp_format("SearchService", format, "%Y-%m-%d %H:%M:%S%.3f")
+                .unwrap();
+        extractor.entry_start = r"^\S+ \[HOST:".to_string();
+        extractor.compile().unwrap();
+
+        let lines = vec![
+            "2026-06-12 10:17:44.944 [HOST:WIN-91TDYP3][POD:unknown][PID:44612][THR:main][SearchService][INFO][Tenant:] Starting".to_string(),
+            "2026-06-12 10:17:44.996 [HOST:WIN-91TDYP3][POD:unknown][PID:44612][THR:main][SearchService][INFO][Tenant:] Active profile".to_string(),
+        ];
+
+        // Before: the bad entry_start matches nothing.
+        assert!(!lines.iter().any(|l| extractor.is_start(l)));
+
+        let note = repair_entry_start(&mut extractor, &lines);
+        assert!(note.unwrap().contains("adjusted"));
+        // After: entry_start cleared, and the derived probe now groups every header line.
+        assert_eq!(extractor.entry_start, "");
+        assert!(lines.iter().all(|l| extractor.is_start(l)));
+    }
+
+    #[test]
+    fn repair_leaves_a_working_entry_start_alone() {
+        let format = "<timestamp> [<level>] <message>";
+        let mut extractor =
+            Extractor::with_timestamp_format("ok", format, "%Y-%m-%d %H:%M:%S").unwrap();
+        extractor.entry_start = r"^\d{4}-\d{2}-\d{2} ".to_string();
+        extractor.compile().unwrap();
+        let lines = vec!["2026-06-12 10:17:44 [INFO] hello".to_string()];
+        assert_eq!(repair_entry_start(&mut extractor, &lines), None);
+        assert_eq!(extractor.entry_start, r"^\d{4}-\d{2}-\d{2} ");
     }
 
     #[test]
