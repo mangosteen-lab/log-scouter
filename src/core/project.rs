@@ -39,6 +39,30 @@ pub struct Session {
     /// "horizontal" or "vertical"; anything else falls back to horizontal.
     #[serde(default)]
     pub split_mode: String,
+    // ---- Workspace layout. Stored as `hide_*` so an older session (no field) shows them. ----
+    /// Sidebar width override in columns; `None` uses the automatic width.
+    #[serde(default)]
+    pub sidebar_width: Option<u16>,
+    /// Height overrides in rows for the stacked panels.
+    #[serde(default)]
+    pub results_height: Option<u16>,
+    #[serde(default)]
+    pub detail_height: Option<u16>,
+    #[serde(default)]
+    pub chat_height: Option<u16>,
+    /// Per-pane size weights; empty or the wrong length means equal panes.
+    #[serde(default)]
+    pub pane_weights: Vec<u16>,
+    #[serde(default)]
+    pub hide_sidebar: bool,
+    #[serde(default)]
+    pub hide_detail: bool,
+    #[serde(default)]
+    pub hide_chat: bool,
+    #[serde(default)]
+    pub hide_results: bool,
+    #[serde(default)]
+    pub focus_mode: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

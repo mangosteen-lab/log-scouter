@@ -9,6 +9,7 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 
 **Contents:** [Features](#features) · [Quick Start](#quick-start) ·
 [Concept Model](#concept-model) · [Architecture](#architecture) · [Keys](#keys) ·
+[Command Palette](#command-palette) · [Filter Builder](#filter-builder) ·
 [Filters](#filters-text-and-time) · [Search](#search-query-language) ·
 [Hiding by Example](#hiding-by-example) · [AI Assistant](#ai-assistant) ·
 [Log Formats](#log-formats) · [Building from Source](#building-from-source) ·
@@ -20,8 +21,9 @@ together they explain what the app is built out of and how the pieces fit and ru
 ## Features
 
 - **Folder = project.** State persists to `<folder>/.logscouter/project.json`.
-- **Session restore.** Quitting records the panes, the logs open in each, the split
-  and the search. Reopening the folder resumes exactly there.
+- **Session restore.** Quitting records the panes, the logs open in each, the split, the
+  search, and the workspace layout (sidebar width, pane sizes, panel visibility, focus mode).
+  Reopening the folder resumes exactly there.
 - **Structured extraction.** Log format expressions use `<field>` placeholders, and
   `<field?>` for a field that is only present on some lines. A bracketed-field
   server log format is built in.
@@ -48,6 +50,9 @@ together they explain what the app is built out of and how the pieces fit and ru
   splits them into **Text** (as many as you like) and **Time** (at most one, replaced by
   each new range). Filters apply to the whole project and are saved automatically, so they
   are still in effect the next time you open the folder.
+- **Guided filter builder.** Press `f` for dropdowns (schema, field, operator, action,
+  value) with field-name and value suggestions, a live match-count preview, and validation —
+  `Tab` switches to the raw grammar and back, and `Enter` on a filter reopens it to edit.
 - **Time range picker.** Press `t` for a picker with an editable start and end plus
   quick ranges (`Last 1 hour`, `Last 24 hours`, `Last 7 days`, ...). Quick ranges
   count back from the newest entry across all loaded logs, not the current time.
@@ -81,9 +86,18 @@ together they explain what the app is built out of and how the pieces fit and ru
   `Tab` flips the menu to **keep only**, building `include` rules instead. Select several
   similar lines and `H` offers a ladder of templates from greedy to strict, each with the
   rows it would remove, again with `Tab` to keep-only.
+- **Command palette.** `Ctrl+P` or `:` opens a searchable, context-aware action list — type
+  to filter, `Enter` runs it — so the rich feature set is discoverable without leaving the
+  keyboard. Every action still has its own key.
 - **Vim-style navigation.** Supports `j/k`, `gg`, `G`, `[count]j`,
   `[count]G`, paging, and horizontal scroll.
 - **Split panes.** Use `|` for columns and `-` for rows.
+- **Resizable, collapsible workspace.** `[`/`]` resize the sidebar and `Ctrl+Arrow` resizes
+  the focused pane along the split — or drag any separator with the mouse: the sidebar
+  border, the border between panes (widths/heights), or a panel's top border to set the
+  height of the results, detail, or chat panel. `z` is a focus mode showing only the active
+  pane, and the sidebar/detail/results/chat panels toggle from the palette. Sizes and
+  visibility are saved with the session.
 - **AI assistant.** Press `A` for a chat panel that troubleshoots the logs for you — it
   inspects the sources and drives filters, searches, and time ranges through the same
   operations you would, iterating until the issue is understood. Works with OpenAI,
@@ -289,6 +303,7 @@ filters, saved searches, settings, last session), with user-level libraries unde
 
 | Key | Action |
 |---|---|
+| `Ctrl+P` / `:` | open the searchable, context-aware command palette |
 | `a` / `o` | browse for a file to add / browse for a folder |
 | `d` / `Delete` | delete the selected item: a log source, a filter, or a saved search |
 | `j k` or arrows | move selection |
@@ -302,7 +317,7 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `Space` (pane) | add/remove the current line from the selection |
 | `y` / right-click | copy selected raw lines (cursor line if nothing selected) |
 | `Esc` | clear the selection, then the search |
-| `f` / `t` / `F` | add filter / open the time range picker / clear filters |
+| `f` / `t` / `F` | guided filter builder / open the time range picker / clear filters |
 | `T` | measure elapsed time from the current line (again to turn off) |
 | `x` / `L` | export filters / import filters from a folder |
 | `X` / `I` | export log schemas / import log schemas from a folder |
@@ -322,6 +337,9 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `i` | infer the focused file's log format with the configured LLM, and apply it |
 | `r` | label the focused source (`short label \| description`, shown in Detail and given to the AI) |
 | `|` / `-` / `w` | split columns / split rows / close pane |
+| `[` / `]` | narrow / widen the sidebar (or drag its separator) |
+| `Ctrl+←/→`, `Ctrl+↑/↓` | resize the focused pane (or drag the border between panes) |
+| `z` | focus mode — show only the active pane |
 | `A` | open the AI chat panel (Enter to send, Esc to cancel/leave) |
 | `Tab` / `Shift+Tab` | cycle sidebar, panes, and search results |
 | `Enter` (pane) | open a larger detail popup for the selected log row |
@@ -333,6 +351,35 @@ view of the thing under the cursor*. In the sidebar those detail views are edita
 the log format for a source, the rule for a filter, the query for a saved search.
 A star in the sidebar marks what is currently selected — the logs feeding the pane,
 the enabled filters, the running search.
+
+## Command Palette
+
+Don't remember the key? Press `Ctrl+P` or `:` for a searchable list of actions, filtered as
+you type and dispatched with `Enter` (`Esc` closes it, `↑`/`↓` or `Ctrl+p`/`Ctrl+n` move):
+
+```text
+┌Command───────────────────────────────────────────┐
+│> filter                                           │
+│                                                   │
+│> Add text filter                                 f│
+│  Clear all filters                               F│
+│  Import filter pack                              L│
+│  Export filter pack                              x│
+└───────────────────────────────────────────────────┘
+```
+
+The list is **context-aware** — it leads with what makes sense for what's focused, then the
+general actions:
+
+- **On a log line:** copy, hide/keep similar, mark elapsed time, show detail, ask AI.
+- **On a source:** open, add to view (merge), change schema, infer schema with AI, label,
+  delete.
+- **On a filter or search:** enable/disable, edit, delete.
+- **On a pane:** split into columns or rows, close.
+
+Each row shows the key that also runs it, so the palette doubles as a way to learn the
+shortcuts. Under the hood the palette and the keys share one dispatcher (an internal
+`Command` enum), so an action behaves identically however you reach it.
 
 ## Filters: Text and Time
 
@@ -362,15 +409,40 @@ stays inside a day, `06-16 23:00:00 → 06-17 01:00:00` when it does not, `from 
 `until …` for an open end, and the span in brackets. The detail panel below spells out the
 full start, end and span.
 
-## Filter Input
+## Filter Builder
 
-Press `f` and enter:
+Press `f` for a guided builder — no grammar to remember. `↑`/`↓` pick a row, `←`/`→` cycle a
+dropdown or step through suggestions, and you type to edit the field or value. A live preview
+counts how much it would remove before you commit, and validates as you go:
+
+```text
+┌Filter Builder────────────────────────────────────┐
+│Scope     Project                                  │
+│                                                   │
+│  Schema    Any                                  ◀ ▶│
+│  Field     log_level                            ◀ ▶│
+│  Operator  equals                               ◀ ▶│
+│  Action    Exclude                              ◀ ▶│
+│> Value     Trace                                  │
+│                                                   │
+│Preview: hides 903 of 8,201 shown lines            │
+│↑↓ row   ←→ change   type to edit   Tab raw   Enter │
+└───────────────────────────────────────────────────┘
+```
+
+- **Field** cycles the active schema's field names (`←`/`→`) or you can type one.
+- **Value** cycles the field's frequent values in view, or you type freely.
+- **Operator** is `equals`, `contains`, `regex`, or `range`; **Action** is exclude or include.
+- **Preview** reuses the hide-pattern match counter — it says *hides N of M* (or *keeps* for an
+  include rule), with sample lines, and shows a red error for, say, an invalid regex.
+- **`Tab`** switches to the **raw grammar** editor (below) and back, losslessly.
+- **`Enter`** on a sidebar filter reopens the builder on that rule to edit it in place.
+
+The raw grammar, reachable with `Tab`, is still there when you want it:
 
 ```text
 [schema="<format name>"] field op [include|exclude] value
 ```
-
-Examples:
 
 ```text
 level equals exclude Trace

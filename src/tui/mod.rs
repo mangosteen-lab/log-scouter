@@ -56,6 +56,43 @@ struct PaneState {
     view: ViewModel,
 }
 
+/// The adjustable workspace layout: panel visibility, sidebar width, per-pane size weights,
+/// and focus mode. Saved with the session so a folder reopens the way you left it.
+#[derive(Debug, Clone)]
+struct Workspace {
+    /// Sidebar width override in columns; `None` uses the automatic width.
+    sidebar_width: Option<u16>,
+    /// Height overrides in rows for the stacked panels; `None` uses the automatic height.
+    results_height: Option<u16>,
+    detail_height: Option<u16>,
+    chat_height: Option<u16>,
+    /// Per-pane size weights; a wrong length is reset to equal weights on demand.
+    pane_weights: Vec<u16>,
+    show_sidebar: bool,
+    show_detail: bool,
+    show_chat: bool,
+    show_results: bool,
+    /// Show only the active log pane, hiding the sidebar, results, and other panes.
+    focus_mode: bool,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            sidebar_width: None,
+            results_height: None,
+            detail_height: None,
+            chat_height: None,
+            pane_weights: Vec::new(),
+            show_sidebar: true,
+            show_detail: true,
+            show_chat: true,
+            show_results: true,
+            focus_mode: false,
+        }
+    }
+}
+
 /// One rendered line in the chat transcript.
 #[derive(Debug, Clone)]
 enum ChatLine {
@@ -151,7 +188,7 @@ const PATTERN_PREVIEW_LIMIT: usize = 50_000;
 const PATTERN_PREVIEW_SAMPLES: usize = 2;
 
 /// What a candidate hide pattern would do to the rows on screen.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PatternPreview {
     matched: usize,
     scanned: usize,
@@ -296,6 +333,94 @@ impl PatternPrompt {
     }
 }
 
+/// The guided filter builder's state: one editable value per row, plus the suggestion pools
+/// and the live preview the drawer shows.
+#[derive(Debug, Clone)]
+struct FilterBuilder {
+    /// `Some(i)` edits `project.filters.rules[i]`; `None` adds a new rule.
+    edit_index: Option<usize>,
+    /// Schema scope: `None` is "Any", else a schema name.
+    schema: Option<String>,
+    field: String,
+    /// Index into `crate::core::filters::OPS`.
+    op: usize,
+    exclude: bool,
+    value: String,
+    /// The focused row, `0..ROWS`.
+    row: usize,
+    /// Schema names to cycle among (after "Any").
+    schemas: Vec<String>,
+    /// Field-name suggestions from the active schema, for the field row.
+    fields: Vec<String>,
+    /// Frequent values of the current field in the view, for the value row.
+    values: Vec<String>,
+    preview: PatternPreview,
+    error: Option<String>,
+}
+
+impl FilterBuilder {
+    const ROWS: usize = 5;
+    const SCHEMA: usize = 0;
+    const FIELD: usize = 1;
+    const OP: usize = 2;
+    const ACTION: usize = 3;
+    const VALUE: usize = 4;
+
+    fn op_name(&self) -> &'static str {
+        crate::core::filters::OPS
+            .get(self.op)
+            .copied()
+            .unwrap_or("equals")
+    }
+
+    fn action_name(&self) -> &'static str {
+        if self.exclude {
+            "exclude"
+        } else {
+            "include"
+        }
+    }
+
+    fn schema_label(&self) -> String {
+        self.schema.clone().unwrap_or_else(|| "Any".to_string())
+    }
+
+    /// Build a rule from the current fields, or an error naming what is missing/invalid.
+    fn rule(&self) -> Result<FilterRule, String> {
+        let field = self.field.trim();
+        if field.is_empty() {
+            return Err("choose a field".to_string());
+        }
+        let value = self.value.trim();
+        if value.is_empty() {
+            return Err("value cannot be empty".to_string());
+        }
+        if self.op_name() == "regex" {
+            regex::Regex::new(value).map_err(|error| one_line(&error.to_string()))?;
+        }
+        let mut rule = FilterRule::new(field, self.op_name(), value, self.action_name());
+        if let Some(schema) = self.schema.as_ref() {
+            rule = rule.for_log_schema(schema.clone());
+        }
+        Ok(rule)
+    }
+
+    /// The equivalent raw-grammar text, for switching to the raw editor.
+    fn to_input(&self) -> String {
+        let field = if self.field.trim().is_empty() {
+            "field"
+        } else {
+            self.field.trim()
+        };
+        let mut rule =
+            FilterRule::new(field, self.op_name(), self.value.trim(), self.action_name());
+        if let Some(schema) = self.schema.as_ref() {
+            rule = rule.for_log_schema(schema.clone());
+        }
+        rule.to_input()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Mode {
     Normal,
@@ -336,6 +461,156 @@ enum Mode {
         scroll: usize,
     },
     Help,
+    /// The command palette (`Ctrl+P` / `:`): a searchable, context-aware action list.
+    Palette(Palette),
+    /// The guided filter builder (`f`): dropdowns for schema/field/op/action/value with a
+    /// live match-count preview, an alternative to the raw filter grammar.
+    FilterBuilder(FilterBuilder),
+}
+
+/// A user action the palette can run. Both the palette and the keyboard funnel through
+/// `AppState::dispatch_command`, so the behaviour of each action lives in one place. Every
+/// variant maps to an existing operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Search,
+    AddFilter,
+    ClearFilters,
+    TimeRange,
+    ImportFilters,
+    ExportFilters,
+    AskAi,
+    Copy,
+    HideSimilar,
+    MarkElapsed,
+    ShowDetail,
+    OpenSource,
+    MergeSource,
+    ChangeSchema,
+    InferSchema,
+    LabelSource,
+    DeleteSelected,
+    EditItem,
+    ToggleItem,
+    SplitColumns,
+    SplitRows,
+    ClosePane,
+    FocusMode,
+    ToggleSidebar,
+    ToggleDetail,
+    ToggleResults,
+    ToggleChat,
+    AddFileBrowse,
+    OpenFolder,
+    Help,
+}
+
+impl Command {
+    /// The label shown in the palette.
+    fn label(self) -> &'static str {
+        match self {
+            Command::Search => "Search",
+            Command::AddFilter => "Add text filter",
+            Command::ClearFilters => "Clear all filters",
+            Command::TimeRange => "Set time range",
+            Command::ImportFilters => "Import filter pack",
+            Command::ExportFilters => "Export filter pack",
+            Command::AskAi => "Ask AI to help",
+            Command::Copy => "Copy selection",
+            Command::HideSimilar => "Hide / keep similar lines",
+            Command::MarkElapsed => "Mark elapsed time from here",
+            Command::ShowDetail => "Show line detail",
+            Command::OpenSource => "Open this source",
+            Command::MergeSource => "Add source to view (merge)",
+            Command::ChangeSchema => "Change schema",
+            Command::InferSchema => "Infer schema with AI",
+            Command::LabelSource => "Label this source",
+            Command::DeleteSelected => "Delete selected",
+            Command::EditItem => "Edit",
+            Command::ToggleItem => "Enable / disable",
+            Command::SplitColumns => "Split into columns",
+            Command::SplitRows => "Split into rows",
+            Command::ClosePane => "Close pane",
+            Command::FocusMode => "Focus mode (only the active pane)",
+            Command::ToggleSidebar => "Toggle sidebar",
+            Command::ToggleDetail => "Toggle detail panel",
+            Command::ToggleResults => "Toggle results panel",
+            Command::ToggleChat => "Toggle chat panel",
+            Command::AddFileBrowse => "Add a log file",
+            Command::OpenFolder => "Open a folder",
+            Command::Help => "Help",
+        }
+    }
+
+    /// The key that also runs this action, shown on the right (empty when there is none).
+    fn key_hint(self) -> &'static str {
+        match self {
+            Command::Search => "/",
+            Command::AddFilter => "f",
+            Command::ClearFilters => "F",
+            Command::TimeRange => "t",
+            Command::ImportFilters => "L",
+            Command::ExportFilters => "x",
+            Command::AskAi => "A",
+            Command::Copy => "y",
+            Command::HideSimilar => "H",
+            Command::MarkElapsed => "T",
+            Command::ShowDetail => "Enter",
+            Command::OpenSource => "",
+            Command::MergeSource => "Space",
+            Command::ChangeSchema => "e",
+            Command::InferSchema => "i",
+            Command::LabelSource => "r",
+            Command::DeleteSelected => "d",
+            Command::EditItem => "Enter",
+            Command::ToggleItem => "Space",
+            Command::SplitColumns => "|",
+            Command::SplitRows => "-",
+            Command::ClosePane => "w",
+            Command::FocusMode => "z",
+            Command::ToggleSidebar => "",
+            Command::ToggleDetail => "",
+            Command::ToggleResults => "",
+            Command::ToggleChat => "",
+            Command::AddFileBrowse => "a",
+            Command::OpenFolder => "o",
+            Command::Help => "?",
+        }
+    }
+}
+
+/// The command palette's state: the query typed so far, the context's command list, and the
+/// cursor into the filtered view.
+#[derive(Debug, Clone)]
+struct Palette {
+    query: String,
+    commands: Vec<Command>,
+    selected: usize,
+}
+
+impl Palette {
+    fn new(commands: Vec<Command>) -> Self {
+        Self {
+            query: String::new(),
+            commands,
+            selected: 0,
+        }
+    }
+
+    /// The commands matching the query (case-insensitive substring on the label).
+    fn filtered(&self) -> Vec<Command> {
+        let query = self.query.trim().to_lowercase();
+        self.commands
+            .iter()
+            .copied()
+            .filter(|command| query.is_empty() || command.label().to_lowercase().contains(&query))
+            .collect()
+    }
+
+    fn clamp(&mut self) {
+        let count = self.filtered().len();
+        self.selected = self.selected.min(count.saturating_sub(1));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -699,6 +974,39 @@ enum MouseDrag {
         surface: DetailSurface,
         anchor: usize,
     },
+    /// Dragging the sidebar/pane separator to resize the sidebar.
+    Sidebar,
+    /// Dragging the border between pane `boundary` and `boundary + 1` to reweight them.
+    PaneSeparator {
+        boundary: usize,
+    },
+    /// Dragging a panel's top border to resize its height. `bottom` is the fixed lower edge,
+    /// so the new height is `bottom - drag_row`.
+    PanelHeight {
+        panel: PanelEdge,
+        bottom: u16,
+    },
+}
+
+/// A stacked panel whose height can be dragged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelEdge {
+    Results,
+    Detail,
+    Chat,
+}
+
+/// A draggable horizontal border above a panel, recorded each frame for hit-testing.
+#[derive(Debug, Clone, Copy)]
+struct PanelSeparator {
+    panel: PanelEdge,
+    /// The border row.
+    top: u16,
+    /// The fixed bottom edge; a drag to row `r` sets the height to `bottom - r`.
+    bottom: u16,
+    /// The horizontal span the border occupies (`x0..x1`).
+    x0: u16,
+    x1: u16,
 }
 
 /// The line every other line's time is measured from, set with `T`.
@@ -933,6 +1241,18 @@ struct AppState {
     ai: Option<AiChat>,
     /// A pending AI schema-inference request, created lazily on first use (`i`).
     ai_schema: Option<SchemaInfer>,
+    /// Panel visibility, sidebar width, pane weights, and focus mode.
+    workspace: Workspace,
+    /// The x of the sidebar/pane separator this frame, for the draggable border. `None` when
+    /// the sidebar is hidden.
+    separator_x: Option<u16>,
+    /// The body area (between header and status) from the last frame, so `[`/`]` and a
+    /// separator drag can resize from the current geometry.
+    body_area: Rect,
+    /// The outer rect of each pane this frame, for dragging the borders between panes.
+    pane_layout: Vec<Rect>,
+    /// Draggable panel top-borders (results, detail, chat) recorded this frame.
+    panel_separators: Vec<PanelSeparator>,
 }
 
 impl AppState {
@@ -966,6 +1286,11 @@ impl AppState {
             pending_merges: Vec::new(),
             ai: None,
             ai_schema: None,
+            workspace: Workspace::default(),
+            separator_x: None,
+            body_area: Rect::default(),
+            pane_layout: Vec::new(),
+            panel_separators: Vec::new(),
         };
         app.restore_session();
         app
@@ -980,6 +1305,18 @@ impl AppState {
         self.split_mode = match session.split_mode.as_str() {
             "vertical" => SplitMode::Vertical,
             _ => SplitMode::Horizontal,
+        };
+        self.workspace = Workspace {
+            sidebar_width: session.sidebar_width,
+            results_height: session.results_height,
+            detail_height: session.detail_height,
+            chat_height: session.chat_height,
+            pane_weights: session.pane_weights.clone(),
+            show_sidebar: !session.hide_sidebar,
+            show_detail: !session.hide_detail,
+            show_chat: !session.hide_chat,
+            show_results: !session.hide_results,
+            focus_mode: session.focus_mode,
         };
 
         for pane_session in &session.panes {
@@ -1052,6 +1389,16 @@ impl AppState {
                 SplitMode::Horizontal => "horizontal".to_string(),
                 SplitMode::Vertical => "vertical".to_string(),
             },
+            sidebar_width: self.workspace.sidebar_width,
+            results_height: self.workspace.results_height,
+            detail_height: self.workspace.detail_height,
+            chat_height: self.workspace.chat_height,
+            pane_weights: self.workspace.pane_weights.clone(),
+            hide_sidebar: !self.workspace.show_sidebar,
+            hide_detail: !self.workspace.show_detail,
+            hide_chat: !self.workspace.show_chat,
+            hide_results: !self.workspace.show_results,
+            focus_mode: self.workspace.focus_mode,
         });
     }
 
@@ -1458,8 +1805,16 @@ impl AppState {
 
     fn draw(&mut self, frame: &mut Frame) {
         let root = frame.area();
-        let show_results = self.search_results_visible();
-        let result_height = root.height.saturating_sub(4).clamp(3, 8);
+        let focus = self.workspace.focus_mode;
+        // Focus mode hides the results panel too; otherwise it shows when a search is running
+        // and the user has not toggled it off.
+        let show_results = self.search_results_visible() && self.workspace.show_results && !focus;
+        self.panel_separators.clear();
+        let result_height = self
+            .workspace
+            .results_height
+            .unwrap_or_else(|| root.height.saturating_sub(4).clamp(3, 8))
+            .clamp(3, root.height.saturating_sub(6));
         let constraints = if show_results {
             vec![
                 Constraint::Length(1),
@@ -1480,49 +1835,113 @@ impl AppState {
             .split(root);
 
         self.draw_header(frame, rows[0]);
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(sidebar_width(rows[1].width)),
-                Constraint::Min(1),
-            ])
-            .split(rows[1]);
-        // The chat panel, when open, takes the bottom of the left column, below the detail
-        // panel. It grows when focused so there is room to read and type.
-        let chat_height = self.chat_panel_height(body[0].height);
-        let left = if chat_height > 0 {
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(4), Constraint::Length(chat_height)])
-                .split(body[0]);
-            self.draw_chat(frame, split[1]);
-            split[0]
-        } else {
-            body[0]
-        };
+        self.body_area = rows[1];
 
-        let detail_height = detail_panel_height(left.height);
-        if detail_height > 0 {
-            let column = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(4), Constraint::Length(detail_height)])
-                .split(left);
-            self.draw_sidebar(frame, column[0]);
-            self.draw_detail(frame, column[1]);
+        // The left column (sidebar + detail + chat) is hidden in focus mode or when toggled
+        // off, giving the panes the whole width.
+        let pane_area = if self.workspace.show_sidebar && !focus {
+            let sidebar_cols = self.effective_sidebar_width(rows[1].width);
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(sidebar_cols), Constraint::Min(1)])
+                .split(rows[1]);
+            self.separator_x = Some(body[1].x);
+            self.draw_left_column(frame, body[0]);
+            body[1]
         } else {
+            self.separator_x = None;
+            self.sidebar_area = Rect::default();
             self.detail_area = Rect::default();
-            self.draw_sidebar(frame, left);
-        }
-        self.draw_panes(frame, body[1]);
+            rows[1]
+        };
+        self.draw_panes(frame, pane_area);
+
         if show_results {
+            // The border above the results panel is draggable to resize its height.
+            self.panel_separators.push(PanelSeparator {
+                panel: PanelEdge::Results,
+                top: rows[2].y,
+                bottom: rows[3].y,
+                x0: root.x,
+                x1: root.x + root.width,
+            });
             self.draw_search_results(frame, rows[2]);
             self.draw_status(frame, rows[3]);
         } else {
             self.results_area = Rect::default();
-            self.draw_status(frame, rows[2]);
+            self.draw_status(frame, rows[rows.len() - 1]);
         }
         self.draw_mode(frame, root);
         self.draw_progress(frame, root);
+    }
+
+    /// The sidebar, detail, and chat panels stacked in the left column.
+    fn draw_left_column(&mut self, frame: &mut Frame, area: Rect) {
+        // The chat panel, when open and shown, takes the bottom, below the detail panel. It
+        // grows when focused so there is room to read and type.
+        let chat_height = if self.workspace.show_chat {
+            self.chat_panel_height(area.height)
+        } else {
+            0
+        };
+        let above_chat = if chat_height > 0 {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(chat_height)])
+                .split(area);
+            // The chat panel's top border is draggable.
+            self.panel_separators.push(PanelSeparator {
+                panel: PanelEdge::Chat,
+                top: split[1].y,
+                bottom: split[1].y + split[1].height,
+                x0: area.x,
+                x1: area.x + area.width,
+            });
+            self.draw_chat(frame, split[1]);
+            split[0]
+        } else {
+            area
+        };
+
+        let detail_height = if !self.workspace.show_detail {
+            0
+        } else {
+            match self.workspace.detail_height {
+                Some(rows) => rows.min(above_chat.height.saturating_sub(4)),
+                None => detail_panel_height(above_chat.height),
+            }
+        };
+        if detail_height > 0 {
+            let column = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(4), Constraint::Length(detail_height)])
+                .split(above_chat);
+            // The detail panel's top border is draggable.
+            self.panel_separators.push(PanelSeparator {
+                panel: PanelEdge::Detail,
+                top: column[1].y,
+                bottom: column[1].y + column[1].height,
+                x0: above_chat.x,
+                x1: above_chat.x + above_chat.width,
+            });
+            self.draw_sidebar(frame, column[0]);
+            self.draw_detail(frame, column[1]);
+        } else {
+            self.detail_area = Rect::default();
+            self.draw_sidebar(frame, above_chat);
+        }
+    }
+
+    /// The sidebar width to use: the override, clamped so neither the sidebar nor the panes
+    /// starve, else the automatic width.
+    fn effective_sidebar_width(&self, body_width: u16) -> u16 {
+        match self.workspace.sidebar_width {
+            Some(cols) => cols
+                .max(MIN_SIDEBAR_WIDTH)
+                .min(body_width.saturating_sub(MIN_PANE_WIDTH))
+                .min(body_width),
+            None => sidebar_width(body_width),
+        }
     }
 
     fn draw_progress(&self, frame: &mut Frame, root: Rect) {
@@ -1688,11 +2107,13 @@ impl AppState {
         if self.ai.is_none() {
             return 0;
         }
-        let want = if self.focus == Focus::Chat {
-            column_height.saturating_sub(6)
-        } else {
-            8
-        };
+        let want = self.workspace.chat_height.unwrap_or_else(|| {
+            if self.focus == Focus::Chat {
+                column_height.saturating_sub(6)
+            } else {
+                8
+            }
+        });
         // Always leave the sidebar at least a few rows.
         want.min(column_height.saturating_sub(6))
     }
@@ -1942,18 +2363,38 @@ impl AppState {
         }
 
         let pane_count = self.panes.len();
+        self.pane_areas.clear();
+        self.pane_layout.clear();
+
+        // Focus mode shows only the active pane, filling the area.
+        if self.workspace.focus_mode {
+            let index = self.focused_pane.min(pane_count - 1);
+            self.draw_pane(frame, area, index);
+            return;
+        }
+
         let direction = match self.split_mode {
             SplitMode::Horizontal => Direction::Horizontal,
             SplitMode::Vertical => Direction::Vertical,
         };
-        let constraints: Vec<Constraint> = (0..pane_count)
-            .map(|_| Constraint::Ratio(1, pane_count as u32))
+        // Per-pane weights let one pane (short structured logs) yield space to another (long
+        // stack traces). Equal weights reproduce the old even split.
+        self.ensure_pane_weights();
+        let weights = &self.workspace.pane_weights;
+        let total: u32 = weights
+            .iter()
+            .map(|weight| *weight as u32)
+            .sum::<u32>()
+            .max(1);
+        let constraints: Vec<Constraint> = weights
+            .iter()
+            .map(|weight| Constraint::Ratio(*weight as u32, total))
             .collect();
         let areas = Layout::default()
             .direction(direction)
             .constraints(constraints)
             .split(area);
-        self.pane_areas.clear();
+        self.pane_layout = areas.to_vec();
 
         for index in 0..pane_count {
             self.draw_pane(frame, areas[index], index);
@@ -2328,6 +2769,8 @@ impl AppState {
                     area,
                 );
             }
+            Mode::Palette(palette) => self.draw_palette(frame, root, palette),
+            Mode::FilterBuilder(builder) => self.draw_filter_builder(frame, root, &builder),
         }
     }
 
@@ -2418,6 +2861,179 @@ impl AppState {
             area,
         );
         self.mode = Mode::OpenFolder(browser);
+    }
+
+    fn draw_palette(&self, frame: &mut Frame, root: Rect, palette: Palette) {
+        let filtered = palette.filtered();
+        let width = 62.min(root.width);
+        // query + blank + up to 12 rows, inside the border.
+        let rows = filtered.len().clamp(1, 12) as u16;
+        let height = (rows + 4).min(root.height.max(6));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let block = Block::default().title("Command").borders(Borders::ALL);
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("> {}", palette.query),
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(""),
+        ];
+
+        let visible = (inner.height as usize).saturating_sub(2).max(1);
+        let start = palette.selected.saturating_sub(visible.saturating_sub(1));
+        for (index, command) in filtered.iter().enumerate().skip(start).take(visible) {
+            let selected = index == palette.selected;
+            let marker = if selected { "> " } else { "  " };
+            let label = command.label();
+            let hint = command.key_hint();
+            // Right-align the key hint against the popup edge.
+            let gap = text_width
+                .saturating_sub(2 + label.chars().count() + hint.chars().count())
+                .max(1);
+            let row = format!("{marker}{label}{}{hint}", " ".repeat(gap));
+            let style = if selected {
+                Style::default().bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(crop(&row, 0, text_width), style)));
+        }
+        if filtered.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (no matching action)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+        // Caret sits in the query line, right after what has been typed.
+        let caret = (2 + palette.query.chars().count()).min(text_width.saturating_sub(1));
+        frame.set_cursor_position((inner.x + caret as u16, inner.y));
+    }
+
+    fn draw_filter_builder(&self, frame: &mut Frame, root: Rect, builder: &FilterBuilder) {
+        let width = 68.min(root.width);
+        // scope + blank + 5 rows + blank + preview + up to 2 samples + footer, inside border.
+        let height = 13u16.min(root.height.max(9));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let title = if builder.edit_index.is_some() {
+            "Edit Filter"
+        } else {
+            "Filter Builder"
+        };
+        let block = Block::default().title(title).borders(Borders::ALL);
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+        let dim = Style::default().fg(Color::DarkGray);
+
+        // The five editable rows: label, value, and whether Left/Right cycles it.
+        let rows = [
+            (
+                FilterBuilder::SCHEMA,
+                "Schema",
+                builder.schema_label(),
+                true,
+            ),
+            (FilterBuilder::FIELD, "Field", builder.field.clone(), true),
+            (
+                FilterBuilder::OP,
+                "Operator",
+                builder.op_name().to_string(),
+                true,
+            ),
+            (
+                FilterBuilder::ACTION,
+                "Action",
+                if builder.exclude {
+                    "Exclude".to_string()
+                } else {
+                    "Include".to_string()
+                },
+                true,
+            ),
+            (FilterBuilder::VALUE, "Value", builder.value.clone(), false),
+        ];
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled("Scope     Project", dim)),
+            Line::from(""),
+        ];
+        for (index, label, value, cyclable) in rows {
+            let selected = index == builder.row;
+            let marker = if selected { "> " } else { "  " };
+            let shown = if value.is_empty() {
+                "—".to_string()
+            } else {
+                value
+            };
+            let arrows = if selected && cyclable {
+                "  ◀ ▶"
+            } else {
+                ""
+            };
+            let text = format!("{marker}{label:<10}{shown}{arrows}");
+            let style = if selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(crop(&text, 0, text_width), style)));
+        }
+
+        lines.push(Line::from(""));
+        // Live validation wins over the preview; otherwise the match count.
+        match &builder.error {
+            Some(error) => lines.push(Line::from(Span::styled(
+                crop(&format!("! {error}"), 0, text_width),
+                Style::default().fg(Color::Red),
+            ))),
+            None => {
+                lines.push(Line::from(Span::styled(
+                    crop(
+                        &format!(
+                            "Preview: {}",
+                            preview_summary(&builder.preview, builder.exclude)
+                        ),
+                        0,
+                        text_width,
+                    ),
+                    Style::default().fg(Color::Green),
+                )));
+                for sample in builder.preview.samples.iter().take(2) {
+                    lines.push(Line::from(Span::styled(
+                        crop(&format!("    {sample}"), 0, text_width),
+                        dim,
+                    )));
+                }
+            }
+        }
+
+        lines.push(Line::from(Span::styled(
+            "↑↓ row   ←→ change   type to edit   Tab raw   Enter apply   Esc",
+            dim,
+        )));
+
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+
+        // Show the caret on the text rows being edited.
+        if matches!(builder.row, FilterBuilder::FIELD | FilterBuilder::VALUE) {
+            let value_len = if builder.row == FilterBuilder::FIELD {
+                builder.field.chars().count()
+            } else {
+                builder.value.chars().count()
+            };
+            let column = 2 + 10 + value_len;
+            let row_offset = 2 + builder.row; // scope + blank + row index
+            frame.set_cursor_position((
+                inner.x + (column as u16).min(inner.width.saturating_sub(1)),
+                inner.y + row_offset as u16,
+            ));
+        }
     }
 
     fn draw_time_picker(&mut self, frame: &mut Frame, root: Rect, picker: &TimePicker) {
@@ -2786,6 +3402,8 @@ impl AppState {
             Mode::Help => 4,
             Mode::TimePicker(_) => 5,
             Mode::OpenFolder(_) => 6,
+            Mode::Palette(_) => 7,
+            Mode::FilterBuilder(_) => 8,
         };
 
         match mode_kind {
@@ -2799,6 +3417,8 @@ impl AppState {
             }
             5 => self.handle_time_picker_key(key),
             6 => self.handle_folder_browser_key(key),
+            7 => self.handle_palette_key(key),
+            8 => self.handle_filter_builder_key(key),
             _ => Ok(false),
         }
     }
@@ -2850,6 +3470,24 @@ impl AppState {
     }
 
     fn begin_mouse_selection(&mut self, mouse: MouseEvent) {
+        // The sidebar/pane separator: a press here starts a resize drag.
+        if self.on_separator(mouse.column, mouse.row) {
+            self.mouse_drag = Some(MouseDrag::Sidebar);
+            return;
+        }
+        // A border between panes resizes those two panes (heights on a rows split).
+        if let Some(boundary) = self.pane_separator_at(mouse.column, mouse.row) {
+            self.mouse_drag = Some(MouseDrag::PaneSeparator { boundary });
+            return;
+        }
+        // A panel's top border resizes that panel's height (results, detail, chat).
+        if let Some(separator) = self.panel_separator_at(mouse.column, mouse.row) {
+            self.mouse_drag = Some(MouseDrag::PanelHeight {
+                panel: separator.panel,
+                bottom: separator.bottom,
+            });
+            return;
+        }
         if rect_contains(self.detail_area, mouse.column, mouse.row) {
             self.begin_detail_mouse_selection(DetailSurface::Inline, mouse);
             return;
@@ -2874,6 +3512,18 @@ impl AppState {
 
     fn drag_mouse_selection(&mut self, mouse: MouseEvent) {
         match self.mouse_drag {
+            Some(MouseDrag::Sidebar) => self.drag_sidebar_to(mouse.column),
+            Some(MouseDrag::PaneSeparator { boundary }) => {
+                self.drag_pane_separator(boundary, mouse.column, mouse.row)
+            }
+            Some(MouseDrag::PanelHeight { panel, bottom }) => {
+                let height = bottom.saturating_sub(mouse.row).clamp(2, 60);
+                match panel {
+                    PanelEdge::Results => self.workspace.results_height = Some(height),
+                    PanelEdge::Detail => self.workspace.detail_height = Some(height),
+                    PanelEdge::Chat => self.workspace.chat_height = Some(height),
+                }
+            }
             Some(MouseDrag::PaneText {
                 pane,
                 position,
@@ -3206,12 +3856,26 @@ impl AppState {
                     self.save_project();
                     return Ok(false);
                 }
+                KeyCode::Char('p') => {
+                    self.open_palette();
+                    return Ok(false);
+                }
+                // Along a vertical (stacked) split, Ctrl+Up/Down resize the focused pane;
+                // otherwise they travel while keeping the selection.
                 KeyCode::Up => {
-                    self.move_keeping_selection(-1);
+                    if self.panes.len() > 1 && self.split_mode == SplitMode::Vertical {
+                        self.resize_pane(-1);
+                    } else {
+                        self.move_keeping_selection(-1);
+                    }
                     return Ok(false);
                 }
                 KeyCode::Down => {
-                    self.move_keeping_selection(1);
+                    if self.panes.len() > 1 && self.split_mode == SplitMode::Vertical {
+                        self.resize_pane(1);
+                    } else {
+                        self.move_keeping_selection(1);
+                    }
                     return Ok(false);
                 }
                 KeyCode::PageUp => {
@@ -3238,14 +3902,20 @@ impl AppState {
                     self.move_keeping_selection(-(self.active_page_size().max(1) as isize));
                     return Ok(false);
                 }
+                // Along a horizontal (side-by-side) split, Ctrl+Left/Right resize the focused
+                // pane; otherwise they scroll it horizontally.
                 KeyCode::Right => {
-                    if let Some(view) = self.active_view_mut() {
+                    if self.panes.len() > 1 && self.split_mode == SplitMode::Horizontal {
+                        self.resize_pane(1);
+                    } else if let Some(view) = self.active_view_mut() {
                         view.scroll_x += 8;
                     }
                     return Ok(false);
                 }
                 KeyCode::Left => {
-                    if let Some(view) = self.active_view_mut() {
+                    if self.panes.len() > 1 && self.split_mode == SplitMode::Horizontal {
+                        self.resize_pane(-1);
+                    } else if let Some(view) = self.active_view_mut() {
                         view.scroll_x = view.scroll_x.saturating_sub(8);
                     }
                     return Ok(false);
@@ -3373,7 +4043,7 @@ impl AppState {
                     self.clear_search();
                 }
             }
-            KeyCode::Char('f') => self.open_input(Mode::Filter(String::new())),
+            KeyCode::Char('f') => self.open_filter_builder(None),
             KeyCode::Char('t') => self.open_time_picker(),
             KeyCode::Char('T') => self.toggle_elapsed_mark(),
             KeyCode::Char('F') => self.clear_filters(),
@@ -3397,8 +4067,12 @@ impl AppState {
             KeyCode::Char('S') => self.open_new_schema_input(),
             KeyCode::Char('|') | KeyCode::Char('\\') => self.split_active(SplitMode::Horizontal),
             KeyCode::Char('-') => self.split_active(SplitMode::Vertical),
+            KeyCode::Char('[') => self.resize_sidebar(-4),
+            KeyCode::Char(']') => self.resize_sidebar(4),
+            KeyCode::Char('z') => self.toggle_focus_mode(),
             KeyCode::Char('w') => self.close_active_pane(),
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char(':') => self.open_palette(),
             KeyCode::Char('e') => self.open_schema_input(),
             KeyCode::Char('i') => self.infer_schema_ai(),
             KeyCode::Char('r') => self.open_source_label(),
@@ -3418,12 +4092,24 @@ impl AppState {
         let caret = self.input_cursor;
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
-            // The one input popup with a direction to flip; elsewhere Tab does nothing.
-            KeyCode::Tab => {
-                if let Mode::HidePattern(prompt) = &mut self.mode {
-                    prompt.exclude = !prompt.exclude;
+            KeyCode::Tab => match &self.mode {
+                // The pattern popup flips hide/keep.
+                Mode::HidePattern(_) => {
+                    if let Mode::HidePattern(prompt) = &mut self.mode {
+                        prompt.exclude = !prompt.exclude;
+                    }
                 }
-            }
+                // The raw filter editors switch back to the guided builder.
+                Mode::Filter(text) => {
+                    let text = text.clone();
+                    self.open_filter_builder_from_text(&text, None);
+                }
+                Mode::EditFilter { index, text } => {
+                    let (index, text) = (*index, text.clone());
+                    self.open_filter_builder_from_text(&text, Some(index));
+                }
+                _ => {}
+            },
             // Up/Down step the template ladder; no input popup is multi-line, so they are
             // free everywhere else.
             KeyCode::Up | KeyCode::Down => {
@@ -4742,6 +5428,512 @@ impl AppState {
         }
     }
 
+    // ---- Command palette --------------------------------------------------------------
+
+    /// `Ctrl+P` / `:`: open the palette on the commands available in the current context.
+    fn open_palette(&mut self) {
+        self.mode = Mode::Palette(Palette::new(self.palette_commands()));
+        self.input_cursor = 0;
+    }
+
+    /// The actions offered for what is focused right now, most specific first, then a set of
+    /// general actions. Duplicates (e.g. "Ask AI") are dropped, keeping the first position.
+    fn palette_commands(&self) -> Vec<Command> {
+        let mut commands: Vec<Command> = Vec::new();
+        match self.focus {
+            Focus::Sidebar => match self.sidebar_items().get(self.sidebar_selected) {
+                Some(SidebarItem::File { .. }) => commands.extend([
+                    Command::OpenSource,
+                    Command::MergeSource,
+                    Command::ChangeSchema,
+                    Command::InferSchema,
+                    Command::LabelSource,
+                    Command::DeleteSelected,
+                ]),
+                Some(SidebarItem::Filter { .. } | SidebarItem::TimeFilter { .. }) => commands
+                    .extend([
+                        Command::ToggleItem,
+                        Command::EditItem,
+                        Command::DeleteSelected,
+                    ]),
+                Some(SidebarItem::Search { .. }) => commands.extend([
+                    Command::ToggleItem,
+                    Command::EditItem,
+                    Command::DeleteSelected,
+                ]),
+                _ => {}
+            },
+            Focus::Pane => {
+                let has_line = self
+                    .active_view()
+                    .map(|view| !view.visible.is_empty())
+                    .unwrap_or(false);
+                if has_line {
+                    commands.extend([
+                        Command::Copy,
+                        Command::HideSimilar,
+                        Command::MarkElapsed,
+                        Command::ShowDetail,
+                        Command::AskAi,
+                    ]);
+                }
+                commands.extend([
+                    Command::SplitColumns,
+                    Command::SplitRows,
+                    Command::ClosePane,
+                ]);
+            }
+            _ => {}
+        }
+        commands.extend([
+            Command::Search,
+            Command::AddFilter,
+            Command::TimeRange,
+            Command::ClearFilters,
+            Command::ImportFilters,
+            Command::ExportFilters,
+            Command::AskAi,
+            Command::FocusMode,
+            Command::ToggleSidebar,
+            Command::ToggleDetail,
+            Command::ToggleResults,
+            Command::ToggleChat,
+            Command::AddFileBrowse,
+            Command::OpenFolder,
+            Command::Help,
+        ]);
+        let mut unique: Vec<Command> = Vec::with_capacity(commands.len());
+        for command in commands {
+            if !unique.contains(&command) {
+                unique.push(command);
+            }
+        }
+        unique
+    }
+
+    /// Run one action. The single place each palette action's behaviour lives; it reuses the
+    /// same operations the keys call.
+    fn dispatch_command(&mut self, command: Command) -> anyhow::Result<()> {
+        match command {
+            Command::Search => {
+                let existing = self
+                    .active_view()
+                    .map(|view| view.query_text.clone())
+                    .unwrap_or_default();
+                self.open_input(Mode::Search(existing));
+            }
+            Command::AddFilter => self.open_filter_builder(None),
+            Command::ClearFilters => self.clear_filters(),
+            Command::TimeRange => self.open_time_picker(),
+            Command::ImportFilters => {
+                self.open_input(Mode::LoadFilters(self.default_filter_folder_input()))
+            }
+            Command::ExportFilters => {
+                self.open_input(Mode::ExportFilters(self.default_filter_folder_input()))
+            }
+            Command::AskAi => self.open_ai_chat(),
+            Command::Copy => self.copy_selection(),
+            Command::HideSimilar => self.begin_hide(),
+            Command::MarkElapsed => self.toggle_elapsed_mark(),
+            Command::ShowDetail => self.open_entry_detail_popup(),
+            Command::OpenSource => self.open_selected_source(),
+            Command::MergeSource => self.toggle_active_selection(),
+            Command::ChangeSchema => self.open_schema_input(),
+            Command::InferSchema => self.infer_schema_ai(),
+            Command::LabelSource => self.open_source_label(),
+            Command::DeleteSelected => self.delete_selected(),
+            Command::EditItem => self.activate_sidebar_item(),
+            Command::ToggleItem => self.toggle_active_selection(),
+            Command::SplitColumns => self.split_active(SplitMode::Horizontal),
+            Command::SplitRows => self.split_active(SplitMode::Vertical),
+            Command::ClosePane => self.close_active_pane(),
+            Command::FocusMode => self.toggle_focus_mode(),
+            Command::ToggleSidebar => self.toggle_sidebar(),
+            Command::ToggleDetail => self.toggle_detail(),
+            Command::ToggleResults => self.toggle_results_panel(),
+            Command::ToggleChat => self.toggle_chat_panel(),
+            Command::AddFileBrowse => self.open_file_browser(),
+            Command::OpenFolder => self.open_folder_browser(),
+            Command::Help => self.mode = Mode::Help,
+        }
+        Ok(())
+    }
+
+    /// Open the sidebar-selected source into the focused pane.
+    fn open_selected_source(&mut self) {
+        if let Some(SidebarItem::File { file_id, .. }) =
+            self.sidebar_items().get(self.sidebar_selected)
+        {
+            let file_id = file_id.clone();
+            self.open_file_in_focused(&file_id);
+        }
+    }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::Palette(mut palette) = self.mode.clone() else {
+            return Ok(false);
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                let chosen = palette.filtered().get(palette.selected).copied();
+                self.mode = Mode::Normal;
+                if let Some(command) = chosen {
+                    self.dispatch_command(command)?;
+                }
+                return Ok(false);
+            }
+            KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
+            KeyCode::Down => {
+                palette.selected += 1;
+                palette.clamp();
+            }
+            KeyCode::Char('p') if ctrl => palette.selected = palette.selected.saturating_sub(1),
+            KeyCode::Char('n') if ctrl => {
+                palette.selected += 1;
+                palette.clamp();
+            }
+            KeyCode::Backspace => {
+                palette.query.pop();
+                palette.selected = 0;
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                palette.query.push(ch);
+                palette.selected = 0;
+            }
+            _ => {}
+        }
+        self.mode = Mode::Palette(palette);
+        Ok(false)
+    }
+
+    // ---- Guided filter builder --------------------------------------------------------
+
+    /// `f` (new) or Enter on a text filter (edit): open the guided builder, prefilled from
+    /// the active schema and, when editing, the existing rule.
+    fn open_filter_builder(&mut self, edit_index: Option<usize>) {
+        let builder = match edit_index {
+            Some(index) => {
+                let Some(rule) = self.project.filters.rules.get(index).cloned() else {
+                    self.status = "that filter is gone".to_string();
+                    return;
+                };
+                // The time range is edited with its picker, not the field builder.
+                if rule.is_time_range() {
+                    self.open_time_picker();
+                    return;
+                }
+                self.builder_from_rule(&rule, Some(index))
+            }
+            None => self.empty_filter_builder(),
+        };
+        self.input_cursor = builder.value.chars().count();
+        self.mode = Mode::FilterBuilder(builder);
+    }
+
+    /// Switch from the raw grammar editor into the builder, prefilled with the same rule.
+    /// An unparseable line falls back to a fresh builder rather than losing the popup.
+    fn open_filter_builder_from_text(&mut self, text: &str, edit_index: Option<usize>) {
+        let builder = match self.parse_filter_rule(text) {
+            Ok(rule) if !rule.is_time_range() => self.builder_from_rule(&rule, edit_index),
+            _ => self.empty_filter_builder(),
+        };
+        self.input_cursor = builder.value.chars().count();
+        self.mode = Mode::FilterBuilder(builder);
+    }
+
+    fn empty_filter_builder(&self) -> FilterBuilder {
+        let fields = self.active_field_names();
+        let mut schemas: Vec<String> = self.project.extractors.keys().cloned().collect();
+        schemas.sort();
+        // A sensible starting field: the level (the most common thing to filter on), else
+        // the first field.
+        let field = fields
+            .iter()
+            .find(|name| name.as_str() == "level" || name.ends_with("_level"))
+            .or_else(|| fields.first())
+            .cloned()
+            .unwrap_or_else(|| "message".to_string());
+        let mut builder = FilterBuilder {
+            edit_index: None,
+            schema: None,
+            field,
+            op: 0,
+            exclude: true,
+            value: String::new(),
+            row: FilterBuilder::VALUE,
+            schemas,
+            fields,
+            values: Vec::new(),
+            preview: PatternPreview::default(),
+            error: None,
+        };
+        self.refresh_builder(&mut builder);
+        builder
+    }
+
+    fn builder_from_rule(&self, rule: &FilterRule, edit_index: Option<usize>) -> FilterBuilder {
+        let fields = self.active_field_names();
+        let mut schemas: Vec<String> = self.project.extractors.keys().cloned().collect();
+        schemas.sort();
+        let op = crate::core::filters::OPS
+            .iter()
+            .position(|name| *name == rule.op)
+            .unwrap_or(0);
+        let mut builder = FilterBuilder {
+            edit_index,
+            schema: rule.log_schema.clone(),
+            field: rule.field.clone(),
+            op,
+            exclude: rule.action != "include",
+            value: rule.value.clone(),
+            row: FilterBuilder::VALUE,
+            schemas,
+            fields,
+            values: Vec::new(),
+            preview: PatternPreview::default(),
+            error: None,
+        };
+        self.refresh_builder(&mut builder);
+        builder
+    }
+
+    /// The field names of the focused pane's schema, for the field row's suggestions.
+    fn active_field_names(&self) -> Vec<String> {
+        let Some((file, _)) = self.active_file_view() else {
+            return Vec::new();
+        };
+        if let Some(extractor) = file.extractor.as_ref() {
+            if !extractor.field_names.is_empty() {
+                return extractor.field_names.clone();
+            }
+        }
+        file.entries
+            .first()
+            .and_then(|entry| file.extractor_for(entry))
+            .map(|extractor| extractor.field_names.clone())
+            .unwrap_or_default()
+    }
+
+    /// The most frequent values of `field` in the focused view, for the value row.
+    fn field_value_suggestions(&self, field: &str) -> Vec<String> {
+        let Some((file, view)) = self.active_file_view() else {
+            return Vec::new();
+        };
+        if field.is_empty() {
+            return Vec::new();
+        }
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        // A sample is enough to surface the common values; no need to scan a million rows.
+        for global in view.visible.iter().take(4000) {
+            let Some(entry) = file.entries.get(global) else {
+                continue;
+            };
+            let value = file.with_field(entry, field, |text| text.trim().to_string());
+            if value.is_empty() || value.chars().count() > 60 {
+                continue;
+            }
+            let count = counts.entry(value.clone()).or_insert(0);
+            if *count == 0 {
+                order.push(value.clone());
+            }
+            *count += 1;
+        }
+        order.sort_by(|a, b| counts[b].cmp(&counts[a]));
+        order.truncate(8);
+        order
+    }
+
+    /// How a rule would narrow the focused view: match count and a couple of sample lines.
+    /// The general form of the hide-pattern preview.
+    fn filter_preview(&self, rule: &FilterRule) -> PatternPreview {
+        let mut preview = PatternPreview::default();
+        let Some((file, view)) = self.active_file_view() else {
+            return preview;
+        };
+        preview.total = view.visible.len();
+        for global in view.visible.iter().take(PATTERN_PREVIEW_LIMIT) {
+            let Some(entry) = file.entries.get(global) else {
+                continue;
+            };
+            preview.scanned += 1;
+            if !rule.matches(file, entry) {
+                continue;
+            }
+            preview.matched += 1;
+            if preview.samples.len() < PATTERN_PREVIEW_SAMPLES {
+                preview
+                    .samples
+                    .push(file.message(entry).lines().next().unwrap_or("").to_string());
+            }
+        }
+        preview
+    }
+
+    /// Recompute the value suggestions, live validation, and preview after a change.
+    fn refresh_builder(&self, builder: &mut FilterBuilder) {
+        builder.values = self.field_value_suggestions(builder.field.trim());
+        match builder.rule() {
+            Ok(rule) => {
+                builder.error = None;
+                builder.preview = self.filter_preview(&rule);
+            }
+            Err(error) => {
+                builder.error = Some(error);
+                builder.preview = PatternPreview::default();
+            }
+        }
+    }
+
+    /// Left/Right on the focused row: cycle the dropdown, or step through suggestions.
+    fn builder_cycle(&self, builder: &mut FilterBuilder, delta: isize) {
+        match builder.row {
+            FilterBuilder::SCHEMA => {
+                let mut options: Vec<Option<String>> = vec![None];
+                options.extend(builder.schemas.iter().cloned().map(Some));
+                let current = options
+                    .iter()
+                    .position(|option| *option == builder.schema)
+                    .unwrap_or(0);
+                builder.schema = options[cycle_index(current, options.len(), delta)].clone();
+            }
+            FilterBuilder::FIELD => {
+                if builder.fields.is_empty() {
+                    return;
+                }
+                let current = builder
+                    .fields
+                    .iter()
+                    .position(|name| *name == builder.field)
+                    .unwrap_or(0);
+                builder.field =
+                    builder.fields[cycle_index(current, builder.fields.len(), delta)].clone();
+            }
+            FilterBuilder::OP => {
+                builder.op = cycle_index(builder.op, crate::core::filters::OPS.len(), delta);
+            }
+            FilterBuilder::ACTION => builder.exclude = !builder.exclude,
+            FilterBuilder::VALUE => {
+                if builder.values.is_empty() {
+                    return;
+                }
+                let next = match builder
+                    .values
+                    .iter()
+                    .position(|value| *value == builder.value)
+                {
+                    Some(current) => cycle_index(current, builder.values.len(), delta),
+                    None if delta >= 0 => 0,
+                    None => builder.values.len() - 1,
+                };
+                builder.value = builder.values[next].clone();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_filter_builder_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::FilterBuilder(mut builder) = self.mode.clone() else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.submit_filter_builder(builder);
+                return Ok(false);
+            }
+            // Switch to the raw grammar editor, prefilled with the equivalent text.
+            KeyCode::Tab => {
+                let text = builder.to_input();
+                match builder.edit_index {
+                    Some(index) => self.open_input(Mode::EditFilter { index, text }),
+                    None => self.open_input(Mode::Filter(text)),
+                }
+                return Ok(false);
+            }
+            KeyCode::Up => builder.row = builder.row.saturating_sub(1),
+            KeyCode::Down => builder.row = (builder.row + 1).min(FilterBuilder::ROWS - 1),
+            KeyCode::Left => {
+                self.builder_cycle(&mut builder, -1);
+                changed = true;
+            }
+            KeyCode::Right => {
+                self.builder_cycle(&mut builder, 1);
+                changed = true;
+            }
+            KeyCode::Char(' ') if builder.row == FilterBuilder::ACTION => {
+                builder.exclude = !builder.exclude;
+                changed = true;
+            }
+            KeyCode::Backspace => match builder.row {
+                FilterBuilder::FIELD => {
+                    builder.field.pop();
+                    changed = true;
+                }
+                FilterBuilder::VALUE => {
+                    builder.value.pop();
+                    changed = true;
+                }
+                _ => {}
+            },
+            KeyCode::Char(ch) => match builder.row {
+                FilterBuilder::FIELD => {
+                    builder.field.push(ch);
+                    changed = true;
+                }
+                FilterBuilder::VALUE => {
+                    builder.value.push(ch);
+                    changed = true;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        if changed {
+            self.refresh_builder(&mut builder);
+        }
+        self.input_cursor = match builder.row {
+            FilterBuilder::FIELD => builder.field.chars().count(),
+            FilterBuilder::VALUE => builder.value.chars().count(),
+            _ => 0,
+        };
+        self.mode = Mode::FilterBuilder(builder);
+        Ok(false)
+    }
+
+    fn submit_filter_builder(&mut self, builder: FilterBuilder) {
+        let mut rule = match builder.rule() {
+            Ok(rule) => rule,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        match builder.edit_index {
+            Some(index) if index < self.project.filters.rules.len() => {
+                // Editing the rule must not silently re-enable one the user had off.
+                rule.enabled = self.project.filters.rules[index].enabled;
+                self.mutate_filters(|filters| filters.rules[index] = rule);
+                self.status = "filter updated".to_string();
+            }
+            Some(_) => self.status = "that filter is gone".to_string(),
+            None => {
+                self.mutate_filters(|filters| filters.add(rule));
+                self.status = "filter added".to_string();
+            }
+        }
+    }
+
     fn handle_folder_browser_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
         let Mode::OpenFolder(mut browser) = self.mode.clone() else {
             return Ok(false);
@@ -6006,8 +7198,181 @@ impl AppState {
             self.panes.insert(self.focused_pane + 1, PaneState { view });
             self.focused_pane += 1;
             self.split_mode = mode;
+            // A fresh split starts even; a later resize re-weights it.
+            self.workspace.pane_weights.clear();
             self.requeue_all_panes();
         }
+    }
+
+    // ---- Workspace layout -------------------------------------------------------------
+
+    /// Make sure there is one weight per pane; a mismatch resets to equal.
+    fn ensure_pane_weights(&mut self) {
+        if self.workspace.pane_weights.len() != self.panes.len() {
+            self.workspace.pane_weights = vec![100; self.panes.len()];
+        }
+    }
+
+    /// `[` / `]`: narrow or widen the sidebar, from its current width.
+    fn resize_sidebar(&mut self, delta: isize) {
+        let body_width = self.body_area.width;
+        let base = self
+            .workspace
+            .sidebar_width
+            .unwrap_or_else(|| sidebar_width(body_width)) as isize;
+        let next = base.saturating_add(delta).max(0) as u16;
+        self.workspace.sidebar_width = Some(next);
+        self.workspace.show_sidebar = true;
+        self.workspace.focus_mode = false;
+        self.status = format!("sidebar width {}", self.effective_sidebar_width(body_width));
+    }
+
+    /// Set the sidebar width from a separator drag to `column`, relative to the body's left.
+    fn drag_sidebar_to(&mut self, column: u16) {
+        let width = column.saturating_sub(self.body_area.x);
+        self.workspace.sidebar_width = Some(width);
+        self.workspace.show_sidebar = true;
+    }
+
+    /// Whether `(column, row)` is on the draggable sidebar/pane separator.
+    fn on_separator(&self, column: u16, row: u16) -> bool {
+        let Some(x) = self.separator_x else {
+            return false;
+        };
+        let in_body = row >= self.body_area.y && row < self.body_area.y + self.body_area.height;
+        in_body && (column == x || column + 1 == x)
+    }
+
+    /// The boundary index (between pane `i` and `i+1`) whose border `(column, row)` lands on,
+    /// for dragging pane heights (a rows split) or widths (a columns split).
+    fn pane_separator_at(&self, column: u16, row: u16) -> Option<usize> {
+        for boundary in 0..self.pane_layout.len().saturating_sub(1) {
+            let a = self.pane_layout[boundary];
+            let b = self.pane_layout[boundary + 1];
+            let hit = match self.split_mode {
+                SplitMode::Horizontal => {
+                    row >= a.y && row < a.y + a.height && (column == b.x || column + 1 == b.x)
+                }
+                SplitMode::Vertical => {
+                    column >= a.x && column < a.x + a.width && (row == b.y || row + 1 == b.y)
+                }
+            };
+            if hit {
+                return Some(boundary);
+            }
+        }
+        None
+    }
+
+    /// The stacked panel whose top border `(column, row)` lands on, for dragging its height.
+    fn panel_separator_at(&self, column: u16, row: u16) -> Option<PanelSeparator> {
+        self.panel_separators.iter().copied().find(|separator| {
+            column >= separator.x0
+                && column < separator.x1
+                && (row == separator.top || row + 1 == separator.top)
+        })
+    }
+
+    /// Reweight the two panes on either side of `boundary` from a drag to `(column, row)`,
+    /// keeping their combined weight fixed so the other panes are undisturbed.
+    fn drag_pane_separator(&mut self, boundary: usize, column: u16, row: u16) {
+        self.ensure_pane_weights();
+        if boundary + 1 >= self.pane_layout.len()
+            || boundary + 1 >= self.workspace.pane_weights.len()
+        {
+            return;
+        }
+        let a = self.pane_layout[boundary];
+        let b = self.pane_layout[boundary + 1];
+        let (start, span, pos) = match self.split_mode {
+            SplitMode::Horizontal => (a.x, a.width + b.width, column),
+            SplitMode::Vertical => (a.y, a.height + b.height, row),
+        };
+        if span < 4 {
+            return;
+        }
+        let min = 2u16;
+        let first_len = pos.saturating_sub(start).clamp(min, span - min) as u32;
+        let sum = (self.workspace.pane_weights[boundary]
+            + self.workspace.pane_weights[boundary + 1])
+            .max(2) as u32;
+        let first = (sum * first_len / span as u32).max(1);
+        self.workspace.pane_weights[boundary] = first as u16;
+        self.workspace.pane_weights[boundary + 1] = (sum - first).max(1) as u16;
+    }
+
+    /// `Ctrl+Arrow` (along the split): grow or shrink the focused pane's share.
+    fn resize_pane(&mut self, delta: isize) {
+        if self.panes.len() < 2 {
+            return;
+        }
+        self.ensure_pane_weights();
+        let index = self.focused_pane.min(self.workspace.pane_weights.len() - 1);
+        let current = self.workspace.pane_weights[index] as isize;
+        self.workspace.pane_weights[index] =
+            current.saturating_add(delta * 20).clamp(20, 400) as u16;
+        self.status = "pane resized".to_string();
+    }
+
+    fn toggle_focus_mode(&mut self) {
+        self.workspace.focus_mode = !self.workspace.focus_mode;
+        if self.workspace.focus_mode {
+            self.focus = Focus::Pane;
+            self.status = "focus mode: only the active pane (z to exit)".to_string();
+        } else {
+            self.status = "focus mode off".to_string();
+        }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.workspace.show_sidebar = !self.workspace.show_sidebar;
+        if !self.workspace.show_sidebar && self.focus == Focus::Sidebar {
+            self.focus = Focus::Pane;
+        }
+        self.status = format!(
+            "sidebar {}",
+            if self.workspace.show_sidebar {
+                "shown"
+            } else {
+                "hidden"
+            }
+        );
+    }
+
+    fn toggle_detail(&mut self) {
+        self.workspace.show_detail = !self.workspace.show_detail;
+        self.status = format!(
+            "detail panel {}",
+            if self.workspace.show_detail {
+                "shown"
+            } else {
+                "hidden"
+            }
+        );
+    }
+
+    fn toggle_chat_panel(&mut self) {
+        self.workspace.show_chat = !self.workspace.show_chat;
+        self.status = format!(
+            "chat panel {}",
+            if self.workspace.show_chat {
+                "shown"
+            } else {
+                "hidden"
+            }
+        );
+    }
+
+    fn toggle_results_panel(&mut self) {
+        self.workspace.show_results = !self.workspace.show_results;
+        self.status = format!(
+            "results panel {}",
+            if self.workspace.show_results {
+                "shown"
+            } else {
+                "hidden"
+            }
+        );
     }
 
     fn close_active_pane(&mut self) {
@@ -6065,13 +7430,7 @@ impl AppState {
         };
         match item {
             SidebarItem::File { .. } => self.open_schema_input(),
-            SidebarItem::Filter { index, .. } => {
-                let Some(rule) = self.project.filters.rules.get(index) else {
-                    return;
-                };
-                let text = rule.to_input();
-                self.open_input(Mode::EditFilter { index, text });
-            }
+            SidebarItem::Filter { index, .. } => self.open_filter_builder(Some(index)),
             // The picker, not the filter grammar: a range is edited as two timestamps.
             SidebarItem::TimeFilter { .. } => self.open_time_picker(),
             SidebarItem::Search { index, text, .. } => {
@@ -6492,6 +7851,11 @@ fn sidebar_width(body_width: u16) -> u16 {
         .min(body_width.saturating_sub(24))
 }
 
+/// A hand-resized sidebar keeps at least this many columns, and leaves the panes at least
+/// `MIN_PANE_WIDTH`.
+const MIN_SIDEBAR_WIDTH: u16 = 16;
+const MIN_PANE_WIDTH: u16 = 20;
+
 /// Split into fixed-width character chunks. Unlike word wrapping this never reflows,
 /// so the caret's (row, column) is a plain division.
 fn chunk_chars(text: &str, width: usize) -> Vec<String> {
@@ -6773,6 +8137,16 @@ fn thousands(value: usize) -> String {
 /// A regex compile error spans several lines with a caret diagram; the popup has one.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Step `current` by `delta`, wrapping around a list of `len`. Used by the filter builder's
+/// dropdown rows.
+fn cycle_index(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let len = len as isize;
+    (((current as isize + delta) % len + len) % len) as usize
 }
 
 /// A field's value, short enough to sit in the menu: its first three words. A message
@@ -7327,7 +8701,10 @@ fn centered_rect(width: u16, height: u16, root: Rect) -> Rect {
 }
 
 fn help_text() -> &'static str {
-    "Project/files
+    "Command palette
+  Ctrl+P or : opens a searchable, context-aware action list; type to filter, Enter runs it
+
+Project/files
   a browse for a file  o browse for a folder      d delete selected item      Ctrl+s save
   d/Delete delete what the cursor is on: a log source, filter, or saved search
   S define reusable log schema
@@ -7365,7 +8742,9 @@ Select/copy
 
 Filter/search
   / search          n/N next/previous match      c context 0/3/10
-  f add filter      t time range picker          F clear filters
+  f guided filter builder   t time range picker      F clear filters
+  In the builder: ↑↓ pick a row, ←→ change a dropdown or step suggestions, type to edit
+                  the field/value, Tab switches to the raw grammar, Enter applies
   Filters split into Text (as many as you like) and Time (at most one, replaced
   by each new range rather than intersected with the old)
   T elapsed time from this line (again to restore absolute timestamps)
@@ -7374,7 +8753,7 @@ Filter/search
   X export schemas  I import schemas (merges; existing names are kept)
   Time range picker presets count back from the newest entry, not from now
   Moving onto a preset fills Start/End from it; Enter applies what they show
-  Filter syntax     [schema=\"name\"] field op [include|exclude] value
+  Raw filter syntax (Tab from the builder): [schema=\"name\"] field op [include|exclude] value
   In the hide menu: every field shows this line's value; a field's own key hides by it
                     at once, Space picks several, Enter ANDs the picks into one regex;
                     Tab switches the whole menu between hide and keep-only
@@ -7388,10 +8767,16 @@ Filter/search
 
 Layout
   | split columns   - split rows                 w close pane
+  [ / ]             narrow / widen the sidebar (or drag its separator with the mouse)
+  Ctrl+←/→ or ↑/↓   resize the focused pane along the split (or drag a border between panes)
+  Drag a panel's top border to resize its height: results, detail, or chat
+  z                 focus mode: show only the active pane (again to restore)
+  Toggle the sidebar, detail, results, and chat panels from the palette (Ctrl+P or :)
   Enter on a log row opens a larger detail popup with parsed fields and raw text
   Detail panel (left, bottom) shows the selected line or project item details
   A star marks files open in a pane, enabled filters, and the running search
-  Quitting records the panes, their logs and their searches; reopening restores them
+  Quitting records the panes, sizes, panel visibility, their logs and searches; reopening
+  restores them
 
 AI assistant
   A open the AI chat panel (bottom left); type a question and Enter to ask
@@ -8604,6 +9989,13 @@ mod tests {
         }
     }
 
+    /// Add a filter through the raw grammar input (the guided builder now owns `f`).
+    fn add_filter_text(app: &mut AppState, text: &str) {
+        app.open_input(Mode::Filter(String::new()));
+        type_text(app, text);
+        press(app, KeyCode::Enter);
+    }
+
     /// Wipe an input popup's prefilled text before typing a replacement.
     fn clear_input(app: &mut AppState) {
         press_mod(app, KeyCode::Char('u'), KeyModifiers::CONTROL);
@@ -8899,10 +10291,7 @@ mod tests {
         let before = app.active_view().unwrap().visible.len();
         assert_eq!(before, 2);
 
-        // f, then the filter expression, then Enter -- exactly what a user types.
-        press(&mut app, KeyCode::Char('f'));
-        type_text(&mut app, "level equals exclude Trace");
-        press(&mut app, KeyCode::Enter);
+        add_filter_text(&mut app, "level equals exclude Trace");
 
         assert_eq!(app.status, "filter added");
         assert_eq!(app.active_view().unwrap().visible.len(), 1);
@@ -8932,12 +10321,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_log(tmp.path());
 
-        press(&mut app, KeyCode::Char('f'));
-        type_text(
+        add_filter_text(
             &mut app,
             "schema=\"Bracketed default\" level equals exclude Trace",
         );
-        press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.status, "filter added");
         assert_eq!(app.active_view().unwrap().visible.len(), 1);
@@ -9430,6 +10817,220 @@ mod tests {
         assert!(app.status.contains("search removed"), "{}", app.status);
     }
 
+    /// The palette offers context actions and runs them through the shared dispatcher.
+    #[test]
+    fn command_palette_is_context_aware_and_dispatches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        // On a pane: line and pane actions are offered.
+        app.focus = Focus::Pane;
+        let pane = app.palette_commands();
+        assert!(pane.contains(&Command::Copy));
+        assert!(pane.contains(&Command::HideSimilar));
+        assert!(pane.contains(&Command::SplitColumns));
+
+        // `:` opens it; typing narrows the list; Enter runs the top match.
+        press(&mut app, KeyCode::Char(':'));
+        assert!(matches!(app.mode, Mode::Palette(_)));
+        for ch in "add text".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        if let Mode::Palette(palette) = &app.mode {
+            assert_eq!(
+                palette.filtered().first().copied(),
+                Some(Command::AddFilter)
+            );
+        } else {
+            panic!("palette closed early");
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.mode, Mode::FilterBuilder(_)),
+            "Enter ran Add text filter (opens the guided builder)"
+        );
+    }
+
+    #[test]
+    fn workspace_resizes_toggles_and_persists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        // `[`/`]` set an explicit sidebar width; `z` toggles focus mode.
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.workspace.sidebar_width.is_some());
+        let widened = app.workspace.sidebar_width.unwrap();
+        press(&mut app, KeyCode::Char('['));
+        assert!(app.workspace.sidebar_width.unwrap() < widened);
+
+        press(&mut app, KeyCode::Char('z'));
+        assert!(app.workspace.focus_mode);
+        assert_eq!(app.focus, Focus::Pane, "focus mode moves focus to the pane");
+
+        // Panel toggles via the palette dispatcher.
+        app.dispatch_command(Command::ToggleDetail).unwrap();
+        assert!(!app.workspace.show_detail);
+        app.dispatch_command(Command::ToggleSidebar).unwrap();
+        assert!(!app.workspace.show_sidebar);
+
+        // The layout survives a save/reopen.
+        let reopened = reopen(app);
+        assert!(reopened.workspace.focus_mode);
+        assert!(!reopened.workspace.show_detail);
+        assert!(!reopened.workspace.show_sidebar);
+        assert!(reopened.workspace.sidebar_width.is_some());
+    }
+
+    #[test]
+    fn dragging_a_panel_border_resizes_its_height() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        // Stand in for the drawn results separator: top border at row 20, bottom (status) 28.
+        app.panel_separators = vec![PanelSeparator {
+            panel: PanelEdge::Results,
+            top: 20,
+            bottom: 28,
+            x0: 0,
+            x1: 100,
+        }];
+        assert_eq!(
+            app.panel_separator_at(10, 20).map(|s| s.panel),
+            Some(PanelEdge::Results)
+        );
+
+        let mouse = |kind, row| MouseEvent {
+            kind,
+            column: 10,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        app.begin_mouse_selection(mouse(MouseEventKind::Down(MouseButton::Left), 20));
+        app.drag_mouse_selection(mouse(MouseEventKind::Drag(MouseButton::Left), 14));
+        // Dragging the top border up to row 14 makes the panel 28 - 14 = 14 rows tall.
+        assert_eq!(app.workspace.results_height, Some(14));
+    }
+
+    #[test]
+    fn dragging_a_pane_border_reweights_heights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.split_active(SplitMode::Vertical); // two stacked panes
+        app.ensure_pane_weights();
+
+        // Stand in for the drawn layout: two 10-row panes stacked from y=1.
+        app.pane_layout = vec![
+            Rect {
+                x: 0,
+                y: 1,
+                width: 40,
+                height: 10,
+            },
+            Rect {
+                x: 0,
+                y: 11,
+                width: 40,
+                height: 10,
+            },
+        ];
+        // The border sits at y=11; a press there grabs boundary 0.
+        assert_eq!(app.pane_separator_at(5, 11), Some(0));
+
+        // Drag it up to y=4: the top pane shrinks below the bottom one.
+        app.drag_pane_separator(0, 5, 4);
+        assert!(
+            app.workspace.pane_weights[0] < app.workspace.pane_weights[1],
+            "top pane shrank: {:?}",
+            app.workspace.pane_weights
+        );
+    }
+
+    #[test]
+    fn ctrl_arrow_reweights_panes_along_the_split() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.split_active(SplitMode::Horizontal); // two side-by-side panes, focus on the 2nd
+        app.finish_work();
+        assert_eq!(app.panes.len(), 2);
+
+        // Along a horizontal split, Ctrl+Right grows the focused pane's weight.
+        press_mod(&mut app, KeyCode::Right, KeyModifiers::CONTROL);
+        app.ensure_pane_weights();
+        assert!(
+            app.workspace.pane_weights[app.focused_pane] > app.workspace.pane_weights[0],
+            "focused pane got a larger share: {:?}",
+            app.workspace.pane_weights
+        );
+    }
+
+    /// The guided builder previews live and applies a working rule; `f` opens it.
+    #[test]
+    fn filter_builder_previews_and_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press(&mut app, KeyCode::Char('f'));
+        let Mode::FilterBuilder(_) = app.mode else {
+            panic!("f opens the guided builder, got {:?}", app.mode);
+        };
+        // Value row is focused; type a value the sample lines carry.
+        type_text(&mut app, "Trace");
+        if let Mode::FilterBuilder(builder) = &app.mode {
+            // The live preview counts matches without applying anything yet.
+            assert!(builder.error.is_none(), "valid rule");
+            assert!(builder.preview.matched > 0, "preview found matches");
+            assert_eq!(app.project.filters.rules.len(), 0, "not applied yet");
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status, "filter added");
+        assert_eq!(app.project.filters.rules.len(), 1);
+        let rule = &app.project.filters.rules[0];
+        assert_eq!(rule.field, "log_level");
+        assert_eq!(rule.op, "equals");
+        assert_eq!(rule.value, "Trace");
+        assert_eq!(rule.action, "exclude");
+    }
+
+    /// Tab moves a rule from the guided builder to the raw editor and back, losslessly.
+    #[test]
+    fn filter_builder_switches_to_raw_and_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        press(&mut app, KeyCode::Char('f'));
+        type_text(&mut app, "Trace");
+        press(&mut app, KeyCode::Tab); // to raw
+        let Mode::Filter(text) = app.mode.clone() else {
+            panic!("Tab switches to the raw editor, got {:?}", app.mode);
+        };
+        assert!(text.contains("log_level"), "raw text: {text}");
+        assert!(text.contains("Trace"), "raw text: {text}");
+        press(&mut app, KeyCode::Tab); // back to builder
+        let Mode::FilterBuilder(builder) = app.mode.clone() else {
+            panic!("Tab switches back to the builder, got {:?}", app.mode);
+        };
+        assert_eq!(builder.field, "log_level");
+        assert_eq!(builder.value, "Trace");
+    }
+
+    #[test]
+    fn command_palette_on_a_source_lists_source_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        app.focus = Focus::Sidebar;
+        app.sidebar_selected = app
+            .sidebar_items()
+            .iter()
+            .position(|item| matches!(item, SidebarItem::File { .. }))
+            .unwrap();
+
+        let commands = app.palette_commands();
+        assert!(commands.contains(&Command::ChangeSchema));
+        assert!(commands.contains(&Command::LabelSource));
+        assert!(commands.contains(&Command::DeleteSelected));
+        // Pane-only actions are not offered on a source.
+        assert!(!commands.contains(&Command::ClosePane));
+    }
+
     /// Typing into Start must reach the field, not the preset list.
     #[test]
     fn the_start_field_is_editable() {
@@ -9525,9 +11126,7 @@ mod tests {
         press(&mut app, KeyCode::Char('|')); // split
         assert_eq!(app.panes.len(), 2);
 
-        press(&mut app, KeyCode::Char('f'));
-        type_text(&mut app, "level equals exclude Trace");
-        press(&mut app, KeyCode::Enter);
+        add_filter_text(&mut app, "level equals exclude Trace");
 
         // Both panes see the project-global filter, not just the focused one.
         for pane in &app.panes {
@@ -9680,9 +11279,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_lines(tmp.path(), 50);
 
-        press(&mut app, KeyCode::Char('f'));
-        type_text(&mut app, "message contains exclude queued");
-        press(&mut app, KeyCode::Enter);
+        add_filter_text(&mut app, "message contains exclude queued");
         assert_eq!(app.active_view().unwrap().visible.len(), 0);
 
         // Clear that filter, then filter to a subset and search within it.
@@ -10853,11 +12450,15 @@ mod tests {
             .unwrap();
         press(&mut app, KeyCode::Enter);
 
-        let Mode::EditFilter { index, text } = app.mode.clone() else {
-            panic!("expected the filter editor, got {:?}", app.mode);
+        // Enter opens the guided builder, prefilled from the rule and targeting its slot.
+        let Mode::FilterBuilder(builder) = app.mode.clone() else {
+            panic!("expected the filter builder, got {:?}", app.mode);
         };
-        assert_eq!(index, 0);
-        assert_eq!(text, "message contains exclude queued");
+        assert_eq!(builder.edit_index, Some(0));
+        assert_eq!(builder.field, "message");
+        assert_eq!(builder.op_name(), "contains");
+        assert_eq!(builder.value, "queued");
+        assert!(builder.exclude);
 
         // Retarget the rule at a value no line has.
         app.submit_edit_filter(0, "message contains exclude nomatch".to_string());
