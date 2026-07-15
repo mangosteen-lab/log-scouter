@@ -542,6 +542,11 @@ enum Mode {
     EntryDetail {
         scroll: usize,
     },
+    PrettyPrint {
+        title: String,
+        body: String,
+        scroll: usize,
+    },
     Help,
     /// The action-history popup (`U`): recent user and AI actions.
     ActionLog,
@@ -573,6 +578,7 @@ enum Command {
     PreviousBookmark,
     NextBookmark,
     HideSimilar,
+    PrettyPrint,
     MarkElapsed,
     ShowDetail,
     OpenSource,
@@ -620,6 +626,7 @@ impl Command {
             Command::PreviousBookmark => "Previous bookmark",
             Command::NextBookmark => "Next bookmark",
             Command::HideSimilar => "Hide / keep similar lines",
+            Command::PrettyPrint => "Pretty-print message",
             Command::MarkElapsed => "Mark elapsed time from here",
             Command::ShowDetail => "Show line detail",
             Command::OpenSource => "Open this source",
@@ -667,6 +674,7 @@ impl Command {
             Command::PreviousBookmark => "[m",
             Command::NextBookmark => "]m",
             Command::HideSimilar => "H",
+            Command::PrettyPrint => "P",
             Command::MarkElapsed => "T",
             Command::ShowDetail => "Enter",
             Command::OpenSource => "",
@@ -3357,6 +3365,11 @@ impl AppState {
             Mode::HideChoice(menu) => self.draw_hide_choice_popup(frame, root, &menu),
             Mode::HidePattern(prompt) => self.draw_hide_pattern_popup(frame, root, &prompt),
             Mode::EntryDetail { scroll } => self.draw_entry_detail_popup(frame, root, scroll),
+            Mode::PrettyPrint {
+                title,
+                body,
+                scroll,
+            } => self.draw_pretty_print_popup(frame, root, &title, &body, scroll),
             Mode::Help => {
                 let area = centered_rect(84, 46, root);
                 frame.render_widget(Clear, area);
@@ -3761,7 +3774,7 @@ impl AppState {
         frame.render_widget(Clear, area);
 
         let block = Block::default()
-            .title("Log Detail  Enter/Esc close  j/k scroll")
+            .title("Log Detail  P pretty-print  Enter/Esc close  j/k scroll")
             .borders(Borders::ALL);
         let inner = block.inner(area);
         self.entry_detail_area = inner;
@@ -3772,6 +3785,43 @@ impl AppState {
 
         let lines = self.full_entry_detail_lines(inner.width as usize);
         let lines = self.apply_detail_selection(lines, DetailSurface::Popup);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)),
+            inner,
+        );
+    }
+
+    fn draw_pretty_print_popup(
+        &self,
+        frame: &mut Frame,
+        root: Rect,
+        title: &str,
+        body: &str,
+        scroll: usize,
+    ) {
+        let width = root
+            .width
+            .saturating_sub(4)
+            .min(120)
+            .max(root.width.min(40));
+        let height = root
+            .height
+            .saturating_sub(4)
+            .min(34)
+            .max(root.height.min(10));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+
+        let block = Block::default()
+            .title(format!("{title}  Esc/q close  j/k scroll"))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let lines = pretty_body_lines(body, inner.width as usize);
         frame.render_widget(
             Paragraph::new(Text::from(lines)).scroll((scroll as u16, 0)),
             inner,
@@ -4039,7 +4089,7 @@ impl AppState {
             | Mode::BookmarkNote { .. }
             | Mode::HidePattern(_) => 1,
             Mode::HideChoice(_) => 2,
-            Mode::EntryDetail { .. } => 3,
+            Mode::EntryDetail { .. } | Mode::PrettyPrint { .. } => 3,
             Mode::Help | Mode::ActionLog => 4,
             Mode::TimePicker(_) => 5,
             Mode::OpenFolder(_) => 6,
@@ -4718,6 +4768,11 @@ impl AppState {
             KeyCode::Char('t') => self.open_time_picker(),
             KeyCode::Char('T') => self.toggle_elapsed_mark(),
             KeyCode::Char('F') => self.clear_filters(),
+            KeyCode::Char('P') | KeyCode::Char('p')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_pretty_print();
+            }
             KeyCode::Char('x') => {
                 self.open_input(Mode::ExportFilters(self.default_filter_folder_input()))
             }
@@ -5017,9 +5072,37 @@ impl AppState {
     }
 
     fn handle_entry_detail_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        if matches!(self.mode, Mode::PrettyPrint { .. }) {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.mode = Mode::Normal,
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_pretty_print(1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_pretty_print(-1),
+                KeyCode::PageDown => self.scroll_pretty_print(10),
+                KeyCode::PageUp => self.scroll_pretty_print(-10),
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_pretty_print(10)
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_pretty_print(-10)
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    if let Mode::PrettyPrint { scroll, .. } = &mut self.mode {
+                        *scroll = 0;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
             KeyCode::Char('q') => self.mode = Mode::Normal,
+            KeyCode::Char('P') | KeyCode::Char('p')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.open_pretty_print();
+            }
             KeyCode::Down | KeyCode::Char('j') => self.scroll_entry_detail(1),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_entry_detail(-1),
             KeyCode::PageDown => self.scroll_entry_detail(10),
@@ -5042,6 +5125,12 @@ impl AppState {
 
     fn scroll_entry_detail(&mut self, delta: isize) {
         if let Mode::EntryDetail { scroll } = &mut self.mode {
+            *scroll = scroll.saturating_add_signed(delta);
+        }
+    }
+
+    fn scroll_pretty_print(&mut self, delta: isize) {
+        if let Mode::PrettyPrint { scroll, .. } = &mut self.mode {
             *scroll = scroll.saturating_add_signed(delta);
         }
     }
@@ -6274,6 +6363,7 @@ impl AppState {
                         Command::PreviousBookmark,
                         Command::NextBookmark,
                         Command::HideSimilar,
+                        Command::PrettyPrint,
                         Command::MarkElapsed,
                         Command::ShowDetail,
                         Command::AskAi,
@@ -6356,6 +6446,7 @@ impl AppState {
             Command::PreviousBookmark => self.jump_bookmark(false, 1),
             Command::NextBookmark => self.jump_bookmark(true, 1),
             Command::HideSimilar => self.begin_hide(),
+            Command::PrettyPrint => self.open_pretty_print(),
             Command::MarkElapsed => self.toggle_elapsed_mark(),
             Command::ShowDetail => self.open_entry_detail_popup(),
             Command::OpenSource => self.open_selected_source(),
@@ -7622,6 +7713,27 @@ impl AppState {
             return;
         }
         self.mode = Mode::EntryDetail { scroll: 0 };
+    }
+
+    fn open_pretty_print(&mut self) {
+        let Some((file, entry)) = self.entry_detail_target() else {
+            self.status = "no line selected".to_string();
+            return;
+        };
+        let message = file.message(entry);
+        match pretty_print_message(&message) {
+            Some((kind, body)) => {
+                self.mode = Mode::PrettyPrint {
+                    title: format!("Pretty {kind}"),
+                    body,
+                    scroll: 0,
+                };
+                self.status.clear();
+            }
+            None => {
+                self.status = "no JSON, XML, or SQL found in this message".to_string();
+            }
+        }
     }
 
     /// A pane whose file vanished (e.g. a merged view invalidated by a schema change)
@@ -9712,6 +9824,255 @@ fn full_detail_lines(file: &LogFileModel, entry: &LogEntry, width: usize) -> Vec
     lines
 }
 
+fn pretty_print_message(message: &str) -> Option<(&'static str, String)> {
+    pretty_json(message)
+        .map(|body| ("JSON", body))
+        .or_else(|| pretty_xml(message).map(|body| ("XML", body)))
+        .or_else(|| pretty_sql(message).map(|body| ("SQL", body)))
+}
+
+fn pretty_json(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    for candidate in json_candidates(trimmed) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if let Ok(body) = serde_json::to_string_pretty(&value) {
+                return Some(body);
+            }
+        }
+    }
+    None
+}
+
+fn json_candidates(text: &str) -> Vec<&str> {
+    let mut candidates = Vec::new();
+    if matches!(text.chars().next(), Some('{') | Some('[')) {
+        candidates.push(text);
+    }
+    for (start, ch) in text.char_indices() {
+        if !matches!(ch, '{' | '[') {
+            continue;
+        }
+        if let Some(len) = balanced_json_len(&text[start..]) {
+            let candidate = &text[start..start + len];
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
+}
+
+fn balanced_json_len(text: &str) -> Option<usize> {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+    for (offset, ch) in text.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn pretty_xml(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    let start = trimmed.find('<')?;
+    let mut rest = &trimmed[start..];
+    if !rest.contains('>') {
+        return None;
+    }
+
+    let mut indent = 0usize;
+    let mut lines = Vec::new();
+    while let Some(tag_start) = rest.find('<') {
+        let text = rest[..tag_start].trim();
+        if !text.is_empty() {
+            lines.push(format!("{}{}", "  ".repeat(indent), text));
+        }
+
+        rest = &rest[tag_start..];
+        let tag_end = rest.find('>')?;
+        let tag = rest[..=tag_end].trim();
+        if tag.starts_with("</") {
+            indent = indent.saturating_sub(1);
+        }
+        lines.push(format!("{}{}", "  ".repeat(indent), tag));
+        if xml_opens_child(tag) {
+            indent += 1;
+        }
+        rest = &rest[tag_end + 1..];
+    }
+
+    let tail = rest.trim();
+    if !tail.is_empty() {
+        lines.push(format!("{}{}", "  ".repeat(indent), tail));
+    }
+
+    (lines.len() > 1).then(|| lines.join("\n"))
+}
+
+fn xml_opens_child(tag: &str) -> bool {
+    tag.starts_with('<')
+        && !tag.starts_with("</")
+        && !tag.starts_with("<?")
+        && !tag.starts_with("<!")
+        && !tag.ends_with("/>")
+}
+
+fn pretty_sql(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    let start = sql_start(trimmed)?;
+    let sql = trimmed[start..].trim();
+    if !looks_like_sql(sql) {
+        return None;
+    }
+
+    let mut formatted = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    for keyword in [
+        r"UNION(?:\s+ALL)?",
+        r"(?:(?:LEFT|RIGHT|INNER|OUTER)\s+)?JOIN",
+        r"GROUP\s+BY",
+        r"ORDER\s+BY",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "VALUES",
+        "RETURNING",
+        "FROM",
+        "WHERE",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "SET",
+        "AND",
+        "OR",
+    ] {
+        let pattern = format!(r"(?i)\b{keyword}\b");
+        let regex = regex::Regex::new(&pattern).ok()?;
+        formatted = regex
+            .replace_all(&formatted, |captures: &regex::Captures| {
+                format!("\n{}", captures.get(0).unwrap().as_str())
+            })
+            .to_string();
+    }
+    formatted = formatted.replace(',', ",\n  ");
+
+    let lines: Vec<String> = formatted
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            if sql_line_starts_clause(line) {
+                line.to_string()
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect();
+
+    (lines.len() > 1).then(|| lines.join("\n"))
+}
+
+fn sql_start(text: &str) -> Option<usize> {
+    ["SELECT", "WITH", "INSERT", "UPDATE", "DELETE"]
+        .iter()
+        .filter_map(|keyword| {
+            let regex = regex::Regex::new(&format!(r"(?i)\b{}\b", keyword)).ok()?;
+            regex.find(text).map(|hit| hit.start())
+        })
+        .min()
+}
+
+fn looks_like_sql(sql: &str) -> bool {
+    let upper = format!(" {} ", sql.to_ascii_uppercase());
+    if upper.contains(" SELECT ") || upper.contains(" WITH ") {
+        return true;
+    }
+    if upper.contains(" INSERT ") {
+        return upper.contains(" INTO ") || upper.contains(" VALUES ");
+    }
+    if upper.contains(" UPDATE ") {
+        return upper.contains(" SET ");
+    }
+    if upper.contains(" DELETE ") {
+        return upper.contains(" FROM ");
+    }
+    false
+}
+
+fn sql_line_starts_clause(line: &str) -> bool {
+    let upper = line.to_ascii_uppercase();
+    [
+        "SELECT",
+        "WITH",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "VALUES",
+        "RETURNING",
+        "FROM",
+        "WHERE",
+        "GROUP BY",
+        "ORDER BY",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "JOIN",
+        "LEFT JOIN",
+        "RIGHT JOIN",
+        "INNER JOIN",
+        "OUTER JOIN",
+        "UNION",
+        "UNION ALL",
+        "SET",
+        "AND",
+        "OR",
+    ]
+    .iter()
+    .any(|keyword| upper.starts_with(keyword))
+}
+
+fn pretty_body_lines(body: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for raw in body.lines() {
+        if raw.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        for chunk in chunk_chars(raw, width) {
+            lines.push(Line::from(Span::raw(chunk)));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
 fn file_detail_lines(file: &LogFileModel, width: usize) -> Vec<Line<'static>> {
     let value_width = width.saturating_sub(DETAIL_LABEL_WIDTH + 1).max(8);
     let plain = Style::default();
@@ -10343,6 +10704,7 @@ Select/copy
   M                 add or edit the current line's bookmark note
   ]m / [m           next / previous bookmark in the current view
   Right-click       copy the substring, the clicked/selected rows, or detail text
+  P                 pretty-print the current message as JSON, XML, or SQL
   Esc               clear the selection, then the search
 
 Filter/search
@@ -10558,6 +10920,18 @@ mod tests {
             })
             .collect();
         std::fs::write(&log, body).unwrap();
+        boot(Project::load(root), &log)
+    }
+
+    fn app_with_message(root: &std::path::Path, message: &str) -> AppState {
+        let log = root.join("structured.log");
+        std::fs::write(
+            &log,
+            format!(
+                "2026-06-16 10:09:00.000 [HOST:h][SERVER:S][PID:5][THR:9][Kernel][Info][UID:0][SID:0][OID:0][D.cpp:0] {message}\n"
+            ),
+        )
+        .unwrap();
         boot(Project::load(root), &log)
     }
 
@@ -11663,6 +12037,48 @@ mod tests {
     }
 
     #[test]
+    fn p_pretty_prints_the_current_message_from_pane_or_detail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_message(
+            tmp.path(),
+            r#"payload={"user":"ada","roles":["admin","ops"]}"#,
+        );
+
+        press(&mut app, KeyCode::Char('P'));
+        match &app.mode {
+            Mode::PrettyPrint {
+                title,
+                body,
+                scroll,
+            } => {
+                assert_eq!(title, "Pretty JSON");
+                assert_eq!(*scroll, 0);
+                assert!(body.contains("\"roles\": ["), "{body}");
+                assert!(body.contains("\"admin\""), "{body}");
+            }
+            mode => panic!("expected pretty-print mode, got {mode:?}"),
+        }
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Pretty JSON"), "{screen}");
+
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::EntryDetail { .. }));
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.mode, Mode::PrettyPrint { ref title, .. } if title == "Pretty JSON"));
+    }
+
+    #[test]
+    fn p_reports_when_the_current_message_is_not_structured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_message(tmp.path(), "plain text only");
+
+        press(&mut app, KeyCode::Char('P'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status, "no JSON, XML, or SQL found in this message");
+    }
+
+    #[test]
     fn mouse_selects_and_copies_inline_detail_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_log(tmp.path());
@@ -12439,6 +12855,7 @@ mod tests {
         let pane = app.palette_commands();
         assert!(pane.contains(&Command::Copy));
         assert!(pane.contains(&Command::HideSimilar));
+        assert!(pane.contains(&Command::PrettyPrint));
         assert!(pane.contains(&Command::SplitColumns));
 
         // `:` opens it; typing narrows the list; Enter runs the top match.
@@ -14095,6 +14512,27 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(normalized.contains("the quick brown fox"));
+    }
+
+    #[test]
+    fn pretty_print_message_formats_json_xml_and_sql() {
+        let (kind, body) = pretty_print_message(r#"payload={"ok":true,"items":[1,2]}"#).unwrap();
+        assert_eq!(kind, "JSON");
+        assert!(body.contains("\"items\": ["), "{body}");
+
+        let (kind, body) = pretty_print_message("<root><item id=\"1\">x</item></root>").unwrap();
+        assert_eq!(kind, "XML");
+        assert!(body.contains("<root>"), "{body}");
+        assert!(body.contains("  <item id=\"1\">"), "{body}");
+
+        let (kind, body) =
+            pretty_print_message("query=select a,b from users where id = 1 order by a").unwrap();
+        assert_eq!(kind, "SQL");
+        assert!(body.contains("select a,"), "{body}");
+        assert!(body.contains("from users"), "{body}");
+        assert!(body.contains("where id = 1"), "{body}");
+
+        assert!(pretty_print_message("plain text only").is_none());
     }
 
     // ---- session restore -------------------------------------------------------
