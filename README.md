@@ -9,7 +9,8 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 
 **Contents:** [Features](#features) · [Quick Start](#quick-start) ·
 [Concept Model](#concept-model) · [Architecture](#architecture) · [Keys](#keys) ·
-[Command Palette](#command-palette) · [Filter Builder](#filter-builder) ·
+[Command Palette](#command-palette) · [Undo / History](#undo-redo-and-action-history) ·
+[Filter Builder](#filter-builder) · [Timeline](#timeline) ·
 [Filters](#filters-text-and-time) · [Search](#search-query-language) ·
 [Hiding by Example](#hiding-by-example) · [AI Assistant](#ai-assistant) ·
 [Log Formats](#log-formats) · [Building from Source](#building-from-source) ·
@@ -53,6 +54,9 @@ together they explain what the app is built out of and how the pieces fit and ru
 - **Guided filter builder.** Press `f` for dropdowns (schema, field, operator, action,
   value) with field-name and value suggestions, a live match-count preview, and validation —
   `Tab` switches to the raw grammar and back, and `Enter` on a filter reopens it to edit.
+- **Interactive timeline.** Press `b` for a compact histogram over the log's time span,
+  bucketed by level (or module or source). Spikes jump out; drag across the bars to make a
+  time-range filter, or click a bucket to zoom to it.
 - **Time range picker.** Press `t` for a picker with an editable start and end plus
   quick ranges (`Last 1 hour`, `Last 24 hours`, `Last 7 days`, ...). Quick ranges
   count back from the newest entry across all loaded logs, not the current time.
@@ -89,6 +93,9 @@ together they explain what the app is built out of and how the pieces fit and ru
 - **Command palette.** `Ctrl+P` or `:` opens a searchable, context-aware action list — type
   to filter, `Enter` runs it — so the rich feature set is discoverable without leaving the
   keyboard. Every action still has its own key.
+- **Undo / redo.** `u` undoes and `Ctrl+r` redoes filters, time ranges, searches, merges,
+  layout changes, and anything the AI applied. `U` shows an action-history popup — recent
+  User and AI actions with timestamps — so you can see (and reverse) what the assistant did.
 - **Vim-style navigation.** Supports `j/k`, `gg`, `G`, `[count]j`,
   `[count]G`, paging, and horizontal scroll.
 - **Split panes.** Use `|` for columns and `-` for rows.
@@ -304,6 +311,7 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | Key | Action |
 |---|---|
 | `Ctrl+P` / `:` | open the searchable, context-aware command palette |
+| `u` / `Ctrl+r` / `U` | undo / redo / show the action history |
 | `a` / `o` | browse for a file to add / browse for a folder |
 | `d` / `Delete` | delete the selected item: a log source, a filter, or a saved search |
 | `j k` or arrows | move selection |
@@ -340,6 +348,7 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `[` / `]` | narrow / widen the sidebar (or drag its separator) |
 | `Ctrl+←/→`, `Ctrl+↑/↓` | resize the focused pane (or drag the border between panes) |
 | `z` | focus mode — show only the active pane |
+| `b` | timeline histogram: cycle off / level / module / source (drag its bars to filter) |
 | `A` | open the AI chat panel (Enter to send, Esc to cancel/leave) |
 | `Tab` / `Shift+Tab` | cycle sidebar, panes, and search results |
 | `Enter` (pane) | open a larger detail popup for the selected log row |
@@ -409,6 +418,29 @@ stays inside a day, `06-16 23:00:00 → 06-17 01:00:00` when it does not, `from 
 `until …` for an open end, and the span in brackets. The detail panel below spells out the
 full start, end and span.
 
+## Undo, Redo, and Action History
+
+Filters are saved automatically and the AI can change filters, searches, and time ranges
+through the same operations you use — so `u` **undoes** and `Ctrl+r` **redoes** them:
+
+- add / edit / delete a filter, apply a time range, run a saved search,
+- add or remove a source from a merged pane, change the layout,
+- and anything the AI applied.
+
+It works by snapshotting the state (filters, saved searches, and the pane/layout session) and
+committing a step only when an action actually changed something — a whole mouse drag is one
+step, and no-ops record nothing.
+
+`U` opens an **action history** popup so you can see what happened, especially what the
+assistant did:
+
+```text
+Action History  (u undo · Ctrl+r redo · any key closes)
+12:31 AI    added filter: exclude level equals 'INFO'
+12:31 AI    searched: "connection reset"
+12:32 User  changed time range: 10:00:00 → 10:30:00
+```
+
 ## Filter Builder
 
 Press `f` for a guided builder — no grammar to remember. `↑`/`↓` pick a row, `←`/`→` cycle a
@@ -451,6 +483,29 @@ module contains include SQL
 timestamp range include 2026-06-16 10:09:50..
 message regex exclude timeout|closed
 ```
+
+## Timeline
+
+Press `b` for a compact histogram above the pane, bucketed over the time span of the lines in
+view. Each row is one value of the aggregation field, so an incident spike is obvious at a
+glance:
+
+```text
+┌Timeline · level   (b change · drag to filter)──────────────┐
+│Info      ▅▅▂▅ ▅▂▅▂  ▂▅▂ ▅▂▅▂▅                    ▂▅ ▅▂▅▂ ▅▂ │
+│Warn      ▂  ▂    ▂ ▂   ▂  ▂     ▂        ▂   ▂ ▂    ▂  ▂    │
+│Error                       ██████████                      │
+│          10:00:00                                  10:59:59 │
+└────────────────────────────────────────────────────────────┘
+```
+
+- **`b`** cycles the aggregation: off → by level → by module → by source → off. Level rows are
+  coloured like the log (errors red, warnings yellow, …).
+- **Drag across the bars** to build the project's time-range filter over that span; a **click**
+  zooms to a single bucket. It is the same time filter the `t` picker sets, so the view
+  narrows immediately.
+- It reads the lines currently in view, so it reflects your filters and search, and works on
+  a timestamp-merged pane spanning several sources.
 
 ## Time Range Picker
 

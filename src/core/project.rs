@@ -63,6 +63,8 @@ pub struct Session {
     pub hide_results: bool,
     #[serde(default)]
     pub focus_mode: bool,
+    #[serde(default)]
+    pub timeline_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

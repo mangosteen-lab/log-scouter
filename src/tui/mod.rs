@@ -56,6 +56,43 @@ struct PaneState {
     view: ViewModel,
 }
 
+/// A restorable slice of state for undo/redo: everything a user or the AI mutates through the
+/// app's operations. The `session` descriptor already carries the pane composition (including
+/// merges), per-pane search, and the workspace layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    filters: crate::core::filters::FilterSet,
+    saved_searches: Vec<String>,
+    session: crate::core::project::Session,
+}
+
+/// Who performed an action, for the history popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Actor {
+    User,
+    Ai,
+}
+
+impl Actor {
+    fn label(self) -> &'static str {
+        match self {
+            Actor::User => "User",
+            Actor::Ai => "AI",
+        }
+    }
+}
+
+/// One line in the action-history popup.
+#[derive(Debug, Clone)]
+struct ActionEntry {
+    time: String,
+    actor: Actor,
+    description: String,
+}
+
+/// Cap on the undo stack and the action log, to bound memory.
+const HISTORY_LIMIT: usize = 100;
+
 /// The adjustable workspace layout: panel visibility, sidebar width, per-pane size weights,
 /// and focus mode. Saved with the session so a folder reopens the way you left it.
 #[derive(Debug, Clone)]
@@ -74,6 +111,8 @@ struct Workspace {
     show_results: bool,
     /// Show only the active log pane, hiding the sidebar, results, and other panes.
     focus_mode: bool,
+    /// The field the timeline histogram buckets by, or `None` when the timeline is hidden.
+    timeline_field: Option<String>,
 }
 
 impl Default for Workspace {
@@ -89,9 +128,37 @@ impl Default for Workspace {
             show_chat: true,
             show_results: true,
             focus_mode: false,
+            timeline_field: None,
         }
     }
 }
+
+/// Where the timeline columns map in time, recorded each frame for mouse selection.
+#[derive(Debug, Clone, Copy)]
+struct TimelineGeom {
+    /// The x of the first histogram column (past the row labels).
+    x0: u16,
+    buckets: usize,
+    /// The rows the histogram sparklines occupy, for hit-testing.
+    y0: u16,
+    y1: u16,
+    min: NaiveDateTime,
+    max: NaiveDateTime,
+}
+
+/// The bars-per-bucket histogram to draw: one row per aggregation value.
+struct TimelineData {
+    min: NaiveDateTime,
+    max: NaiveDateTime,
+    rows: Vec<(String, Vec<u32>)>,
+}
+
+/// Sparkline bars from empty to full.
+const SPARK_BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Aggregation values shown as separate histogram rows.
+const TIMELINE_MAX_ROWS: usize = 4;
+/// Columns reserved for each row's value label, before the sparkline.
+const TIMELINE_LABEL_WIDTH: usize = 10;
 
 /// One rendered line in the chat transcript.
 #[derive(Debug, Clone)]
@@ -461,6 +528,8 @@ enum Mode {
         scroll: usize,
     },
     Help,
+    /// The action-history popup (`U`): recent user and AI actions.
+    ActionLog,
     /// The command palette (`Ctrl+P` / `:`): a searchable, context-aware action list.
     Palette(Palette),
     /// The guided filter builder (`f`): dropdowns for schema/field/op/action/value with a
@@ -495,7 +564,11 @@ enum Command {
     SplitColumns,
     SplitRows,
     ClosePane,
+    Undo,
+    Redo,
+    ActionHistory,
     FocusMode,
+    Timeline,
     ToggleSidebar,
     ToggleDetail,
     ToggleResults,
@@ -531,7 +604,11 @@ impl Command {
             Command::SplitColumns => "Split into columns",
             Command::SplitRows => "Split into rows",
             Command::ClosePane => "Close pane",
+            Command::Undo => "Undo",
+            Command::Redo => "Redo",
+            Command::ActionHistory => "Action history",
             Command::FocusMode => "Focus mode (only the active pane)",
+            Command::Timeline => "Timeline (cycle by level / module / source)",
             Command::ToggleSidebar => "Toggle sidebar",
             Command::ToggleDetail => "Toggle detail panel",
             Command::ToggleResults => "Toggle results panel",
@@ -567,7 +644,11 @@ impl Command {
             Command::SplitColumns => "|",
             Command::SplitRows => "-",
             Command::ClosePane => "w",
+            Command::Undo => "u",
+            Command::Redo => "Ctrl+r",
+            Command::ActionHistory => "U",
             Command::FocusMode => "z",
+            Command::Timeline => "b",
             Command::ToggleSidebar => "",
             Command::ToggleDetail => "",
             Command::ToggleResults => "",
@@ -986,6 +1067,11 @@ enum MouseDrag {
         panel: PanelEdge,
         bottom: u16,
     },
+    /// Dragging across timeline buckets to build a time-range filter; `anchor_col` is where
+    /// the press landed.
+    Timeline {
+        anchor_col: u16,
+    },
 }
 
 /// A stacked panel whose height can be dragged.
@@ -1112,8 +1198,15 @@ pub fn run(project: Project) -> anyhow::Result<()> {
     app.queue_initial_loads();
 
     loop {
-        // A reply from the AI worker may have arrived; run any tools it asked for.
-        app.drain_ai_events();
+        // A reply from the AI worker may have arrived; run any tools it asked for. Wrap it
+        // so any state the AI changed becomes one undo step, attributed to the AI.
+        if app.ai_busy() {
+            let before = app.undo_snapshot();
+            app.drain_ai_events();
+            app.commit_change(before, Actor::Ai);
+        } else {
+            app.drain_ai_events();
+        }
         // A schema-inference reply may have arrived; open its suggestion for review.
         app.drain_schema_events();
 
@@ -1146,11 +1239,32 @@ pub fn run(project: Project) -> anyhow::Result<()> {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    if app.handle_key(key)? {
+                    // Record the pre-key state, act, then commit an undo step if it changed.
+                    let before = app.undo_snapshot();
+                    let quit = app.handle_key(key)?;
+                    app.commit_change(before, Actor::User);
+                    if quit {
                         break;
                     }
                 }
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                // Drags fire many events; capture on press and commit on release so a whole
+                // drag is a single undo step.
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            app.undo_pending = Some(app.undo_snapshot());
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            app.handle_mouse(mouse);
+                            if let Some(before) = app.undo_pending.take() {
+                                app.commit_change(before, Actor::User);
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    app.handle_mouse(mouse);
+                }
                 _ => {}
             }
         }
@@ -1253,6 +1367,16 @@ struct AppState {
     pane_layout: Vec<Rect>,
     /// Draggable panel top-borders (results, detail, chat) recorded this frame.
     panel_separators: Vec<PanelSeparator>,
+    /// The timeline's column-to-time mapping this frame, for drag-to-filter.
+    timeline_geom: Option<TimelineGeom>,
+    /// Undo/redo stacks of state snapshots, and the human-readable action log.
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
+    /// The state captured on mouse-down, committed on mouse-up so a drag is one undo step.
+    undo_pending: Option<Snapshot>,
+    /// Set by undo/redo so the surrounding commit does not re-record their effect.
+    did_undo_redo: bool,
+    action_log: Vec<ActionEntry>,
 }
 
 impl AppState {
@@ -1291,6 +1415,12 @@ impl AppState {
             body_area: Rect::default(),
             pane_layout: Vec::new(),
             panel_separators: Vec::new(),
+            timeline_geom: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            undo_pending: None,
+            did_undo_redo: false,
+            action_log: Vec::new(),
         };
         app.restore_session();
         app
@@ -1317,6 +1447,7 @@ impl AppState {
             show_chat: !session.hide_chat,
             show_results: !session.hide_results,
             focus_mode: session.focus_mode,
+            timeline_field: session.timeline_field.clone(),
         };
 
         for pane_session in &session.panes {
@@ -1399,7 +1530,84 @@ impl AppState {
             hide_chat: !self.workspace.show_chat,
             hide_results: !self.workspace.show_results,
             focus_mode: self.workspace.focus_mode,
+            timeline_field: self.workspace.timeline_field.clone(),
         });
+    }
+
+    // ---- Undo / redo ------------------------------------------------------------------
+
+    /// Snapshot the state undo/redo tracks: filters, saved searches, and the pane/layout
+    /// session descriptor.
+    fn undo_snapshot(&mut self) -> Snapshot {
+        self.capture_session();
+        Snapshot {
+            filters: self.project.filters.clone(),
+            saved_searches: self.project.saved_searches.clone(),
+            session: self.project.session.clone().unwrap_or_default(),
+        }
+    }
+
+    /// After an action, record `before` on the undo stack if the state actually changed, and
+    /// log it. A no-op right after an undo/redo, which manage the stacks themselves.
+    fn commit_change(&mut self, before: Snapshot, actor: Actor) {
+        if self.did_undo_redo {
+            self.did_undo_redo = false;
+            return;
+        }
+        let after = self.undo_snapshot();
+        if after == before {
+            return;
+        }
+        let description = describe_change(&before, &after);
+        if self.undo_stack.len() >= HISTORY_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(before);
+        self.redo_stack.clear();
+        self.action_log.push(ActionEntry {
+            time: chrono::Local::now().format("%H:%M").to_string(),
+            actor,
+            description,
+        });
+        if self.action_log.len() > HISTORY_LIMIT {
+            self.action_log.remove(0);
+        }
+    }
+
+    fn restore_snapshot(&mut self, snapshot: Snapshot) {
+        self.project.filters = snapshot.filters;
+        self.project.saved_searches = snapshot.saved_searches;
+        self.project.session = Some(snapshot.session);
+        self.panes.clear();
+        self.pending_merges.clear();
+        self.restore_session();
+        self.apply_pending_merges();
+        self.requeue_all_panes();
+        self.autosave_project();
+    }
+
+    fn undo(&mut self) {
+        let Some(previous) = self.undo_stack.pop() else {
+            self.status = "nothing to undo".to_string();
+            return;
+        };
+        let current = self.undo_snapshot();
+        self.redo_stack.push(current);
+        self.restore_snapshot(previous);
+        self.did_undo_redo = true;
+        self.status = "undid last action".to_string();
+    }
+
+    fn redo(&mut self) {
+        let Some(next) = self.redo_stack.pop() else {
+            self.status = "nothing to redo".to_string();
+            return;
+        };
+        let current = self.undo_snapshot();
+        self.undo_stack.push(current);
+        self.restore_snapshot(next);
+        self.did_undo_redo = true;
+        self.status = "redid action".to_string();
     }
 
     /// Rebuild any restored merged pane whose files have all arrived.
@@ -1854,7 +2062,26 @@ impl AppState {
             self.detail_area = Rect::default();
             rows[1]
         };
-        self.draw_panes(frame, pane_area);
+
+        // The timeline histogram, when on, sits above the panes.
+        self.timeline_geom = None;
+        let panes_area = match self.workspace.timeline_field.clone() {
+            Some(field) if !focus => match self.compute_timeline(&field, pane_area.width) {
+                Some(data) => {
+                    let height =
+                        (data.rows.len() as u16 + 3).min(pane_area.height.saturating_sub(4));
+                    let split = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(height), Constraint::Min(4)])
+                        .split(pane_area);
+                    self.draw_timeline(frame, split[0], &field, &data);
+                    split[1]
+                }
+                None => pane_area,
+            },
+            _ => pane_area,
+        };
+        self.draw_panes(frame, panes_area);
 
         if show_results {
             // The border above the results panel is draggable to resize its height.
@@ -1942,6 +2169,233 @@ impl AppState {
                 .min(body_width),
             None => sidebar_width(body_width),
         }
+    }
+
+    // ---- Timeline histogram -----------------------------------------------------------
+
+    /// Bucket the focused view's entries over their time span, counting each value of
+    /// `field` per bucket. `None` when there is nothing to show (no timestamps).
+    fn compute_timeline(&self, field: &str, panel_width: u16) -> Option<TimelineData> {
+        let buckets = (panel_width as usize)
+            .saturating_sub(TIMELINE_LABEL_WIDTH + 2)
+            .max(1);
+        let (file, view) = self.active_file_view()?;
+        if view.visible.is_empty() {
+            return None;
+        }
+
+        // Pass 1: the time span across the visible entries (capped).
+        let mut min: Option<NaiveDateTime> = None;
+        let mut max: Option<NaiveDateTime> = None;
+        for global in view.visible.iter().take(PATTERN_PREVIEW_LIMIT) {
+            let Some(entry) = file.entries.get(global) else {
+                continue;
+            };
+            if let Some(ts) = file.timestamp(entry) {
+                min = Some(min.map_or(ts, |m| m.min(ts)));
+                max = Some(max.map_or(ts, |m| m.max(ts)));
+            }
+        }
+        let (min, max) = (min?, max?);
+        let span_ms = (max - min).num_milliseconds().max(0) as f64;
+
+        // Pass 2: count each value of `field` into its bucket.
+        let mut counts: std::collections::HashMap<String, Vec<u32>> =
+            std::collections::HashMap::new();
+        for global in view.visible.iter().take(PATTERN_PREVIEW_LIMIT) {
+            let Some(entry) = file.entries.get(global) else {
+                continue;
+            };
+            let Some(ts) = file.timestamp(entry) else {
+                continue;
+            };
+            let value = file.with_field(entry, field, |text| text.trim().to_string());
+            if value.is_empty() {
+                continue;
+            }
+            let bucket = if span_ms <= 0.0 {
+                0
+            } else {
+                let position = (ts - min).num_milliseconds() as f64 / span_ms;
+                ((position * (buckets as f64 - 1.0)).round() as usize).min(buckets - 1)
+            };
+            counts.entry(value).or_insert_with(|| vec![0; buckets])[bucket] += 1;
+        }
+        if counts.is_empty() {
+            return None;
+        }
+
+        // Keep the busiest values, most frequent first.
+        let mut rows: Vec<(String, Vec<u32>)> = counts.into_iter().collect();
+        rows.sort_by(|a, b| {
+            b.1.iter()
+                .sum::<u32>()
+                .cmp(&a.1.iter().sum::<u32>())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        rows.truncate(TIMELINE_MAX_ROWS);
+        Some(TimelineData { min, max, rows })
+    }
+
+    fn draw_timeline(&mut self, frame: &mut Frame, area: Rect, field: &str, data: &TimelineData) {
+        let level_field = field == "level" || field.ends_with("_level");
+        let block = Block::default()
+            .title(format!("Timeline · {field}   (b change · drag to filter)"))
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let global_max = data
+            .rows
+            .iter()
+            .flat_map(|(_, counts)| counts.iter())
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(1) as f64;
+        let buckets = data.rows.first().map(|(_, c)| c.len()).unwrap_or(0);
+
+        for (index, (value, counts)) in data.rows.iter().enumerate() {
+            if index as u16 >= inner.height.saturating_sub(1) {
+                break;
+            }
+            let label: String = value.chars().take(TIMELINE_LABEL_WIDTH - 1).collect();
+            let spark: String = counts
+                .iter()
+                .map(|&count| {
+                    if count == 0 {
+                        ' '
+                    } else {
+                        let level = ((count as f64 / global_max) * 7.0).round() as usize;
+                        SPARK_BARS[level.min(7)]
+                    }
+                })
+                .collect();
+            let style = if level_field {
+                level_style(value)
+            } else {
+                Style::default()
+            };
+            let line = format!("{label:<width$}{spark}", width = TIMELINE_LABEL_WIDTH);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(line, style))),
+                Rect {
+                    y: inner.y + index as u16,
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
+
+        // A time axis under the bars: start on the left, end on the right.
+        let axis_y = inner.y + inner.height - 1;
+        let fmt = if data.max.date() == data.min.date() {
+            "%H:%M:%S"
+        } else {
+            "%m-%d %H:%M"
+        };
+        let start = data.min.format(fmt).to_string();
+        let end = data.max.format(fmt).to_string();
+        let x0 = inner.x + TIMELINE_LABEL_WIDTH as u16;
+        let axis_width = inner.width.saturating_sub(TIMELINE_LABEL_WIDTH as u16) as usize;
+        let mut axis = format!("{start:<width$}", width = axis_width);
+        if end.len() < axis_width {
+            axis.replace_range(axis_width - end.len().., &end);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                axis,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Rect {
+                x: x0,
+                y: axis_y,
+                width: inner.width.saturating_sub(TIMELINE_LABEL_WIDTH as u16),
+                height: 1,
+            },
+        );
+
+        self.timeline_geom = Some(TimelineGeom {
+            x0,
+            buckets,
+            y0: inner.y,
+            y1: axis_y.saturating_sub(1),
+            min: data.min,
+            max: data.max,
+        });
+    }
+
+    /// `b`: cycle the timeline through off → by level → by module → by source → off.
+    fn cycle_timeline(&mut self) {
+        let choices = self.timeline_field_choices();
+        let next = match &self.workspace.timeline_field {
+            None => choices.first().cloned(),
+            Some(current) => match choices.iter().position(|choice| choice == current) {
+                Some(index) if index + 1 < choices.len() => Some(choices[index + 1].clone()),
+                _ => None,
+            },
+        };
+        self.workspace.timeline_field = next;
+        self.status = match &self.workspace.timeline_field {
+            Some(field) => format!("timeline by {field}"),
+            None => "timeline off".to_string(),
+        };
+    }
+
+    /// The fields the timeline can aggregate by, in cycle order: the level, a module field
+    /// if the schema has one, and the source.
+    fn timeline_field_choices(&self) -> Vec<String> {
+        let fields = self.active_field_names();
+        let mut choices = Vec::new();
+        if let Some(level) = fields
+            .iter()
+            .find(|name| name.as_str() == "level" || name.ends_with("_level"))
+        {
+            choices.push(level.clone());
+        }
+        if let Some(module) = fields.iter().find(|name| name.contains("module")) {
+            choices.push(module.clone());
+        }
+        choices.push("source".to_string());
+        choices
+    }
+
+    /// Turn a drag (or click) across timeline buckets into the project time-range filter.
+    fn apply_timeline_range(&mut self, col_a: u16, col_b: u16) {
+        let Some(geom) = self.timeline_geom else {
+            return;
+        };
+        if geom.buckets == 0 {
+            return;
+        }
+        let to_bucket =
+            |column: u16| (column.saturating_sub(geom.x0) as usize).min(geom.buckets - 1);
+        let (lo, hi) = {
+            let (a, b) = (to_bucket(col_a), to_bucket(col_b));
+            (a.min(b), a.max(b))
+        };
+        let span_ms = (geom.max - geom.min).num_milliseconds().max(1);
+        let per = span_ms / geom.buckets as i64;
+        let start = geom.min + ChronoDuration::milliseconds(per * lo as i64);
+        let end = geom.min + ChronoDuration::milliseconds((per * (hi as i64 + 1)).min(span_ms));
+        self.apply_time_range(format!(
+            "{}..{}",
+            format_filter_datetime(start),
+            format_filter_datetime(end)
+        ));
+    }
+
+    /// Whether `(column, row)` is on the timeline's histogram bars.
+    fn on_timeline(&self, column: u16, row: u16) -> bool {
+        self.timeline_geom.is_some_and(|geom| {
+            row >= geom.y0
+                && row <= geom.y1
+                && column >= geom.x0
+                && column < geom.x0 + geom.buckets as u16
+        })
     }
 
     fn draw_progress(&self, frame: &mut Frame, root: Rect) {
@@ -2771,6 +3225,7 @@ impl AppState {
             }
             Mode::Palette(palette) => self.draw_palette(frame, root, palette),
             Mode::FilterBuilder(builder) => self.draw_filter_builder(frame, root, &builder),
+            Mode::ActionLog => self.draw_action_log(frame, root),
         }
     }
 
@@ -2913,6 +3368,44 @@ impl AppState {
         // Caret sits in the query line, right after what has been typed.
         let caret = (2 + palette.query.chars().count()).min(text_width.saturating_sub(1));
         frame.set_cursor_position((inner.x + caret as u16, inner.y));
+    }
+
+    fn draw_action_log(&self, frame: &mut Frame, root: Rect) {
+        let width = 72.min(root.width);
+        let visible = 16usize;
+        let height = ((self.action_log.len().min(visible) + 3) as u16).min(root.height.max(6));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title("Action History  (u undo · Ctrl+r redo · any key closes)")
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+
+        let mut lines: Vec<Line> = Vec::new();
+        if self.action_log.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "no actions yet",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            // Most recent last, showing the tail that fits.
+            let start = self.action_log.len().saturating_sub(inner.height as usize);
+            for entry in &self.action_log[start..] {
+                let actor = Style::default().fg(match entry.actor {
+                    Actor::Ai => Color::Cyan,
+                    Actor::User => Color::White,
+                });
+                let line = format!(
+                    "{} {:<4} {}",
+                    entry.time,
+                    entry.actor.label(),
+                    entry.description
+                );
+                lines.push(Line::from(Span::styled(crop(&line, 0, text_width), actor)));
+            }
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     fn draw_filter_builder(&self, frame: &mut Frame, root: Rect, builder: &FilterBuilder) {
@@ -3399,7 +3892,7 @@ impl AppState {
             | Mode::HidePattern(_) => 1,
             Mode::HideChoice(_) => 2,
             Mode::EntryDetail { .. } => 3,
-            Mode::Help => 4,
+            Mode::Help | Mode::ActionLog => 4,
             Mode::TimePicker(_) => 5,
             Mode::OpenFolder(_) => 6,
             Mode::Palette(_) => 7,
@@ -3433,7 +3926,13 @@ impl AppState {
             MouseEventKind::Down(MouseButton::Right) => self.copy_from_mouse(mouse),
             MouseEventKind::Down(MouseButton::Left) => self.begin_mouse_selection(mouse),
             MouseEventKind::Drag(MouseButton::Left) => self.drag_mouse_selection(mouse),
-            MouseEventKind::Up(MouseButton::Left) => self.mouse_drag = None,
+            MouseEventKind::Up(MouseButton::Left) => {
+                // A timeline drag (or click) applies its range on release.
+                if let Some(MouseDrag::Timeline { anchor_col }) = self.mouse_drag {
+                    self.apply_timeline_range(anchor_col, mouse.column);
+                }
+                self.mouse_drag = None;
+            }
             _ => {}
         }
     }
@@ -3485,6 +3984,13 @@ impl AppState {
             self.mouse_drag = Some(MouseDrag::PanelHeight {
                 panel: separator.panel,
                 bottom: separator.bottom,
+            });
+            return;
+        }
+        // A press on the timeline starts a drag that becomes a time-range filter on release.
+        if self.on_timeline(mouse.column, mouse.row) {
+            self.mouse_drag = Some(MouseDrag::Timeline {
+                anchor_col: mouse.column,
             });
             return;
         }
@@ -3586,6 +4092,8 @@ impl AppState {
                 });
                 self.report_detail_selection();
             }
+            // A timeline drag applies its range on release, not continuously.
+            Some(MouseDrag::Timeline { .. }) => {}
             None => {}
         }
     }
@@ -3860,6 +4368,10 @@ impl AppState {
                     self.open_palette();
                     return Ok(false);
                 }
+                KeyCode::Char('r') => {
+                    self.redo();
+                    return Ok(false);
+                }
                 // Along a vertical (stacked) split, Ctrl+Up/Down resize the focused pane;
                 // otherwise they travel while keeping the selection.
                 KeyCode::Up => {
@@ -4070,6 +4582,9 @@ impl AppState {
             KeyCode::Char('[') => self.resize_sidebar(-4),
             KeyCode::Char(']') => self.resize_sidebar(4),
             KeyCode::Char('z') => self.toggle_focus_mode(),
+            KeyCode::Char('b') => self.cycle_timeline(),
+            KeyCode::Char('u') => self.undo(),
+            KeyCode::Char('U') => self.mode = Mode::ActionLog,
             KeyCode::Char('w') => self.close_active_pane(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char(':') => self.open_palette(),
@@ -5493,6 +6008,10 @@ impl AppState {
             Command::ImportFilters,
             Command::ExportFilters,
             Command::AskAi,
+            Command::Undo,
+            Command::Redo,
+            Command::ActionHistory,
+            Command::Timeline,
             Command::FocusMode,
             Command::ToggleSidebar,
             Command::ToggleDetail,
@@ -5547,7 +6066,11 @@ impl AppState {
             Command::SplitColumns => self.split_active(SplitMode::Horizontal),
             Command::SplitRows => self.split_active(SplitMode::Vertical),
             Command::ClosePane => self.close_active_pane(),
+            Command::Undo => self.undo(),
+            Command::Redo => self.redo(),
+            Command::ActionHistory => self.mode = Mode::ActionLog,
             Command::FocusMode => self.toggle_focus_mode(),
+            Command::Timeline => self.cycle_timeline(),
             Command::ToggleSidebar => self.toggle_sidebar(),
             Command::ToggleDetail => self.toggle_detail(),
             Command::ToggleResults => self.toggle_results_panel(),
@@ -8042,6 +8565,65 @@ fn summarize_time_range(rule: &FilterRule) -> String {
     }
 }
 
+/// A short, human-readable description of what changed between two snapshots, for the action
+/// log. Best-effort: it reports the single most salient difference.
+fn describe_change(before: &Snapshot, after: &Snapshot) -> String {
+    if before.filters != after.filters {
+        if before.filters.time_rule() != after.filters.time_rule() {
+            return match after.filters.time_rule() {
+                Some(rule) => format!("changed time range: {}", summarize_time_range(rule)),
+                None => "cleared time range".to_string(),
+            };
+        }
+        let (b, a) = (&before.filters.rules, &after.filters.rules);
+        if a.len() > b.len() {
+            return match a.iter().find(|rule| !b.contains(rule)) {
+                Some(rule) => format!("added filter: {}", rule.describe()),
+                None => "added filter".to_string(),
+            };
+        }
+        if a.len() < b.len() {
+            return match b.iter().find(|rule| !a.contains(rule)) {
+                Some(rule) => format!("removed filter: {}", rule.describe()),
+                None => "removed filter".to_string(),
+            };
+        }
+        return "edited a filter".to_string();
+    }
+    if before.saved_searches != after.saved_searches {
+        return "changed saved searches".to_string();
+    }
+
+    let queries = |snapshot: &Snapshot| -> Vec<String> {
+        snapshot
+            .session
+            .panes
+            .iter()
+            .map(|pane| pane.query.clone())
+            .collect()
+    };
+    if queries(before) != queries(after) {
+        return match queries(after).into_iter().find(|query| !query.is_empty()) {
+            Some(query) => format!("searched: {query:?}"),
+            None => "cleared search".to_string(),
+        };
+    }
+
+    let sources = |snapshot: &Snapshot| -> Vec<Vec<String>> {
+        snapshot
+            .session
+            .panes
+            .iter()
+            .map(|pane| pane.file_ids.clone())
+            .collect()
+    };
+    if sources(before) != sources(after) {
+        return "changed the pane's sources".to_string();
+    }
+
+    "changed the layout".to_string()
+}
+
 fn format_range_bound(value: NaiveDateTime, with_date: bool) -> String {
     let time = if value.and_utc().timestamp_subsec_millis() == 0 {
         value.format("%H:%M:%S").to_string()
@@ -8701,7 +9283,11 @@ fn centered_rect(width: u16, height: u16, root: Rect) -> Rect {
 }
 
 fn help_text() -> &'static str {
-    "Command palette
+    "Undo / history
+  u undo   Ctrl+r redo   (filters, time range, searches, merges, layout, AI-applied ops)
+  U shows the action history: recent User and AI actions with timestamps
+
+Command palette
   Ctrl+P or : opens a searchable, context-aware action list; type to filter, Enter runs it
 
 Project/files
@@ -8749,6 +9335,8 @@ Filter/search
   by each new range rather than intersected with the old)
   T elapsed time from this line (again to restore absolute timestamps)
   H hide like current row
+  b timeline histogram: cycle off / by level / by module / by source; drag across its
+    bars to build a time-range filter (a click zooms to one bucket)
   x export filters  L import filters
   X export schemas  I import schemas (merges; existing names are kept)
   Time range picker presets count back from the newest entry, not from now
@@ -10879,6 +11467,74 @@ mod tests {
         assert!(!reopened.workspace.show_detail);
         assert!(!reopened.workspace.show_sidebar);
         assert!(reopened.workspace.sidebar_width.is_some());
+    }
+
+    #[test]
+    fn undo_and_redo_restore_filters_and_log_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        assert_eq!(app.project.filters.rules.len(), 0);
+
+        // Apply a filter through the same capture/commit path the run loop uses.
+        let before = app.undo_snapshot();
+        app.submit_filter("log_level equals exclude Trace".to_string());
+        app.commit_change(before, Actor::User);
+        app.finish_work();
+        assert_eq!(app.project.filters.rules.len(), 1);
+        assert_eq!(app.action_log.len(), 1);
+        assert!(
+            app.action_log[0].description.contains("added filter"),
+            "{}",
+            app.action_log[0].description
+        );
+
+        // Undo removes it; redo brings it back.
+        app.undo();
+        app.finish_work();
+        assert_eq!(app.project.filters.rules.len(), 0);
+        app.redo();
+        app.finish_work();
+        assert_eq!(app.project.filters.rules.len(), 1);
+
+        // An unchanged action records nothing.
+        let before = app.undo_snapshot();
+        app.status = "just a status message".to_string();
+        app.commit_change(before, Actor::User);
+        assert_eq!(app.action_log.len(), 1, "no-op did not log");
+    }
+
+    #[test]
+    fn timeline_buckets_entries_and_drag_sets_a_time_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 20);
+
+        // `b` turns the timeline on, aggregating by the level field.
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.workspace.timeline_field.as_deref(), Some("log_level"));
+
+        let data = app
+            .compute_timeline("log_level", 80)
+            .expect("timeline data");
+        // app_with_lines writes Trace lines; every entry is counted into a bucket.
+        assert!(data.rows.iter().any(|(value, _)| value == "Trace"));
+        let counted: u32 = data.rows.iter().flat_map(|(_, c)| c.iter()).sum();
+        assert_eq!(counted, 20);
+
+        // A drag across buckets builds the project's time-range filter.
+        app.timeline_geom = Some(TimelineGeom {
+            x0: 10,
+            buckets: 60,
+            y0: 2,
+            y1: 5,
+            min: data.min,
+            max: data.max,
+        });
+        app.apply_timeline_range(20, 45);
+        app.finish_work();
+        assert!(
+            app.project.filters.time_rule().is_some(),
+            "drag set a time range"
+        );
     }
 
     #[test]
