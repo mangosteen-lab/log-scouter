@@ -3,7 +3,7 @@ use crate::ai::message::{Assistant, ChatMsg, ToolResult};
 use crate::ai::{tools as ai_tools, AgentRequest, AiWorker};
 use crate::core::extractor::{
     export_schemas_to_folder, load_schemas_from_folder, user_schema_dir, Extractor,
-    BRACKETED_DEFAULT_FORMAT, DEFAULT_TIMESTAMP_FORMAT, GENERIC_EXTRACTOR_NAME,
+    BRACKETED_DEFAULT_FORMAT, DEFAULT_TIMESTAMP_FORMAT, DETECT_LINES, GENERIC_EXTRACTOR_NAME,
     USER_SCHEMAS_SUBDIR,
 };
 use crate::core::filters::{
@@ -52,6 +52,9 @@ const CONTEXT_CYCLE: &[usize] = &[0, 3, 10];
 const DETAIL_LABEL_WIDTH: usize = 14;
 const USER_BOOKMARKS_SUBDIR: &str = "bookmarks";
 const SCHEMA_INFER_SAMPLE_LINES: usize = 100;
+/// Minimum non-empty lines a live/stdin source must capture before its one-shot schema
+/// auto-detection runs -- enough for `detect` to be meaningful, small enough to feel instant.
+const LIVE_AUTODETECT_MIN_LINES: usize = 5;
 const SOURCE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,8 +823,9 @@ impl SourceEditor {
     const SHORT_NAME: usize = 0;
     const DESCRIPTION: usize = 1;
     const TAG: usize = 2;
+    /// Row index of the first schema. Schemas occupy `SCHEMA .. SCHEMA + schemas.len()`, one
+    /// row each, so any of them can be selected, reordered, or removed.
     const SCHEMA: usize = 3;
-    const ROWS: usize = 4;
 
     fn new(file: &LogFileModel) -> Self {
         let schemas: Vec<String> = file
@@ -843,14 +847,18 @@ impl SourceEditor {
         }
     }
 
+    fn total_rows(&self) -> usize {
+        Self::SCHEMA + self.schemas.len()
+    }
+
     fn pick(&mut self, delta: isize) {
         self.row = self
             .row
             .saturating_add_signed(delta)
-            .min(Self::ROWS.saturating_sub(1));
+            .min(self.total_rows().saturating_sub(1));
     }
 
-    /// The three free-text rows. The schema row is edited with the picker, not typing.
+    /// The three free-text rows. Schema rows are edited with the picker and reorder keys.
     fn field_mut(&mut self) -> Option<&mut String> {
         match self.row {
             Self::SHORT_NAME => Some(&mut self.short_name),
@@ -860,32 +868,46 @@ impl SourceEditor {
         }
     }
 
-    /// The schema set as a numbered priority line for the editor row.
-    fn schema_display(&self) -> String {
-        if self.schemas.is_empty() {
-            return "(none)".to_string();
-        }
-        self.schemas
-            .iter()
-            .enumerate()
-            .map(|(index, name)| format!("{}. {name}", index + 1))
-            .collect::<Vec<_>>()
-            .join("   ")
+    /// Index into `schemas` of the selected schema row, if the cursor is on one.
+    fn schema_index(&self) -> Option<usize> {
+        (self.row >= Self::SCHEMA)
+            .then(|| self.row - Self::SCHEMA)
+            .filter(|index| *index < self.schemas.len())
     }
 
     fn add_schema(&mut self, name: String) {
         if !name.trim().is_empty() && !self.schemas.iter().any(|existing| existing == &name) {
             self.schemas.push(name);
+            // Land on the row just added, so more can be added or it can be reordered.
+            self.row = Self::SCHEMA + self.schemas.len() - 1;
         }
     }
 
-    fn remove_last_schema(&mut self) -> Option<String> {
-        // Keep at least one schema; a source always parses under something.
-        if self.schemas.len() > 1 {
-            self.schemas.pop()
-        } else {
-            None
+    /// Remove the selected schema, keeping at least one (a source always parses under
+    /// something). Returns the removed name.
+    fn remove_selected_schema(&mut self) -> Option<String> {
+        let index = self.schema_index()?;
+        if self.schemas.len() <= 1 {
+            return None;
         }
+        let removed = self.schemas.remove(index);
+        self.row = self.row.min(self.total_rows().saturating_sub(1));
+        Some(removed)
+    }
+
+    /// Move the selected schema up (`delta < 0`) or down, changing its match priority.
+    fn move_schema(&mut self, delta: isize) -> bool {
+        let Some(index) = self.schema_index() else {
+            return false;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= self.schemas.len() {
+            return false;
+        }
+        let target = target as usize;
+        self.schemas.swap(index, target);
+        self.row = Self::SCHEMA + target;
+        true
     }
 }
 
@@ -1901,6 +1923,9 @@ struct LiveRuntime {
     base_entries: usize,
     open_pipes: usize,
     exit_status: Option<ExitStatus>,
+    /// A generic-default source auto-detects its schema from the first captured batch; this
+    /// records that the one-shot attempt is done, so it does not run again.
+    auto_detected: bool,
 }
 
 impl Drop for LiveRuntime {
@@ -2617,6 +2642,9 @@ impl AppState {
                     None => {}
                 }
             }
+            // A generic-default live/stdin source auto-detects its schema once its first
+            // batch is in hand, re-grouping what it has captured.
+            self.try_live_autodetect(&file_id);
             self.record_source_stamp(&file_id);
             dirty.push(file_id);
         }
@@ -2628,6 +2656,87 @@ impl AppState {
             }
         }
         self.collect_finished_live_sources();
+    }
+
+    /// A live/stdin source has no data when it is added, so it starts on `Generic line`. Once
+    /// it has captured a batch, scan the schema libraries against those lines and, if a real
+    /// schema/set explains them, switch the source to it once and re-group what is captured.
+    fn try_live_autodetect(&mut self, file_id: &str) {
+        let eligible = self
+            .live_sources
+            .get(file_id)
+            .map(|runtime| !runtime.auto_detected)
+            .unwrap_or(false)
+            && self
+                .project
+                .get_file(file_id)
+                .map(|file| {
+                    !file.is_multi_schema() && file.extractor_name == GENERIC_EXTRACTOR_NAME
+                })
+                .unwrap_or(false);
+        if !eligible {
+            return;
+        }
+
+        let lines: Vec<String> = match self.project.get_file(file_id) {
+            Some(file) => file
+                .entries
+                .iter()
+                .flat_map(|entry| entry.raw.lines().map(str::to_string))
+                .collect(),
+            None => return,
+        };
+        let non_empty = lines.iter().filter(|line| !line.trim().is_empty()).count();
+        let closed = self
+            .live_sources
+            .get(file_id)
+            .map(|runtime| runtime.open_pipes == 0)
+            .unwrap_or(false);
+        // Wait for the stream to settle before the one-shot detection: either it ended (a batch
+        // like `docker logs ID`, which closes once dumped) or a full detection window has
+        // arrived. Detecting on the first small burst would lock in only the format that
+        // happened to lead -- missing a second one that appears a few lines later.
+        if !closed && non_empty < DETECT_LINES {
+            return;
+        }
+        if non_empty < LIVE_AUTODETECT_MIN_LINES {
+            // Ended with almost nothing captured; leave it on the generic default.
+            if let Some(runtime) = self.live_sources.get_mut(file_id) {
+                runtime.auto_detected = true;
+            }
+            return;
+        }
+
+        let set = self.project.detect_schema_set_for_lines(&lines);
+        if set.is_empty() {
+            if let Some(runtime) = self.live_sources.get_mut(file_id) {
+                runtime.auto_detected = true;
+            }
+            return;
+        }
+
+        let names: Vec<String> = set.iter().map(|schema| schema.name.clone()).collect();
+        let regroup = set.clone();
+        if let Some(file) = self.project.get_file_mut(file_id) {
+            file.set_schemas(set);
+        }
+        // Rebuild the live grouping under the new set from the captured lines (the spool is the
+        // source of truth), and continue streaming into it.
+        let refs: Vec<&Extractor> = regroup.iter().collect();
+        let snapshot = self.live_sources.get_mut(file_id).map(|runtime| {
+            runtime.builder = EntryBuilder::new();
+            for line in &lines {
+                runtime.builder.push_line(line, &refs);
+            }
+            runtime.base_entries = 0;
+            runtime.auto_detected = true;
+            runtime.builder.snapshot()
+        });
+        if let (Some(snapshot), Some(file)) = (snapshot, self.project.get_file_mut(file_id)) {
+            file.entries = snapshot;
+            file.assign_schema_indices();
+        }
+        self.status = format!("detected schema: {}", names.join(" + "));
     }
 
     fn collect_finished_live_sources(&mut self) {
@@ -2767,6 +2876,7 @@ impl AppState {
                 base_entries: entries_len,
                 open_pipes,
                 exit_status: None,
+                auto_detected: false,
             },
         );
         if let Some(file) = self.project.get_file_mut(file_id) {
@@ -4816,7 +4926,10 @@ impl AppState {
             .saturating_sub(4)
             .min(112)
             .max(root.width.min(72));
-        let height = 11.min(root.height.max(8));
+        // Three fixed rows, one per schema, a blank, a hint, and two borders.
+        let height = (editor.total_rows() as u16 + 4)
+            .max(8)
+            .min(root.height.max(8));
         let area = centered_rect(width, height, root);
         frame.render_widget(Clear, area);
         let block = Block::default()
@@ -4826,25 +4939,28 @@ impl AppState {
         let inner = block.inner(area);
         let text_width = inner.width as usize;
         let label_width = 13usize;
-        let schema_display = editor.schema_display();
-        let rows = [
-            ("Short name", editor.short_name.as_str()),
-            ("Description", editor.description.as_str()),
-            ("Tag", editor.tag.as_str()),
-            ("Schemas", schema_display.as_str()),
+        let mut rows: Vec<(String, String)> = vec![
+            ("Short name".to_string(), editor.short_name.clone()),
+            ("Description".to_string(), editor.description.clone()),
+            ("Tag".to_string(), editor.tag.clone()),
         ];
+        // One row per schema, numbered by priority; only the first carries the "Schemas" label.
+        for (index, name) in editor.schemas.iter().enumerate() {
+            let label = if index == 0 {
+                "Schemas".to_string()
+            } else {
+                String::new()
+            };
+            rows.push((label, format!("{}. {name}", index + 1)));
+        }
 
         let mut lines = Vec::new();
-        for (index, (label, value)) in rows.into_iter().enumerate() {
+        for (index, (label, value)) in rows.iter().enumerate() {
             let marker = if index == editor.row { "> " } else { "  " };
-            let row = format!(
-                "{marker}{label:<label_width$} {}",
-                value,
-                label_width = label_width
-            );
+            let row = format!("{marker}{label:<label_width$} {value}");
             let style = if index == editor.row {
                 theme.selected()
-            } else if index == SourceEditor::SCHEMA {
+            } else if index >= SourceEditor::SCHEMA {
                 theme.section()
             } else {
                 Style::default()
@@ -4852,17 +4968,12 @@ impl AppState {
             lines.push(Line::from(Span::styled(crop(&row, 0, text_width), style)));
         }
         lines.push(Line::from(""));
-        if editor.row == SourceEditor::SCHEMA {
-            lines.push(Line::from(Span::styled(
-                "Schemas: L add from library  d remove last  i detect (LLM)  e edit  X save library",
-                theme.dim(),
-            )));
+        let hint = if editor.schema_index().is_some() {
+            "Schema: L add  d remove  K/J reorder  i detect(LLM)  e edit  X save to library"
         } else {
-            lines.push(Line::from(Span::styled(
-                "Use Up/Down or Tab to move; type to edit the focused field",
-                theme.dim(),
-            )));
-        }
+            "Use Up/Down or Tab to move; type to edit the focused field"
+        };
+        lines.push(Line::from(Span::styled(hint, theme.dim())));
 
         frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
@@ -8513,31 +8624,40 @@ impl AppState {
                 }
                 self.mode = Mode::SourceEditor(editor);
             }
-            KeyCode::Char('i') if editor.row == SourceEditor::SCHEMA && !ctrl => {
+            KeyCode::Char('i') if editor.schema_index().is_some() && !ctrl => {
                 self.save_source_editor_fields(&editor);
                 self.mode = Mode::Normal;
                 self.infer_schema_ai_for(editor.file_id);
             }
-            KeyCode::Char('e') if editor.row == SourceEditor::SCHEMA && !ctrl => {
+            KeyCode::Char('e') if editor.schema_index().is_some() && !ctrl => {
                 self.save_source_editor_fields(&editor);
                 self.open_schema_input_for(&editor.file_id);
             }
-            // On the schema row, `L` adds a library schema to the set (repeat to add more).
-            KeyCode::Char('L') if editor.row == SourceEditor::SCHEMA && !ctrl => {
+            // On a schema row, `L` adds a library schema to the set (repeat to add more).
+            KeyCode::Char('L') if editor.schema_index().is_some() && !ctrl => {
                 self.save_source_editor_fields(&editor);
                 self.open_schema_library_picker_for_target(SchemaPickerTarget::SourceEditor(
                     editor,
                 ));
             }
-            // `d`/Delete removes the last schema in the set (never the only one).
-            KeyCode::Char('d') | KeyCode::Delete if editor.row == SourceEditor::SCHEMA && !ctrl => {
-                match editor.remove_last_schema() {
+            // `d`/Delete removes the *selected* schema (never the only one).
+            KeyCode::Char('d') | KeyCode::Delete if editor.schema_index().is_some() && !ctrl => {
+                match editor.remove_selected_schema() {
                     Some(removed) => self.status = format!("removed schema: {removed}"),
                     None => self.status = "a source needs at least one schema".to_string(),
                 }
                 self.mode = Mode::SourceEditor(editor);
             }
-            KeyCode::Char('X') if editor.row == SourceEditor::SCHEMA && !ctrl => {
+            // `K`/`J` move the selected schema up/down, changing its match priority.
+            KeyCode::Char('K') if editor.schema_index().is_some() && !ctrl => {
+                editor.move_schema(-1);
+                self.mode = Mode::SourceEditor(editor);
+            }
+            KeyCode::Char('J') if editor.schema_index().is_some() && !ctrl => {
+                editor.move_schema(1);
+                self.mode = Mode::SourceEditor(editor);
+            }
+            KeyCode::Char('X') if editor.schema_index().is_some() && !ctrl => {
                 self.save_source_editor_fields(&editor);
                 self.open_save_source_schema(editor.file_id);
             }
@@ -13813,7 +13933,9 @@ mod tests {
         app.capture_session();
         app.project.save().unwrap();
 
-        let mut reopened = AppState::new(Project::load(&root));
+        let mut reloaded = Project::load(&root);
+        reloaded.library.clear();
+        let mut reopened = AppState::new(reloaded);
         reopened.queue_initial_loads();
         reopened.finish_work();
         reopened
@@ -13821,6 +13943,8 @@ mod tests {
 
     /// Build the app the way `run()` does: queue loads, then let them finish.
     fn boot(mut project: Project, log: &std::path::Path) -> AppState {
+        // Isolate tests from whatever schemas the dev's real ~/.log-scouter/schemas holds.
+        project.library.clear();
         project.add_file(log, None);
         let mut app = AppState::new(project);
         app.ui_config = UiConfig::default();
@@ -17613,6 +17737,158 @@ mod tests {
             .entries
             .iter()
             .find(|entry| entry.raw.contains("uvicorn row"))
+            .unwrap();
+        assert_eq!(file.log_schema_name_for(uvi_row), "Uvi");
+        assert_eq!(file.level(uvi_row), "INFO");
+    }
+
+    #[test]
+    fn source_editor_reorders_and_deletes_any_schema() {
+        let compile = |name: &str| {
+            let mut ex = Extractor::new(name, "<message>").unwrap();
+            ex.compile().unwrap();
+            ex
+        };
+        let mut file = LogFileModel::new("f", "x.log", "A", "", Some(compile("A")));
+        file.set_schemas(vec![compile("A"), compile("B"), compile("C")]);
+        let mut editor = SourceEditor::new(&file);
+        assert_eq!(editor.schemas, ["A", "B", "C"]);
+
+        // Reorder: move the first schema (priority 1) down one.
+        editor.row = SourceEditor::SCHEMA;
+        assert_eq!(editor.schema_index(), Some(0));
+        assert!(editor.move_schema(1));
+        assert_eq!(editor.schemas, ["B", "A", "C"]);
+        assert_eq!(editor.row, SourceEditor::SCHEMA + 1); // cursor follows the moved row
+
+        // Delete the *first* schema -- the reported bug (only the last was removable before).
+        editor.row = SourceEditor::SCHEMA;
+        assert_eq!(editor.remove_selected_schema().as_deref(), Some("B"));
+        assert_eq!(editor.schemas, ["A", "C"]);
+
+        // Down to one, then the last cannot be removed.
+        editor.row = SourceEditor::SCHEMA;
+        assert_eq!(editor.remove_selected_schema().as_deref(), Some("A"));
+        editor.row = SourceEditor::SCHEMA;
+        assert_eq!(editor.remove_selected_schema(), None);
+        assert_eq!(editor.schemas, ["C"]);
+    }
+
+    #[test]
+    fn live_source_auto_detects_its_schema_from_the_first_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::load(tmp.path());
+        project.library.clear();
+        let file_id = project.add_stdin_source().file_id.clone();
+
+        // A batch captured under the generic default (one entry per physical line).
+        let lines: Vec<String> = (0..6)
+            .map(|i| {
+                format!(
+                    "2026-06-16 10:00:0{i}.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][a.cpp:{i}] line {i}"
+                )
+            })
+            .collect();
+        project
+            .get_file_mut(&file_id)
+            .unwrap()
+            .load_from_lines(lines.iter());
+        assert_eq!(
+            project.get_file(&file_id).unwrap().extractor_name,
+            GENERIC_EXTRACTOR_NAME
+        );
+
+        let mut app = AppState::new(project);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.live_sources.insert(
+            file_id.clone(),
+            LiveRuntime {
+                child: None,
+                rx,
+                builder: EntryBuilder::new(),
+                base_entries: 0,
+                // A batch dump like `docker logs ID` closes once emitted; detection then runs
+                // over everything captured (not just a leading burst).
+                open_pipes: 0,
+                exit_status: None,
+                auto_detected: false,
+            },
+        );
+
+        app.try_live_autodetect(&file_id);
+
+        // The source switched off Generic to the detected schema and re-grouped, so fields
+        // now extract; the one-shot flag is set.
+        let file = app.project.get_file(&file_id).unwrap();
+        assert_eq!(file.extractor_name, "Bracketed default");
+        assert_eq!(file.level(&file.entries[0]), "Info");
+        assert!(app.live_sources[&file_id].auto_detected);
+    }
+
+    #[test]
+    fn live_source_auto_detects_multiple_schemas_from_a_mixed_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::load(tmp.path());
+        project.library.clear();
+        // A second structured format the mixed batch also carries.
+        let mut uvi = Extractor::new("Uvi", "<level>:<pad><message>").unwrap();
+        uvi.field_patterns
+            .insert("level".to_string(), "INFO|ERROR".to_string());
+        uvi.field_patterns
+            .insert("pad".to_string(), " +".to_string());
+        uvi.entry_start = "^(?:INFO|ERROR):".to_string();
+        uvi.compile().unwrap();
+        project.add_extractor(uvi).unwrap();
+        let file_id = project.add_stdin_source().file_id.clone();
+
+        // Half bracketed rows, half uvicorn rows -- both clear the detection threshold.
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..5 {
+            lines.push(format!(
+                "2026-06-16 10:00:0{i}.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][a.cpp:{i}] bracketed {i}"
+            ));
+            lines.push(format!("INFO:     uvicorn {i}"));
+        }
+        project
+            .get_file_mut(&file_id)
+            .unwrap()
+            .load_from_lines(lines.iter());
+
+        let mut app = AppState::new(project);
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.live_sources.insert(
+            file_id.clone(),
+            LiveRuntime {
+                child: None,
+                rx,
+                builder: EntryBuilder::new(),
+                base_entries: 0,
+                open_pipes: 0, // batch dumped and closed
+                exit_status: None,
+                auto_detected: false,
+            },
+        );
+
+        app.try_live_autodetect(&file_id);
+
+        // Both formats are picked, and each row parses under its own schema.
+        let file = app.project.get_file(&file_id).unwrap();
+        assert!(file.is_multi_schema(), "expected a multi-schema set");
+        let names: Vec<&str> = file.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"Bracketed default") && names.contains(&"Uvi"),
+            "{names:?}"
+        );
+        let brack = file
+            .entries
+            .iter()
+            .find(|e| e.raw.contains("bracketed 0"))
+            .unwrap();
+        assert_eq!(file.level(brack), "Info");
+        let uvi_row = file
+            .entries
+            .iter()
+            .find(|e| e.raw.contains("uvicorn 0"))
             .unwrap();
         assert_eq!(file.log_schema_name_for(uvi_row), "Uvi");
         assert_eq!(file.level(uvi_row), "INFO");

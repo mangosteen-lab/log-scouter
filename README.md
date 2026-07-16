@@ -131,6 +131,13 @@ Run `logscout .` inside a log folder to add every direct text file in that folde
 a log source. Run `logscout` with no arguments to start an empty project, then press
 `o` to browse for a folder and add its text files.
 
+Open a specific file directly with `-f`, no folder needed — repeat it for several:
+
+```bash
+logscout -f /var/log/app.log
+logscout -f app.log -f errors.log
+```
+
 Two side commands stand apart from opening logs:
 
 ```bash
@@ -964,14 +971,24 @@ continuation that began a new record — shows `-`.
 ## Schema Detection
 
 When a file is added without an explicit format, its first 200 lines are matched against
-every log format in the project and the best fit wins. Formats are tried **most specific
-first**, not best-scoring first: a permissive format such as a bare `<message>` matches
-every line of every file, so scoring alone would hand it every log. A format only has to
-explain a quarter of the grouped entries to win, because continuation lines and block
-records are merged before the score is evaluated. The status bar names the format that was
-chosen.
+every candidate format and the best fit wins. Formats are tried **most specific first**, not
+best-scoring first: a permissive format such as a bare `<message>` matches every line of
+every file, so scoring alone would hand it every log. A format only has to explain a quarter
+of the grouped entries to win, because continuation lines and block records are merged before
+the score is evaluated. The status bar names the format that was chosen.
 
-If nothing matches, the file falls back to the built-in `Generic line`.
+Candidates are gathered from, in order: the **project's own schema library**
+(`<project>/.logscouter/schemas`), the **user library** (`~/.log-scouter/schemas`), and the
+**built-in** formats — so a schema you saved once is picked up automatically, without loading
+it by hand. A schema chosen from a library is referenced by name, not copied into
+`project.json`; it is re-resolved from the library each time the project opens (so editing the
+library file updates every source that uses it). If nothing matches, the file falls back to
+the built-in `Generic line`.
+
+A piped or live source (`logscout -i`, `kubectl logs -f | logscout -i`) has no data when it is
+added, so it starts on `Generic line` and **auto-detects from its first captured batch**:
+once enough lines have streamed in, the same library scan runs and, if a schema fits, the
+source switches to it and re-groups what it has captured.
 
 ### Multiple schemas per source
 
@@ -987,10 +1004,11 @@ lines joins the set (the `Generic line` catch-all never does). So a log mixing u
 nginx lines lands on `[Nginx Access Log, Uvicorn Log]` with no configuration — provided both
 schemas are in the project (load them once with `L`; they persist).
 
-Edit the set from the source editor (`Enter` on a source, move to the **Schemas** row):
-`L` adds a schema from the library (repeat to add more), `d` removes the last, and the order
-is the match priority. The set is saved with the project. A merged view still uses each
-contributing file's primary schema.
+Edit the set from the source editor (`Enter` on a source): the schema set is listed one per
+row, numbered by priority. On a schema row, `L` adds another from the library, `d` removes the
+selected one (never the last), and `K`/`J` move it up or down to change the match priority.
+The set is saved with the project. A merged view still uses each contributing file's primary
+schema.
 
 The fastest way to add a schema for a format the set does not cover yet: **select the lines
 of that format in the pane (`Space`) and press `i`.** The LLM infers a schema from exactly

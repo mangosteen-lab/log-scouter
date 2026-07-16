@@ -1,7 +1,8 @@
 use crate::core::extractor::{
-    builtin_extractors, default_extractor, detect, detect_all, extractor_from_project, Extractor,
-    BRACKETED_DEFAULT_FORMAT, BRACKETED_LEGACY_FORMAT, DEFAULT_EXTRACTOR_NAME, DETECT_LINES,
-    GENERIC_EXTRACTOR_NAME,
+    builtin_extractors, default_extractor, detect, detect_all, extractor_from_project,
+    load_schemas_from_folder, user_schema_dir, Extractor, BRACKETED_DEFAULT_FORMAT,
+    BRACKETED_LEGACY_FORMAT, DEFAULT_EXTRACTOR_NAME, DETECT_LINES, GENERIC_EXTRACTOR_NAME,
+    USER_SCHEMAS_SUBDIR,
 };
 use crate::core::filters::FilterSet;
 use crate::core::models::{display_name, merge_files, LiveSourceConfig, LogFileModel};
@@ -22,6 +23,11 @@ pub struct Project {
     pub root: PathBuf,
     pub files: Vec<LogFileModel>,
     pub extractors: HashMap<String, Extractor>,
+    /// Schemas loaded from the on-disk libraries (`.logscouter/schemas` then
+    /// `~/.log-scouter/schemas`), deduped project-first. Consulted for detection and name
+    /// resolution but never persisted -- a source references a library schema by name and
+    /// re-resolves it from disk on each open, so `project.json` stays lean.
+    pub library: Vec<Extractor>,
     pub saved_searches: Vec<String>,
     pub filters: FilterSet,
     pub bookmarks: Vec<Bookmark>,
@@ -152,6 +158,7 @@ impl Project {
             root: absolute_path(root.into()),
             files: Vec::new(),
             extractors: HashMap::new(),
+            library: Vec::new(),
             saved_searches: Vec::new(),
             filters: FilterSet::default(),
             bookmarks: Vec::new(),
@@ -160,6 +167,7 @@ impl Project {
             file_counter: 0,
         };
         project.ensure_builtin_extractors();
+        project.load_schema_libraries();
         project
     }
 
@@ -177,6 +185,33 @@ impl Project {
         // can only choose among the schemas it is handed.
         project.ensure_builtin_extractors();
         project
+    }
+
+    /// Load the on-disk schema libraries into `self.library`: the project's own
+    /// `.logscouter/schemas` first, then the shared `~/.log-scouter/schemas`, deduped so a
+    /// project schema shadows a user one of the same name. Bad or missing folders are simply
+    /// empty -- detection must never fail because a library file does not parse.
+    pub fn load_schema_libraries(&mut self) {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut library: Vec<Extractor> = Vec::new();
+        let folders = [
+            Some(self.config_dir().join(USER_SCHEMAS_SUBDIR)),
+            user_schema_dir(),
+        ];
+        for folder in folders.into_iter().flatten() {
+            let loaded = load_schemas_from_folder(&folder).unwrap_or_default();
+            let mut names: Vec<(String, Extractor)> = loaded
+                .into_iter()
+                .map(|file| (file.schema.name.clone(), file.schema))
+                .collect();
+            names.sort_by(|left, right| left.0.cmp(&right.0));
+            for (name, schema) in names {
+                if seen.insert(name) {
+                    library.push(schema);
+                }
+            }
+        }
+        self.library = library;
     }
 
     /// Add any built-in schema the project does not already define. A schema the user has
@@ -208,7 +243,25 @@ impl Project {
         if let Some(extractor) = self.extractors.get(name) {
             return extractor.clone();
         }
+        // A source may name a schema that lives only in a disk library; resolve it from there
+        // rather than falling straight to the default.
+        if let Some(extractor) = self.library.iter().find(|schema| schema.name == name) {
+            return extractor.clone();
+        }
         self.default_extractor_obj()
+    }
+
+    /// Every schema detection may pick from: the project's in-memory extractors (built-ins +
+    /// saved) plus any library schema not shadowed by them. `detect`/`detect_all` rank by
+    /// specificity, so a specific library schema still beats the generic built-ins.
+    fn detection_candidates(&self) -> Vec<&Extractor> {
+        let mut candidates: Vec<&Extractor> = self.extractors.values().collect();
+        for schema in &self.library {
+            if !self.extractors.contains_key(&schema.name) {
+                candidates.push(schema);
+            }
+        }
+        candidates
     }
 
     /// The schema to fall back on when nothing is known about a file.
@@ -243,19 +296,25 @@ impl Project {
         let Ok(lines) = parser::read_first_lines(path, DETECT_LINES) else {
             return self.default_extractor_obj();
         };
-        match detect(self.extractors.values(), &lines) {
-            Some(extractor) => extractor.clone(),
+        match detect(self.detection_candidates(), &lines).cloned() {
+            Some(extractor) => extractor,
             None => self.default_extractor_obj(),
         }
     }
 
-    /// The ordered schema *set* for `path` -- one per format present. Empty when no library
-    /// schema explains the file (the caller falls back to a single default).
+    /// The ordered schema *set* for `path` -- one per format present. Empty when no schema
+    /// explains the file (the caller falls back to a single default).
     pub fn detect_schema_set_for(&self, path: &Path) -> Vec<Extractor> {
         let Ok(lines) = parser::read_first_lines(path, DETECT_LINES) else {
             return Vec::new();
         };
-        detect_all(self.extractors.values(), &lines)
+        self.detect_schema_set_for_lines(&lines)
+    }
+
+    /// Like `detect_schema_set_for`, but over lines already in hand -- used to auto-detect a
+    /// live/stdin source from its first captured batch.
+    pub fn detect_schema_set_for_lines(&self, lines: &[String]) -> Vec<Extractor> {
+        detect_all(self.detection_candidates(), lines)
             .into_iter()
             .cloned()
             .collect()
@@ -516,7 +575,7 @@ impl Project {
                 continue;
             }
 
-            let Some(better) = detect(self.extractors.values(), &lines).cloned() else {
+            let Some(better) = detect(self.detection_candidates(), &lines).cloned() else {
                 continue;
             };
             if better.name == self.files[index].extractor_name {

@@ -950,6 +950,7 @@ fn add_file_auto_assigns_a_schema_set_for_a_mixed_log() {
     std::fs::write(&log, MIXED_LOG).unwrap();
 
     let mut project = Project::load(tmp.path());
+    project.library.clear(); // isolate from the dev's real ~/.log-scouter/schemas
     project.add_extractor(uvicorn_schema()).unwrap();
     project.add_extractor(nginx_schema()).unwrap();
     // Zero config: adding the file auto-assigns a schema per format present.
@@ -958,6 +959,53 @@ fn add_file_auto_assigns_a_schema_set_for_a_mixed_log() {
     assert!(file.is_multi_schema());
     let names: Vec<&str> = file.schemas.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"Uvicorn") && names.contains(&"Nginx"));
+}
+
+#[test]
+fn add_file_detects_a_schema_from_the_disk_library() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A schema present only in the project-level library, not in the project itself.
+    let lib = tmp.path().join(".logscouter").join("schemas");
+    std::fs::create_dir_all(&lib).unwrap();
+    let schema = nginx_schema();
+    let wrapper = serde_json::json!({
+        "name": schema.name,
+        "description": "",
+        "schema": {
+            "name": schema.name,
+            "format": schema.format,
+            "timestamp_field": "timestamp",
+            "timestamp_format": "%d/%b/%Y:%H:%M:%S %z",
+            "entry_start": schema.entry_start,
+        }
+    });
+    std::fs::write(
+        lib.join("nginx.json"),
+        serde_json::to_string_pretty(&wrapper).unwrap(),
+    )
+    .unwrap();
+
+    let log = tmp.path().join("access.log");
+    std::fs::write(&log, "1.2.3.4 - - [13/Jul/2026:06:30:11 +0000] GET /\n").unwrap();
+
+    // The library schema is not added to the project, yet detection finds it...
+    let mut project = Project::load(tmp.path());
+    let id = project.add_file(&log, None).file_id.clone();
+    project.load_all_files();
+    let file = project.get_file(&id).unwrap();
+    assert_eq!(file.extractor_name, "Nginx");
+    assert_eq!(file.get_field(&file.entries[0], "addr"), "1.2.3.4");
+
+    // ...and it is not copied into project.json (the source references it by name only).
+    project.save().unwrap();
+    let saved = std::fs::read_to_string(tmp.path().join(".logscouter/project.json")).unwrap();
+    assert!(
+        !saved.contains("<addr> - - "),
+        "library schema body must not be persisted: {saved}"
+    );
+    // A reopened project still resolves it from the library.
+    let reloaded = Project::load(tmp.path());
+    assert_eq!(reloaded.get_file(&id).unwrap().extractor_name, "Nginx");
 }
 
 #[test]

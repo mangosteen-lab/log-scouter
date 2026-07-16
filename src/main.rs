@@ -21,6 +21,10 @@ struct Cli {
     folder: Option<String>,
     #[arg()]
     files: Vec<String>,
+    /// Open a specific log file directly, without a folder: `logscout -f app.log`. Repeat
+    /// `-f` for several files. Works alongside a folder too.
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    file: Vec<String>,
     /// Read the process's own stdin as a live log source, e.g.
     /// `kubectl logs -f ... | logscout -i`. Works alongside an optional folder.
     #[arg(short = 'i', long = "stdin")]
@@ -67,7 +71,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Config { action }) => run_config(action.unwrap_or(ConfigAction::List)),
-        None => run_tui(cli.folder, cli.files, cli.stdin),
+        None => run_tui(cli.folder, cli.files, cli.file, cli.stdin),
     }
 }
 
@@ -142,10 +146,19 @@ fn mask(key: &str) -> String {
     format!("{first}…{last}")
 }
 
-fn run_tui(folder: Option<String>, files: Vec<String>, stdin: bool) -> anyhow::Result<()> {
+fn run_tui(
+    folder: Option<String>,
+    files: Vec<String>,
+    file_flags: Vec<String>,
+    stdin: bool,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().context("logscout: could not read current folder")?;
+
     let Some(folder_arg) = folder else {
-        let root = std::env::current_dir().context("logscout: could not read current folder")?;
-        let mut project = Project::new(root);
+        // No folder: `logscout -f app.log` (and/or `-i`) opens just what was named, rooted at
+        // the current directory. Auto-detection still picks a schema from the libraries.
+        let mut project = Project::new(cwd.clone());
+        add_files(&mut project, &cwd, &file_flags);
         if stdin {
             project.add_stdin_source();
         }
@@ -164,24 +177,33 @@ fn run_tui(folder: Option<String>, files: Vec<String>, stdin: bool) -> anyhow::R
             .add_text_files_from_dir(&folder)
             .with_context(|| format!("logscout: could not read folder: {}", folder.display()))?;
     } else {
-        for path in &files {
-            let path = PathBuf::from(path);
-            let resolved = if path.is_absolute() {
-                path
-            } else {
-                folder.join(path)
-            };
-            if resolved.is_file() {
-                project.add_file(&resolved, None);
-            } else {
-                eprintln!("logscout: skipping missing file: {}", resolved.display());
-            }
-        }
+        // Positional files are named relative to the folder being opened.
+        add_files(&mut project, &folder, &files);
     }
+    // `-f` files are explicit paths the user typed, so resolve them against the current dir.
+    add_files(&mut project, &cwd, &file_flags);
 
     if stdin {
         project.add_stdin_source();
     }
 
     log_scouter::tui::run(project)
+}
+
+/// Add each path in `files` as a log source, resolving a relative path against `base` and
+/// skipping (with a note) anything that is not a file.
+fn add_files(project: &mut Project, base: &std::path::Path, files: &[String]) {
+    for path in files {
+        let path = PathBuf::from(path);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            base.join(path)
+        };
+        if resolved.is_file() {
+            project.add_file(&resolved, None);
+        } else {
+            eprintln!("logscout: skipping missing file: {}", resolved.display());
+        }
+    }
 }
