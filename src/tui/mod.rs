@@ -3234,8 +3234,16 @@ impl AppState {
         let schemas: Vec<Extractor> = file.schema_set().into_iter().cloned().collect();
         let total = parser::file_size(&path);
         let is_live = file.is_live();
+        let is_stdin = file.is_stdin_source();
 
-        if is_live && !path.exists() {
+        // A stdin source is transient and reuses a fixed spool path (`f1` resets every run,
+        // since it is never persisted). Discard any spool a previous run left behind, then
+        // start fresh -- otherwise its old lines are loaded here and the live reader appends
+        // this run's lines on top of them.
+        if is_live && (is_stdin || !path.exists()) {
+            if is_stdin {
+                let _ = fs::remove_file(&path);
+            }
             if let Some(file) = self.project.get_file_mut(file_id) {
                 file.loaded = true;
                 file.error.clear();
@@ -17608,6 +17616,30 @@ mod tests {
             .unwrap();
         assert_eq!(file.log_schema_name_for(uvi_row), "Uvi");
         assert_eq!(file.level(uvi_row), "INFO");
+    }
+
+    #[test]
+    fn stdin_source_discards_a_stale_spool_from_a_previous_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::load(tmp.path());
+        let file_id = project.add_stdin_source().file_id.clone();
+        let spool = project.get_file(&file_id).unwrap().path.clone();
+        // A previous `logscout -i` left its captured lines at this fixed, reused path.
+        std::fs::create_dir_all(spool.parent().unwrap()).unwrap();
+        std::fs::write(&spool, "old line from a previous run\nanother old line\n").unwrap();
+
+        let mut app = AppState::new(project);
+        app.queue_load(&file_id);
+
+        // The stale spool is discarded and its lines are not loaded into the view.
+        assert!(!spool.exists(), "stale stdin spool should be removed");
+        let file = app.project.get_file(&file_id).unwrap();
+        assert!(file.loaded);
+        assert!(
+            file.entries.is_empty(),
+            "old spool content must not reappear, got {} entries",
+            file.entries.len()
+        );
     }
 
     #[test]
