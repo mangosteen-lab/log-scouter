@@ -139,6 +139,17 @@ logscout config set --provider anthropic --api-key ...  # set up the AI assistan
 logscout config list                                    # show the current AI settings
 ```
 
+Pipe any command's output straight into logscout as a live source with `-i` (Linux/macOS):
+
+```bash
+kubectl logs -n kube-system -l app=istio-ingressgateway -f | logscout -i
+tail -f /var/log/app.log | logscout -i
+```
+
+logscout reads the pipe on stdin and takes keystrokes from the terminal (`/dev/tty`). The
+stream is spooled while you browse, but a stdin source is transient — it is not saved to the
+project, since a closed pipe cannot be reopened. `-i` also works alongside a folder argument.
+
 Upgrade or uninstall with the matching scripts:
 
 ```bash
@@ -330,6 +341,7 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `Enter` (source) | edit the log source name, description, tag, and schema |
 | `L` / `X` | load / save the selected schema, filters, bookmarks, or saved search library |
 | `H` | hide logs like the selection, using fields from the log format |
+| `i` (pane) | infer a schema from the selected lines and append it to the source's set |
 | `Space` (hide menu) | pick a field; `Enter` ANDs the picks into one regex |
 | `H` (hide menu) | derive a pattern from the single current line |
 | `↑` / `↓` (pattern popup) | pick a template, greediest first |
@@ -915,6 +927,25 @@ the extracted fields and grouped entries appear immediately. If the guess is off
 on the schema row to tweak it or `i` to try again. Needs an LLM configured; otherwise the
 status line tells you to run `logscout config set`.
 
+### Generating a Schema with Codex or Claude Code
+
+Prefer your coding agent? Install the **log-schema skill** and let Codex or Claude Code write
+a user-level schema (`~/.log-scouter/schemas/<name>.json`) from your sample log files:
+
+```bash
+# OpenAI Codex CLI  ->  ~/.codex/skills/log-schema/
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install-log-schema-codex-skill | bash
+
+# Claude Code       ->  ~/.claude/skills/log-schema/
+curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install-log-schema-claude-skill | bash
+```
+
+Then start a new agent session and ask it to generate a logscout schema from your log. The
+skill teaches the schema format — the template DSL, chrono timestamp formats, multi-line
+`entry_start`, the padded-level and trailing-catch-all tricks, and validation samples — and
+the agent writes the JSON to `~/.log-scouter/schemas/`, where logscout auto-detects it. The
+skill source lives in [`skills/log-schema/`](skills/log-schema/SKILL.md).
+
 Press `T` on a line to make it the origin. The timestamp column then shows every line's
 signed offset from it, so "how long did this take" is a glance rather than arithmetic:
 
@@ -941,6 +972,32 @@ records are merged before the score is evaluated. The status bar names the forma
 chosen.
 
 If nothing matches, the file falls back to the built-in `Generic line`.
+
+### Multiple schemas per source
+
+Container logs often interleave formats — a `/docker-entrypoint.sh` or `[entrypoint]`
+preamble, a structured app log, sometimes two structured formats at once (nginx access +
+error, or an app that logs both JSON and plain). A single schema cannot parse all of it, so
+a source can hold an **ordered set of schemas**: each log entry is parsed by the first
+schema in the set whose pattern matches it, and anything matching none shows its raw text.
+
+Detection assigns the set automatically. On add, each line is attributed to the
+most-specific schema that parses it, and every schema that wins a meaningful share of the
+lines joins the set (the `Generic line` catch-all never does). So a log mixing uvicorn and
+nginx lines lands on `[Nginx Access Log, Uvicorn Log]` with no configuration — provided both
+schemas are in the project (load them once with `L`; they persist).
+
+Edit the set from the source editor (`Enter` on a source, move to the **Schemas** row):
+`L` adds a schema from the library (repeat to add more), `d` removes the last, and the order
+is the match priority. The set is saved with the project. A merged view still uses each
+contributing file's primary schema.
+
+The fastest way to add a schema for a format the set does not cover yet: **select the lines
+of that format in the pane (`Space`) and press `i`.** The LLM infers a schema from exactly
+those lines and appends it to the schema set of the source(s) they came from (in a merged
+view, each contributing source), then re-parses — so a cluster of unparsed lines becomes a
+new format in one keystroke. (`i` on a *source* or the Schemas row still infers a single
+schema that *replaces* the source's schema, from its first lines.)
 
 ## Schema Validation
 

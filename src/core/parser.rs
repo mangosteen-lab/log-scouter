@@ -19,20 +19,25 @@ impl EntryBuilder {
         Self::default()
     }
 
-    pub fn push_line(&mut self, raw: &str, extractor: Option<&Extractor>) {
+    /// Fold `raw` into the running grouping under a **set** of schemas: a line starts a new
+    /// entry when *any* schema's `is_start` matches, and closes one when *any* schema's
+    /// `is_end` matches -- so a source carrying several formats groups each correctly. An
+    /// empty slice means "no schema": every non-empty line is its own entry, as before. A
+    /// one-element slice is byte-for-byte the old single-extractor behaviour.
+    pub fn push_line(&mut self, raw: &str, schemas: &[&Extractor]) {
         let line = trim_line_end(raw);
-        let explicit_boundary = extractor
-            .map(Extractor::uses_explicit_entry_boundary)
-            .unwrap_or(false);
+        let explicit_boundary = schemas
+            .iter()
+            .any(|extractor| extractor.uses_explicit_entry_boundary());
         if self.current.is_none() && explicit_boundary && line.trim().is_empty() {
             self.line_index += 1;
             return;
         }
 
-        let is_continuation = self.current.is_some()
-            && extractor
-                .map(|extractor| !extractor.is_start(line))
-                .unwrap_or(false);
+        // With no schema, every line starts an entry (nothing marks a continuation).
+        let starts_entry =
+            schemas.is_empty() || schemas.iter().any(|extractor| extractor.is_start(line));
+        let is_continuation = self.current.is_some() && !starts_entry;
 
         if is_continuation {
             if let Some(entry) = &mut self.current {
@@ -48,10 +53,7 @@ impl EntryBuilder {
                 source: 0,
             });
         }
-        if extractor
-            .map(|extractor| extractor.is_end(line))
-            .unwrap_or(false)
-        {
+        if schemas.iter().any(|extractor| extractor.is_end(line)) {
             self.flush_current();
         }
         self.line_index += 1;
@@ -88,9 +90,19 @@ where
     I: IntoIterator,
     I::Item: AsRef<str>,
 {
+    let schemas: Vec<&Extractor> = extractor.into_iter().collect();
+    build_entries_multi(lines, &schemas)
+}
+
+/// Group `lines` under an ordered set of schemas. See `EntryBuilder::push_line`.
+pub fn build_entries_multi<I>(lines: I, schemas: &[&Extractor]) -> Vec<LogEntry>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
     let mut builder = EntryBuilder::new();
     for raw in lines {
-        builder.push_line(raw.as_ref(), extractor);
+        builder.push_line(raw.as_ref(), schemas);
     }
     builder.finish()
 }
@@ -99,7 +111,7 @@ where
 /// bar against the file size.
 pub fn read_entries(
     path: &Path,
-    extractor: Option<&Extractor>,
+    schemas: &[&Extractor],
     mut progress: Option<&mut dyn FnMut(u64)>,
 ) -> std::io::Result<Vec<LogEntry>> {
     let file = fs::File::open(path)?;
@@ -110,7 +122,7 @@ pub fn read_entries(
     for (line_index, line_result) in reader.lines().enumerate() {
         let raw_line = line_result?;
         bytes += raw_line.len() as u64 + 1;
-        builder.push_line(&raw_line, extractor);
+        builder.push_line(&raw_line, schemas);
 
         if let Some(progress) = progress.as_deref_mut() {
             if (line_index & 0x0FFF) == 0 {

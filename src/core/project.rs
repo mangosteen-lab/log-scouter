@@ -1,5 +1,5 @@
 use crate::core::extractor::{
-    builtin_extractors, default_extractor, detect, extractor_from_project, Extractor,
+    builtin_extractors, default_extractor, detect, detect_all, extractor_from_project, Extractor,
     BRACKETED_DEFAULT_FORMAT, BRACKETED_LEGACY_FORMAT, DEFAULT_EXTRACTOR_NAME, DETECT_LINES,
     GENERIC_EXTRACTOR_NAME,
 };
@@ -130,6 +130,10 @@ struct FileData {
     path: String,
     #[serde(default)]
     extractor_name: String,
+    /// The ordered schema set for a multi-schema source. Empty (the default, and every older
+    /// project) means single-schema via `extractor_name`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extractor_names: Vec<String>,
     #[serde(default)]
     display_name: String,
     #[serde(default)]
@@ -245,6 +249,18 @@ impl Project {
         }
     }
 
+    /// The ordered schema *set* for `path` -- one per format present. Empty when no library
+    /// schema explains the file (the caller falls back to a single default).
+    pub fn detect_schema_set_for(&self, path: &Path) -> Vec<Extractor> {
+        let Ok(lines) = parser::read_first_lines(path, DETECT_LINES) else {
+            return Vec::new();
+        };
+        detect_all(self.extractors.values(), &lines)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     pub fn add_file(
         &mut self,
         path: impl AsRef<Path>,
@@ -260,17 +276,29 @@ impl Project {
         }
 
         self.file_counter += 1;
-        // No schema asked for: work it out from the file rather than from hash order.
-        let extractor_name =
-            extractor_name.unwrap_or_else(|| self.detect_extractor_for(&absolute).name);
-        let extractor = Some(self.get_extractor(&extractor_name));
-        let model = LogFileModel::new(
+        // No schema asked for: work out the schema *set* from the file (one per format), so a
+        // mixed log parses each line under the right one. A named schema stays single.
+        let schemas: Vec<Extractor> = match extractor_name {
+            Some(name) => vec![self.get_extractor(&name)],
+            None => {
+                let set = self.detect_schema_set_for(&absolute);
+                if set.is_empty() {
+                    // No structural set: fall back to single-schema detection, which lands an
+                    // unexplained file on the `Generic line` catch-all just as before.
+                    vec![self.detect_extractor_for(&absolute)]
+                } else {
+                    set
+                }
+            }
+        };
+        let mut model = LogFileModel::new(
             format!("f{}", self.file_counter),
             absolute.clone(),
-            extractor_name,
+            schemas[0].name.clone(),
             display_name(&absolute),
-            extractor,
+            Some(schemas[0].clone()),
         );
+        model.set_schemas(schemas);
         self.files.push(model);
         self.files.last_mut().expect("just pushed file")
     }
@@ -301,6 +329,16 @@ impl Project {
         model.live = Some(config);
         self.files.push(model);
         self.files.last_mut().expect("just pushed live source")
+    }
+
+    /// Register the process's own stdin as a live source (`cmd | logscout -i`). Transient:
+    /// `to_data` drops it, since a closed pipe cannot be reopened.
+    pub fn add_stdin_source(&mut self) -> &mut LogFileModel {
+        let config = LiveSourceConfig {
+            kind: crate::core::models::LiveSourceKind::Stdin,
+            ..LiveSourceConfig::default()
+        };
+        self.add_live_source(config, "stdin", None)
     }
 
     pub fn remove_file(&mut self, file_id: &str) {
@@ -394,6 +432,31 @@ impl Project {
         Ok(())
     }
 
+    /// Point a file at an ordered *set* of schemas (each entry is parsed by the first that
+    /// matches). Empty falls back to the default. Like `set_file_extractor`, the caller must
+    /// re-read the file. Names are resolved against the project's schema library.
+    pub fn set_file_schemas(&mut self, file_id: &str, names: &[String]) -> Result<(), String> {
+        let mut schemas: Vec<Extractor> =
+            names.iter().map(|name| self.get_extractor(name)).collect();
+        if schemas.is_empty() {
+            schemas.push(self.default_extractor_obj());
+        }
+        let Some(file) = self.get_file_mut(file_id) else {
+            return Err(format!("unknown file {file_id}"));
+        };
+        if file.is_merged() {
+            return Err("a merged view takes each file's own schema".to_string());
+        }
+        file.set_schemas(schemas);
+        file.loaded = false;
+        file.entries.clear();
+
+        let file_id = file_id.to_string();
+        self.files
+            .retain(|file| !file.merged_from.contains(&file_id));
+        Ok(())
+    }
+
     pub fn get_file(&self, file_id: &str) -> Option<&LogFileModel> {
         self.files.iter().find(|file| file.file_id == file_id)
     }
@@ -464,22 +527,36 @@ impl Project {
         }
     }
 
+    /// Re-resolve every file's schema(s) against the current library (the on-disk schemas may
+    /// have changed since the project was saved), preserving multi-schema sets. Merged views
+    /// resolve per contributing file and are left alone.
+    pub fn refresh_all_extractors(&mut self) {
+        for index in 0..self.files.len() {
+            if self.files[index].is_merged() {
+                continue;
+            }
+            let names: Vec<String> = self.files[index]
+                .schema_set()
+                .iter()
+                .map(|schema| schema.name.clone())
+                .collect();
+            let resolved: Vec<Extractor> =
+                names.iter().map(|name| self.get_extractor(name)).collect();
+            if resolved.len() > 1 {
+                self.files[index].set_schemas(resolved);
+            } else {
+                self.files[index].refresh_extractor(resolved.into_iter().next());
+            }
+        }
+    }
+
     pub fn load_all_files(&mut self) {
         self.redetect_mismatched_schemas();
-        let extractor_names: Vec<String> = self
-            .files
-            .iter()
-            .map(|f| f.extractor_name.clone())
-            .collect();
-        let extractors: Vec<Extractor> = extractor_names
-            .iter()
-            .map(|name| self.get_extractor(name))
-            .collect();
-        for (file, extractor) in self.files.iter_mut().zip(extractors) {
+        self.refresh_all_extractors();
+        for file in self.files.iter_mut() {
             if file.is_merged() {
                 continue;
             }
-            file.refresh_extractor(Some(extractor));
             if !file.loaded && file.error.is_empty() {
                 if file.is_live() && !file.path.exists() {
                     file.loaded = true;
@@ -529,6 +606,15 @@ impl Project {
                 file_data.display_name,
                 extractor,
             );
+            // A saved multi-schema source restores its ordered set; older projects have none.
+            if !file_data.extractor_names.is_empty() {
+                let schemas: Vec<Extractor> = file_data
+                    .extractor_names
+                    .iter()
+                    .map(|name| self.get_extractor(name))
+                    .collect();
+                model.set_schemas(schemas);
+            }
             model.label = file_data.label;
             model.description = file_data.description;
             model.tag = file_data.tag;
@@ -545,11 +631,17 @@ impl Project {
             files: self
                 .files
                 .iter()
-                .filter(|file| !file.is_merged())
+                // Merged views are derived; stdin sources cannot be reconnected next session.
+                .filter(|file| !file.is_merged() && !file.is_stdin_source())
                 .map(|file| FileData {
                     file_id: file.file_id.clone(),
                     path: self.rel(&file.path),
                     extractor_name: file.extractor_name.clone(),
+                    extractor_names: if file.is_multi_schema() {
+                        file.schemas.iter().map(|s| s.name.clone()).collect()
+                    } else {
+                        Vec::new()
+                    },
                     display_name: file.display_name.clone(),
                     label: file.label.clone(),
                     description: file.description.clone(),

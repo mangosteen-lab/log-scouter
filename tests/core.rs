@@ -1,6 +1,6 @@
 use chrono::{NaiveDate, Timelike};
 use log_scouter::core::extractor::{
-    default_extractor, detect, export_schemas_to_folder, generic_extractor,
+    default_extractor, detect, detect_all, export_schemas_to_folder, generic_extractor,
     load_schemas_from_folder, preview_extraction, sniff_timestamp, user_schema_dir, Extractor,
     SampleLine, BRACKETED_LEGACY_FORMAT, GENERIC_EXTRACTOR_NAME,
 };
@@ -843,6 +843,168 @@ fn a_files_schema_can_be_changed_independently() {
         reloaded.get_file(&id_b).unwrap().extractor_name,
         "Bracketed default"
     );
+}
+
+/// Two single-line formats a mixed docker log might interleave.
+fn uvicorn_schema() -> Extractor {
+    let mut ex = Extractor::new("Uvicorn", "<level>:<pad><message>").unwrap();
+    ex.field_patterns
+        .insert("level".into(), "INFO|ERROR".into());
+    ex.field_patterns.insert("pad".into(), " +".into());
+    ex.entry_start = "^(?:INFO|ERROR):".into();
+    ex.compile().unwrap();
+    ex
+}
+
+fn nginx_schema() -> Extractor {
+    let mut ex = Extractor::with_timestamp_format(
+        "Nginx",
+        "<addr> - - [<timestamp>] <message>",
+        "%d/%b/%Y:%H:%M:%S %z",
+    )
+    .unwrap();
+    ex.entry_start = r"^\S+ - - \[".into();
+    ex.compile().unwrap();
+    ex
+}
+
+const MIXED_LOG: &str = "[boot] starting up\n\
+    INFO:     application ready\n\
+    1.2.3.4 - - [13/Jul/2026:06:30:11 +0000] GET /api/x\n\
+    ERROR:    boom happened\n\
+    5.6.7.8 - - [13/Jul/2026:06:30:12 +0000] GET /healthz";
+
+#[test]
+fn multi_schema_source_parses_each_entry_with_the_matching_schema() {
+    let uvi = uvicorn_schema();
+    let nginx = nginx_schema();
+    let mut model = LogFileModel::new("f", "mixed.log", uvi.name.clone(), "", Some(uvi.clone()));
+    model.set_schemas(vec![uvi, nginx]);
+    model.load_from_lines(MIXED_LOG.lines());
+
+    assert!(model.is_multi_schema());
+    // One entry per line; the [boot] preamble is its own (unmatched) entry.
+    assert_eq!(model.entries.len(), 5);
+
+    let by_msg = |needle: &str| {
+        model
+            .entries
+            .iter()
+            .find(|entry| entry.raw.contains(needle))
+            .unwrap()
+    };
+
+    let info = by_msg("application ready");
+    assert_eq!(model.log_schema_name_for(info), "Uvicorn");
+    assert_eq!(model.level(info), "INFO");
+    assert_eq!(model.message(info), "application ready");
+
+    let access = by_msg("/api/x");
+    assert_eq!(model.log_schema_name_for(access), "Nginx");
+    assert_eq!(model.get_field(access, "addr"), "1.2.3.4");
+    assert_eq!(model.message(access), "GET /api/x");
+    assert!(model.timestamp(access).is_some());
+
+    let err = by_msg("boom happened");
+    assert_eq!(model.log_schema_name_for(err), "Uvicorn");
+    assert_eq!(model.level(err), "ERROR");
+
+    // The preamble matches nothing: it resolves to the primary and shows its raw text.
+    let boot = by_msg("[boot] starting");
+    assert_eq!(model.level(boot), "");
+    assert_eq!(model.message(boot), "[boot] starting up");
+}
+
+#[test]
+fn detect_all_returns_a_schema_per_format() {
+    let uvi = uvicorn_schema();
+    let nginx = nginx_schema();
+    let generic = generic_extractor();
+    let candidates = [&uvi, &nginx, &generic];
+    let lines: Vec<String> = MIXED_LOG.lines().map(str::to_string).collect();
+
+    let set: Vec<&str> = detect_all(candidates.iter().copied(), &lines)
+        .into_iter()
+        .map(|ex| ex.name.as_str())
+        .collect();
+    // Both real formats, most-specific first; the Generic catch-all is never included.
+    assert!(set.contains(&"Uvicorn") && set.contains(&"Nginx"));
+    assert!(!set.contains(&GENERIC_EXTRACTOR_NAME));
+
+    // A single-format sample yields just that schema.
+    let only_uvi: Vec<String> = ["INFO:     a", "ERROR:    b", "INFO:     c"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let single: Vec<&str> = detect_all(candidates.iter().copied(), &only_uvi)
+        .into_iter()
+        .map(|ex| ex.name.as_str())
+        .collect();
+    assert_eq!(single, ["Uvicorn"]);
+}
+
+#[test]
+fn add_file_auto_assigns_a_schema_set_for_a_mixed_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("mixed.log");
+    std::fs::write(&log, MIXED_LOG).unwrap();
+
+    let mut project = Project::load(tmp.path());
+    project.add_extractor(uvicorn_schema()).unwrap();
+    project.add_extractor(nginx_schema()).unwrap();
+    // Zero config: adding the file auto-assigns a schema per format present.
+    let id = project.add_file(&log, None).file_id.clone();
+    let file = project.get_file(&id).unwrap();
+    assert!(file.is_multi_schema());
+    let names: Vec<&str> = file.schemas.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"Uvicorn") && names.contains(&"Nginx"));
+}
+
+#[test]
+fn multi_schema_set_survives_a_project_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("mixed.log");
+    std::fs::write(&log, MIXED_LOG).unwrap();
+
+    let mut project = Project::load(tmp.path());
+    project.add_extractor(uvicorn_schema()).unwrap();
+    project.add_extractor(nginx_schema()).unwrap();
+    let id = project.add_file(&log, None).file_id.clone();
+    project
+        .set_file_schemas(&id, &["Uvicorn".to_string(), "Nginx".to_string()])
+        .unwrap();
+    assert!(project.get_file(&id).unwrap().is_multi_schema());
+
+    project.save().unwrap();
+    let reloaded = Project::load(tmp.path());
+    let file = reloaded.get_file(&id).unwrap();
+    assert!(file.is_multi_schema());
+    let names: Vec<&str> = file.schemas.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["Uvicorn", "Nginx"]);
+}
+
+#[test]
+fn stdin_source_is_not_persisted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.log");
+    std::fs::write(&a, "hello\n").unwrap();
+
+    let mut project = Project::load(tmp.path());
+    project.add_file(&a, None);
+    let stdin_id = project.add_stdin_source().file_id.clone();
+    assert!(project.get_file(&stdin_id).unwrap().is_stdin_source());
+
+    // A closed pipe cannot be reopened, so the stdin source must not survive a round trip;
+    // the ordinary file must.
+    project.save().unwrap();
+    let reloaded = Project::load(tmp.path());
+    assert!(reloaded.get_file(&stdin_id).is_none());
+    let names: Vec<&str> = reloaded
+        .files
+        .iter()
+        .map(|file| file.display_name.as_str())
+        .collect();
+    assert_eq!(names, ["a.log"]);
 }
 
 #[test]
@@ -2317,7 +2479,10 @@ fn cached_field_extraction_matches_and_is_stable() {
     // fields_for (one pass) agrees with field-at-a-time access.
     let map = model.fields_for(entry);
     for field in ["timestamp", "message", "logger", "level"] {
-        assert_eq!(map.get(field).map(String::as_str).unwrap_or(""), model.get_field(entry, field));
+        assert_eq!(
+            map.get(field).map(String::as_str).unwrap_or(""),
+            model.get_field(entry, field)
+        );
     }
 }
 
@@ -2347,7 +2512,10 @@ fn multiline_block_schema_extracts_a_message_value_that_spans_lines() {
 
     assert_eq!(model.entries.len(), 1);
     assert_eq!(model.get_field(&model.entries[0], "level"), "INFO");
-    assert_eq!(model.get_field(&model.entries[0], "service"), "MSTRBAK-REFRESH");
+    assert_eq!(
+        model.get_field(&model.entries[0], "service"),
+        "MSTRBAK-REFRESH"
+    );
     assert_eq!(
         model.get_field(&model.entries[0], "host"),
         "env-oplssbz618oe2fkp-iserver-0"

@@ -1,5 +1,5 @@
 use crate::ai::config::AiConfig;
-use crate::ai::message::{ChatMsg, ToolResult};
+use crate::ai::message::{Assistant, ChatMsg, ToolResult};
 use crate::ai::{tools as ai_tools, AgentRequest, AiWorker};
 use crate::core::extractor::{
     export_schemas_to_folder, load_schemas_from_folder, user_schema_dir, Extractor,
@@ -501,13 +501,27 @@ impl AiChat {
     }
 }
 
-/// A one-off request to infer a log schema from a file's first lines. Kept apart from the
-/// chat so the two never share a worker thread or a generation counter.
+/// What to do with an inferred schema when the reply arrives.
+#[derive(Debug, Clone)]
+enum SchemaInferTarget {
+    /// Replace the file's schema with the inferred one (`i` on a source / schema row).
+    Replace(String),
+    /// Append the inferred schema to each listed source's set (`i` on selected lines). The
+    /// sample rides along so `entry_start` repair validates against the selected lines rather
+    /// than the file's first lines, which in a mixed log are a different format.
+    Append {
+        file_ids: Vec<String>,
+        sample: Vec<String>,
+    },
+}
+
+/// A one-off request to infer a log schema. Kept apart from the chat so the two never share a
+/// worker thread or a generation counter.
 struct SchemaInfer {
     worker: AiWorker,
-    /// The `(generation, file_id)` of the request in flight, if any; replies to older ones,
-    /// or with a mismatched generation, are ignored.
-    pending: Option<(u64, String)>,
+    /// The `(generation, target)` of the request in flight, if any; replies to older ones, or
+    /// with a mismatched generation, are ignored.
+    pending: Option<(u64, SchemaInferTarget)>,
     next_gen: u64,
 }
 
@@ -797,7 +811,9 @@ struct SourceEditor {
     short_name: String,
     description: String,
     tag: String,
-    schema: String,
+    /// The source's ordered schema set (priority = match order). One name is the ordinary
+    /// single-schema case.
+    schemas: Vec<String>,
 }
 
 impl SourceEditor {
@@ -808,13 +824,22 @@ impl SourceEditor {
     const ROWS: usize = 4;
 
     fn new(file: &LogFileModel) -> Self {
+        let schemas: Vec<String> = file
+            .schema_set()
+            .iter()
+            .map(|schema| schema.name.clone())
+            .collect();
         Self {
             file_id: file.file_id.clone(),
             row: Self::SHORT_NAME,
             short_name: source_default_short_name(file),
             description: file.description.clone(),
             tag: file.tag.clone(),
-            schema: file.extractor_name.clone(),
+            schemas: if schemas.is_empty() {
+                vec![file.extractor_name.clone()]
+            } else {
+                schemas
+            },
         }
     }
 
@@ -825,13 +850,41 @@ impl SourceEditor {
             .min(Self::ROWS.saturating_sub(1));
     }
 
-    fn field_mut(&mut self) -> &mut String {
+    /// The three free-text rows. The schema row is edited with the picker, not typing.
+    fn field_mut(&mut self) -> Option<&mut String> {
         match self.row {
-            Self::SHORT_NAME => &mut self.short_name,
-            Self::DESCRIPTION => &mut self.description,
-            Self::TAG => &mut self.tag,
-            Self::SCHEMA => &mut self.schema,
-            _ => &mut self.short_name,
+            Self::SHORT_NAME => Some(&mut self.short_name),
+            Self::DESCRIPTION => Some(&mut self.description),
+            Self::TAG => Some(&mut self.tag),
+            _ => None,
+        }
+    }
+
+    /// The schema set as a numbered priority line for the editor row.
+    fn schema_display(&self) -> String {
+        if self.schemas.is_empty() {
+            return "(none)".to_string();
+        }
+        self.schemas
+            .iter()
+            .enumerate()
+            .map(|(index, name)| format!("{}. {name}", index + 1))
+            .collect::<Vec<_>>()
+            .join("   ")
+    }
+
+    fn add_schema(&mut self, name: String) {
+        if !name.trim().is_empty() && !self.schemas.iter().any(|existing| existing == &name) {
+            self.schemas.push(name);
+        }
+    }
+
+    fn remove_last_schema(&mut self) -> Option<String> {
+        // Keep at least one schema; a source always parses under something.
+        if self.schemas.len() > 1 {
+            self.schemas.pop()
+        } else {
+            None
         }
     }
 }
@@ -952,6 +1005,8 @@ impl LiveSourceEditor {
             LiveSourceKind::Journalctl => {
                 rows.push((LiveSourceField::Unit, "Unit", self.unit.clone()));
             }
+            // Only created via `logscout -i`, never through this editor.
+            LiveSourceKind::Stdin => {}
         }
         rows.extend([
             (LiveSourceField::Since, "Since", self.since.clone()),
@@ -1052,6 +1107,9 @@ struct SchemaLibraryPicker {
 enum SchemaPickerTarget {
     File(String),
     LiveEditor(LiveSourceEditor),
+    /// Adding a schema to a source's set from inside its editor; the pick appends and
+    /// returns to the editor.
+    SourceEditor(SourceEditor),
 }
 
 #[derive(Debug, Clone)]
@@ -1815,7 +1873,9 @@ struct LoadJob {
     display_name: String,
     lines: std::io::Lines<std::io::BufReader<std::fs::File>>,
     builder: EntryBuilder,
-    extractor: Option<Extractor>,
+    /// The source's ordered schema set, for entry grouping. One element (or none) is the
+    /// ordinary single-schema case.
+    schemas: Vec<Extractor>,
     bytes: u64,
     total: u64,
     error: Option<String>,
@@ -1826,12 +1886,16 @@ enum LiveEvent {
     /// (`[logscout stderr] ` for stderr, empty for stdout). The tag is applied later, in
     /// `drain_live_events`, where the schema is known -- so it can land only on lines that
     /// start an entry and leave continuation lines clean.
-    Line { text: String, prefix: &'static str },
+    Line {
+        text: String,
+        prefix: &'static str,
+    },
     Closed,
 }
 
 struct LiveRuntime {
-    child: Child,
+    /// `None` for a stdin source: there is no child process, only the already-open pipe.
+    child: Option<Child>,
     rx: Receiver<LiveEvent>,
     builder: EntryBuilder,
     base_entries: usize,
@@ -1841,9 +1905,11 @@ struct LiveRuntime {
 
 impl Drop for LiveRuntime {
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if let Some(child) = self.child.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -2485,18 +2551,19 @@ impl AppState {
                 continue;
             }
 
-            let Some((path, extractor)) = self
-                .project
-                .get_file(&file_id)
-                .map(|file| (file.path.clone(), file.extractor.clone()))
-            else {
+            let Some((path, schemas)) = self.project.get_file(&file_id).map(|file| {
+                let schemas: Vec<Extractor> = file.schema_set().into_iter().cloned().collect();
+                (file.path.clone(), schemas)
+            }) else {
                 self.live_sources.remove(&file_id);
                 continue;
             };
 
+            // The stderr-prefix rule keys off the primary schema's `is_start`.
+            let primary = schemas.first();
             let lines: Vec<String> = raw_lines
                 .into_iter()
-                .map(|(text, prefix)| apply_live_prefix(text, prefix, extractor.as_ref()))
+                .map(|(text, prefix)| apply_live_prefix(text, prefix, primary))
                 .collect();
 
             let mut append_error = None;
@@ -2517,6 +2584,7 @@ impl AppState {
                 None
             };
 
+            let refs: Vec<&Extractor> = schemas.iter().collect();
             let Some(runtime) = self.live_sources.get_mut(&file_id) else {
                 continue;
             };
@@ -2527,7 +2595,7 @@ impl AppState {
                         spool = None;
                     }
                 }
-                runtime.builder.push_line(line, extractor.as_ref());
+                runtime.builder.push_line(line, &refs);
             }
             let base_entries = runtime.base_entries;
             let snapshot = runtime.builder.snapshot();
@@ -2539,6 +2607,8 @@ impl AppState {
                     entry
                 }));
                 file.loaded = true;
+                // Tag the (re)built entries with their matching schema (multi-schema only).
+                file.assign_schema_indices();
                 match append_error {
                     Some(error) => file.error = format!("live spool write error: {error}"),
                     None if file.error.starts_with("live spool write error:") => {
@@ -2563,14 +2633,20 @@ impl AppState {
     fn collect_finished_live_sources(&mut self) {
         let mut finished = Vec::new();
         for (file_id, runtime) in &mut self.live_sources {
-            if runtime.exit_status.is_none() {
-                if let Ok(Some(status)) = runtime.child.try_wait() {
-                    runtime.exit_status = Some(status);
+            if let Some(child) = runtime.child.as_mut() {
+                if runtime.exit_status.is_none() {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        runtime.exit_status = Some(status);
+                    }
                 }
             }
             if runtime.open_pipes == 0 {
-                if let Some(status) = runtime.exit_status.take() {
-                    finished.push((file_id.clone(), status));
+                // A spawned command is done once its exit status is known; a stdin source
+                // (no child) is done the moment its pipe closes.
+                if runtime.child.is_none() {
+                    finished.push((file_id.clone(), None));
+                } else if let Some(status) = runtime.exit_status.take() {
+                    finished.push((file_id.clone(), Some(status)));
                 }
             }
         }
@@ -2578,14 +2654,18 @@ impl AppState {
         for (file_id, status) in finished {
             self.live_sources.remove(&file_id);
             if let Some(file) = self.project.get_file_mut(&file_id) {
-                if status.success() {
-                    if file.error.starts_with("live command exited") {
-                        file.error.clear();
+                match status {
+                    None => self.status = format!("input stream ended: {}", file.display_name),
+                    Some(status) if status.success() => {
+                        if file.error.starts_with("live command exited") {
+                            file.error.clear();
+                        }
+                        self.status = format!("live source stopped: {}", file.display_name);
                     }
-                    self.status = format!("live source stopped: {}", file.display_name);
-                } else {
-                    file.error = format!("live command exited with {status}");
-                    self.status = format!("live source stopped with {status}");
+                    Some(status) => {
+                        file.error = format!("live command exited with {status}");
+                        self.status = format!("live source stopped with {status}");
+                    }
                 }
             }
         }
@@ -2642,33 +2722,41 @@ impl AppState {
             }
         }
 
-        let (program, args) = config.command_parts();
-        let mut command = ProcessCommand::new(&program);
-        command
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                if let Some(file) = self.project.get_file_mut(file_id) {
-                    file.error = format!("live command failed: {error}");
-                }
-                self.status = format!("live source failed: {}", config.command_preview());
-                return;
-            }
-        };
-
         let (tx, rx) = mpsc::channel();
         let mut open_pipes = 0usize;
-        if let Some(stdout) = child.stdout.take() {
+        let child = if config.kind == LiveSourceKind::Stdin {
+            // No process to spawn: read the already-open stdin pipe directly. crossterm's
+            // `use-dev-tty` feature keeps key events coming from /dev/tty, not this pipe.
             open_pipes += 1;
-            spawn_live_pipe_reader(stdout, tx.clone(), "");
-        }
-        if let Some(stderr) = child.stderr.take() {
-            open_pipes += 1;
-            spawn_live_pipe_reader(stderr, tx, "[logscout stderr] ");
-        }
+            spawn_live_pipe_reader(io::stdin(), tx, "");
+            None
+        } else {
+            let (program, args) = config.command_parts();
+            let mut command = ProcessCommand::new(&program);
+            command
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    if let Some(file) = self.project.get_file_mut(file_id) {
+                        file.error = format!("live command failed: {error}");
+                    }
+                    self.status = format!("live source failed: {}", config.command_preview());
+                    return;
+                }
+            };
+            if let Some(stdout) = child.stdout.take() {
+                open_pipes += 1;
+                spawn_live_pipe_reader(stdout, tx.clone(), "");
+            }
+            if let Some(stderr) = child.stderr.take() {
+                open_pipes += 1;
+                spawn_live_pipe_reader(stderr, tx, "[logscout stderr] ");
+            }
+            Some(child)
+        };
 
         self.live_sources.insert(
             file_id.to_string(),
@@ -2892,7 +2980,8 @@ impl AppState {
                     match job.lines.next() {
                         Some(Ok(line)) => {
                             job.bytes += line.len() as u64 + 1;
-                            job.builder.push_line(&line, job.extractor.as_ref());
+                            let refs: Vec<&Extractor> = job.schemas.iter().collect();
+                            job.builder.push_line(&line, &refs);
                         }
                         Some(Err(error)) => {
                             job.error = Some(format!("read error: {error}"));
@@ -2944,6 +3033,8 @@ impl AppState {
                     file.entries = entries;
                     file.loaded = true;
                     file.error.clear();
+                    // Tag each entry with the schema that parsed it (multi-schema sources).
+                    file.assign_schema_indices();
                 }
             }
         }
@@ -3105,19 +3196,8 @@ impl AppState {
     /// Attach extractors, queue a load for every unread file, and recompute each pane.
     fn queue_initial_loads(&mut self) {
         self.project.redetect_mismatched_schemas();
-        let names: Vec<String> = self
-            .project
-            .files
-            .iter()
-            .map(|file| file.extractor_name.clone())
-            .collect();
-        let extractors: Vec<Extractor> = names
-            .iter()
-            .map(|name| self.project.get_extractor(name))
-            .collect();
-        for (index, extractor) in extractors.into_iter().enumerate() {
-            self.project.files[index].refresh_extractor(Some(extractor));
-        }
+        // Re-resolve schemas against the current library, preserving multi-schema sets.
+        self.project.refresh_all_extractors();
 
         let ids: Vec<String> = self
             .project
@@ -3151,7 +3231,7 @@ impl AppState {
         };
         let path = file.path.clone();
         let display_name = file.display_name.clone();
-        let extractor = file.extractor.clone();
+        let schemas: Vec<Extractor> = file.schema_set().into_iter().cloned().collect();
         let total = parser::file_size(&path);
         let is_live = file.is_live();
 
@@ -3170,7 +3250,7 @@ impl AppState {
                 display_name,
                 lines: std::io::BufReader::new(handle).lines(),
                 builder: EntryBuilder::new(),
-                extractor,
+                schemas,
                 bytes: 0,
                 total,
                 error: None,
@@ -4738,11 +4818,12 @@ impl AppState {
         let inner = block.inner(area);
         let text_width = inner.width as usize;
         let label_width = 13usize;
+        let schema_display = editor.schema_display();
         let rows = [
             ("Short name", editor.short_name.as_str()),
             ("Description", editor.description.as_str()),
             ("Tag", editor.tag.as_str()),
-            ("Schema", editor.schema.as_str()),
+            ("Schemas", schema_display.as_str()),
         ];
 
         let mut lines = Vec::new();
@@ -4765,7 +4846,7 @@ impl AppState {
         lines.push(Line::from(""));
         if editor.row == SourceEditor::SCHEMA {
             lines.push(Line::from(Span::styled(
-                "Schema: i detect with LLM  e edit manually  L load library  X save to library",
+                "Schemas: L add from library  d remove last  i detect (LLM)  e edit  X save library",
                 theme.dim(),
             )));
         } else {
@@ -6269,6 +6350,8 @@ impl AppState {
             KeyCode::Char('f') => self.open_filter_builder(None),
             KeyCode::Char('t') => self.open_time_picker(),
             KeyCode::Char('T') => self.toggle_elapsed_mark(),
+            // `i` on selected pane lines: infer a schema from them and append it to the set.
+            KeyCode::Char('i') if self.focus == Focus::Pane => self.infer_schema_from_selection(),
             KeyCode::Char('P') | KeyCode::Char('p')
                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
@@ -8411,11 +8494,15 @@ impl AppState {
                 self.mode = Mode::SourceEditor(editor);
             }
             KeyCode::Backspace => {
-                editor.field_mut().pop();
+                if let Some(field) = editor.field_mut() {
+                    field.pop();
+                }
                 self.mode = Mode::SourceEditor(editor);
             }
             KeyCode::Char('u') if ctrl => {
-                editor.field_mut().clear();
+                if let Some(field) = editor.field_mut() {
+                    field.clear();
+                }
                 self.mode = Mode::SourceEditor(editor);
             }
             KeyCode::Char('i') if editor.row == SourceEditor::SCHEMA && !ctrl => {
@@ -8427,16 +8514,29 @@ impl AppState {
                 self.save_source_editor_fields(&editor);
                 self.open_schema_input_for(&editor.file_id);
             }
+            // On the schema row, `L` adds a library schema to the set (repeat to add more).
             KeyCode::Char('L') if editor.row == SourceEditor::SCHEMA && !ctrl => {
                 self.save_source_editor_fields(&editor);
-                self.open_schema_library_picker(editor.file_id);
+                self.open_schema_library_picker_for_target(SchemaPickerTarget::SourceEditor(
+                    editor,
+                ));
+            }
+            // `d`/Delete removes the last schema in the set (never the only one).
+            KeyCode::Char('d') | KeyCode::Delete if editor.row == SourceEditor::SCHEMA && !ctrl => {
+                match editor.remove_last_schema() {
+                    Some(removed) => self.status = format!("removed schema: {removed}"),
+                    None => self.status = "a source needs at least one schema".to_string(),
+                }
+                self.mode = Mode::SourceEditor(editor);
             }
             KeyCode::Char('X') if editor.row == SourceEditor::SCHEMA && !ctrl => {
                 self.save_source_editor_fields(&editor);
                 self.open_save_source_schema(editor.file_id);
             }
             KeyCode::Char(ch) if !ctrl => {
-                editor.field_mut().push(ch);
+                if let Some(field) = editor.field_mut() {
+                    field.push(ch);
+                }
                 self.mode = Mode::SourceEditor(editor);
             }
             _ => self.mode = Mode::SourceEditor(editor),
@@ -8468,6 +8568,9 @@ impl AppState {
                         }
                         SchemaPickerTarget::LiveEditor(editor) => {
                             self.apply_library_schema_to_live_editor(editor, schema);
+                        }
+                        SchemaPickerTarget::SourceEditor(editor) => {
+                            self.add_library_schema_to_source_editor(editor, schema);
                         }
                     }
                 } else {
@@ -9238,36 +9341,6 @@ impl AppState {
         self.apply_schema_to_file(&file_id, &name);
     }
 
-    fn apply_schema_text_to_file(&mut self, file_id: &str, text: &str) {
-        let text = text.trim();
-        if text.is_empty() {
-            self.status = "schema name cannot be empty".to_string();
-            return;
-        }
-        if !text.contains('|') && !looks_like_schema_json_input(text) {
-            if !self.project.extractors.contains_key(text) {
-                self.status = format!("unknown log schema: {text}");
-                return;
-            }
-            self.apply_schema_to_file(file_id, text);
-            return;
-        }
-
-        let extractor = match parse_log_schema_input(text) {
-            Ok(extractor) => extractor,
-            Err(error) => {
-                self.status = error;
-                return;
-            }
-        };
-        let name = extractor.name.clone();
-        if let Err(error) = self.project.add_extractor(extractor) {
-            self.status = error;
-            return;
-        }
-        self.apply_schema_to_file(file_id, &name);
-    }
-
     fn open_schema_library_picker(&mut self, file_id: String) {
         self.open_schema_library_picker_for_target(SchemaPickerTarget::File(file_id));
     }
@@ -9334,6 +9407,10 @@ impl AppState {
                 editor.focus_field(LiveSourceField::Schema);
                 self.mode = Mode::LiveSourceEditor(editor);
             }
+            SchemaPickerTarget::SourceEditor(mut editor) => {
+                editor.row = SourceEditor::SCHEMA;
+                self.mode = Mode::SourceEditor(editor);
+            }
         }
     }
 
@@ -9346,6 +9423,23 @@ impl AppState {
             }
         }
         self.apply_schema_to_file(&file_id, &name);
+    }
+
+    /// Append a picked library schema to a source editor's set, then return to the editor
+    /// (with the schema row focused) so more can be added.
+    fn add_library_schema_to_source_editor(&mut self, mut editor: SourceEditor, schema: Extractor) {
+        let name = schema.name.clone();
+        if !self.project.extractors.contains_key(&name) {
+            if let Err(error) = self.project.add_extractor(schema) {
+                self.status = format!("schema import failed: {error}");
+                editor.row = SourceEditor::SCHEMA;
+                self.mode = Mode::SourceEditor(editor);
+                return;
+            }
+        }
+        editor.add_schema(name);
+        editor.row = SourceEditor::SCHEMA;
+        self.mode = Mode::SourceEditor(editor);
     }
 
     fn apply_library_schema_to_live_editor(
@@ -9753,15 +9847,19 @@ impl AppState {
     }
 
     fn submit_source_editor(&mut self, editor: SourceEditor) {
-        let schema = editor.schema.trim().to_string();
-        let old_schema = self
+        let old_schemas: Vec<String> = self
             .project
             .get_file(&editor.file_id)
-            .map(|file| file.extractor_name.clone())
+            .map(|file| {
+                file.schema_set()
+                    .iter()
+                    .map(|schema| schema.name.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         self.save_source_editor_fields(&editor);
-        if !schema.is_empty() && schema != old_schema {
-            self.apply_schema_text_to_file(&editor.file_id, &schema);
+        if editor.schemas != old_schemas && !editor.schemas.is_empty() {
+            self.apply_schema_set_to_file(&editor.file_id, &editor.schemas);
             return;
         }
         let name = self
@@ -9770,6 +9868,33 @@ impl AppState {
             .map(|file| source_default_short_name(file))
             .unwrap_or_else(|| editor.short_name.clone());
         self.status = format!("source updated: {name}");
+    }
+
+    /// Point a file at an ordered schema set and re-read it (grouping depends on the set).
+    fn apply_schema_set_to_file(&mut self, file_id: &str, names: &[String]) {
+        let display = self
+            .project
+            .get_file(file_id)
+            .map(|file| file.display_name.clone())
+            .unwrap_or_default();
+        self.live_sources.remove(file_id);
+        if let Err(error) = self.project.set_file_schemas(file_id, names) {
+            self.autosave_project();
+            self.status = error;
+            return;
+        }
+        self.repoint_panes(file_id);
+        self.queue_load(file_id);
+        self.requeue_all_panes();
+        self.autosave_project();
+        self.status = if names.len() > 1 {
+            format!("{} schemas applied to {display}", names.len())
+        } else {
+            format!(
+                "schema '{}' applied to {display}",
+                names.first().cloned().unwrap_or_default()
+            )
+        };
     }
 
     /// `i` on a log source: ask the configured LLM to infer a schema from its first lines.
@@ -9791,14 +9916,6 @@ impl AppState {
             .take(SCHEMA_INFER_SAMPLE_LINES)
             .collect();
 
-        let config = AiConfig::load();
-        let Some(key) = config.api_key() else {
-            self.status =
-                "Configure an LLM first: logscout config set --provider <p> --api-key <key>"
-                    .to_string();
-            return;
-        };
-
         let sample: Vec<String> =
             match crate::core::parser::read_first_lines(&path, SCHEMA_INFER_SAMPLE_LINES) {
                 Ok(lines) => lines.into_iter().take(SCHEMA_INFER_SAMPLE_LINES).collect(),
@@ -9808,10 +9925,63 @@ impl AppState {
                     return;
                 }
             };
-        if sample.iter().all(|line| line.trim().is_empty()) {
-            self.status = "the file has no lines to sample".to_string();
+        self.send_schema_infer(sample, SchemaInferTarget::Replace(file_id));
+    }
+
+    /// `i` on selected lines: infer a schema from exactly those lines and append it to the
+    /// schema set of the source(s) they came from (a merged view spreads to each contributing
+    /// source). Turns "this cluster is a second format" into one keystroke.
+    fn infer_schema_from_selection(&mut self) {
+        let globals = self.target_globals();
+        if globals.is_empty() {
+            self.status = "select one or more lines, then press i".to_string();
             return;
         }
+        let Some(view_file_id) = self.active_view().map(|view| view.file_id.clone()) else {
+            return;
+        };
+        let Some(file) = self.project.get_file(&view_file_id) else {
+            return;
+        };
+
+        let mut sample = Vec::new();
+        let mut file_ids: Vec<String> = Vec::new();
+        for global in globals {
+            let Some(entry) = file.entries.get(global) else {
+                continue;
+            };
+            if sample.len() < SCHEMA_INFER_SAMPLE_LINES {
+                sample.extend(entry.raw.lines().map(str::to_string));
+            }
+            let source_id = file.source_file_id_for(entry).to_string();
+            if !file_ids.contains(&source_id) {
+                file_ids.push(source_id);
+            }
+        }
+        sample.truncate(SCHEMA_INFER_SAMPLE_LINES);
+        if file_ids.is_empty() {
+            self.status = "no source for the selected lines".to_string();
+            return;
+        }
+        self.send_schema_infer(
+            sample.clone(),
+            SchemaInferTarget::Append { file_ids, sample },
+        );
+    }
+
+    /// Send an inference request for `sample` and record what to do with the reply.
+    fn send_schema_infer(&mut self, sample: Vec<String>, target: SchemaInferTarget) {
+        if sample.iter().all(|line| line.trim().is_empty()) {
+            self.status = "no lines to sample".to_string();
+            return;
+        }
+        let config = AiConfig::load();
+        let Some(key) = config.api_key() else {
+            self.status =
+                "Configure an LLM first: logscout config set --provider <p> --api-key <key>"
+                    .to_string();
+            return;
+        };
 
         let schema = self.ai_schema.get_or_insert_with(SchemaInfer::new);
         schema.next_gen += 1;
@@ -9830,7 +10000,7 @@ impl AppState {
             self.status = error;
             return;
         }
-        schema.pending = Some((generation, file_id));
+        schema.pending = Some((generation, target));
         self.status = format!("Inferring a schema with {}…", config.provider.label());
     }
 
@@ -9844,7 +10014,7 @@ impl AppState {
             _ => None,
         };
         let Some(event) = event else { return };
-        let Some((generation, file_id)) = self
+        let Some((generation, target)) = self
             .ai_schema
             .as_ref()
             .and_then(|schema| schema.pending.clone())
@@ -9857,24 +10027,71 @@ impl AppState {
         if let Some(schema) = &mut self.ai_schema {
             schema.pending = None;
         }
+        self.apply_schema_reply(event.result, target);
+    }
 
-        match event.result {
-            Err(error) => self.status = format!("schema inference failed: {error}"),
-            Ok(assistant) => match parse_inferred_schema(&assistant.text) {
-                Ok(mut extractor) => {
-                    let note = self.repair_inferred_schema(&file_id, &mut extractor);
-                    let name = extractor.name.clone();
-                    if let Err(error) = self.project.add_extractor(extractor) {
-                        self.status = format!("the AI's schema did not compile: {error}");
-                    } else {
-                        self.apply_schema_to_file(&file_id, &name);
-                        if let Some(note) = note {
-                            self.status = format!("applied '{name}' -- {note}");
-                        }
+    /// Turn an inference reply into a schema and apply it per its target. Split from the poll
+    /// loop so the apply path can be driven directly in tests.
+    fn apply_schema_reply(&mut self, result: Result<Assistant, String>, target: SchemaInferTarget) {
+        let assistant = match result {
+            Err(error) => {
+                self.status = format!("schema inference failed: {error}");
+                return;
+            }
+            Ok(assistant) => assistant,
+        };
+        let mut extractor = match parse_inferred_schema(&assistant.text) {
+            Ok(extractor) => extractor,
+            Err(error) => {
+                self.status = format!("could not use the AI's schema: {error}");
+                return;
+            }
+        };
+
+        match target {
+            SchemaInferTarget::Replace(file_id) => {
+                let note = self.repair_inferred_schema(&file_id, &mut extractor);
+                let name = extractor.name.clone();
+                if let Err(error) = self.project.add_extractor(extractor) {
+                    self.status = format!("the AI's schema did not compile: {error}");
+                } else {
+                    self.apply_schema_to_file(&file_id, &name);
+                    if let Some(note) = note {
+                        self.status = format!("applied '{name}' -- {note}");
                     }
                 }
-                Err(error) => self.status = format!("could not use the AI's schema: {error}"),
-            },
+            }
+            SchemaInferTarget::Append { file_ids, sample } => {
+                // Fix a near-miss entry_start against the very lines it was inferred from.
+                repair_entry_start(&mut extractor, &sample);
+                let name = extractor.name.clone();
+                if let Err(error) = self.project.add_extractor(extractor) {
+                    self.status = format!("the AI's schema did not compile: {error}");
+                    return;
+                }
+                let mut applied = 0;
+                for file_id in &file_ids {
+                    let Some(file) = self.project.get_file(file_id) else {
+                        continue;
+                    };
+                    let mut names: Vec<String> = file
+                        .schema_set()
+                        .iter()
+                        .map(|schema| schema.name.clone())
+                        .collect();
+                    if names.contains(&name) {
+                        continue;
+                    }
+                    names.push(name.clone());
+                    self.apply_schema_set_to_file(file_id, &names);
+                    applied += 1;
+                }
+                self.status = if applied == 0 {
+                    format!("'{name}' is already on the selected source(s)")
+                } else {
+                    format!("added schema '{name}' to {applied} source(s)")
+                };
+            }
         }
     }
 
@@ -9889,7 +10106,10 @@ impl AppState {
     /// it. Returns a note when it changed something, or a warning when the schema still
     /// collapses the sample so the user knows to edit it.
     fn repair_inferred_schema(&self, file_id: &str, extractor: &mut Extractor) -> Option<String> {
-        let path = self.project.get_file(file_id).map(|file| file.path.clone())?;
+        let path = self
+            .project
+            .get_file(file_id)
+            .map(|file| file.path.clone())?;
         let lines = crate::core::parser::read_first_lines(&path, SCHEMA_INFER_SAMPLE_LINES).ok()?;
         repair_entry_start(extractor, &lines)
     }
@@ -11724,7 +11944,10 @@ fn schema_infer_prompt() -> String {
 /// lines, clear it and say so; otherwise warn. Pure, so the decision is unit-tested apart
 /// from the file I/O in `repair_inferred_schema`.
 fn repair_entry_start(extractor: &mut Extractor, lines: &[String]) -> Option<String> {
-    let non_empty: Vec<&String> = lines.iter().filter(|line| !line.trim().is_empty()).collect();
+    let non_empty: Vec<&String> = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     if non_empty.is_empty() {
         return None;
     }
@@ -13426,7 +13649,9 @@ mod tests {
         )
         .unwrap();
         extractor.field_patterns.insert("pid".into(), r"\d+".into());
-        extractor.field_patterns.insert("level".into(), "LOG".into());
+        extractor
+            .field_patterns
+            .insert("level".into(), "LOG".into());
         extractor.entry_start =
             r"^\[logscout stderr\] \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} UTC \[\d+\] \w+:"
                 .into();
@@ -13452,8 +13677,7 @@ mod tests {
         assert!(extractor.is_start(&header));
 
         // A continuation line (the wrapped SQL) is left clean and is not a new entry.
-        let continuation =
-            apply_live_prefix("            SELECT".into(), prefix, Some(&extractor));
+        let continuation = apply_live_prefix("            SELECT".into(), prefix, Some(&extractor));
         assert_eq!(continuation, "            SELECT");
         assert!(!extractor.is_start(&continuation));
     }
@@ -13462,7 +13686,11 @@ mod tests {
     fn live_prefix_leaves_stdout_untouched_and_falls_back_without_a_schema() {
         // stdout carries no prefix: returned verbatim.
         assert_eq!(
-            apply_live_prefix("plain stdout line".into(), "", Some(&postgres_live_extractor())),
+            apply_live_prefix(
+                "plain stdout line".into(),
+                "",
+                Some(&postgres_live_extractor())
+            ),
             "plain stdout line"
         );
         // No schema: every line counts as a start, so the tag is always applied (the
@@ -17140,7 +17368,7 @@ mod tests {
         assert_eq!(editor.short_name, "b");
         assert_eq!(editor.description, "");
         assert_eq!(editor.tag, "");
-        assert_eq!(editor.schema, "Bracketed default");
+        assert_eq!(editor.schemas, vec!["Bracketed default".to_string()]);
     }
 
     #[test]
@@ -17246,7 +17474,8 @@ mod tests {
         editor.short_name = "access".to_string();
         editor.description = "front door requests".to_string();
         editor.tag = "access_log".to_string();
-        editor.schema = "custom | <timestamp> <level>: <message> | %H:%M:%S | custom".to_string();
+        // The schema row is a picker-driven set now; switch it to another library schema.
+        editor.schemas = vec![GENERIC_EXTRACTOR_NAME.to_string()];
         app.mode = Mode::SourceEditor(editor);
         press(&mut app, KeyCode::Enter);
         app.finish_work();
@@ -17255,9 +17484,130 @@ mod tests {
         assert_eq!(file.label, "access");
         assert_eq!(file.description, "front door requests");
         assert_eq!(file.tag, "access_log");
-        assert_eq!(file.extractor_name, "custom");
+        assert_eq!(file.extractor_name, GENERIC_EXTRACTOR_NAME);
         let saved = std::fs::read_to_string(tmp.path().join(".logscouter/project.json")).unwrap();
         assert!(saved.contains("\"tag\": \"access_log\""), "{saved}");
+    }
+
+    #[test]
+    fn source_editor_applies_and_persists_a_schema_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("mixed.log");
+        std::fs::write(
+            &log,
+            "2026-06-16 10:00:00.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][a.cpp:1] bracketed row\n\
+             INFO:     uvicorn row\n",
+        )
+        .unwrap();
+        let mut app = boot(Project::load(tmp.path()), &log);
+
+        let mut uvi = Extractor::new("Uvi", "<level>:<pad><message>").unwrap();
+        uvi.field_patterns
+            .insert("level".to_string(), "INFO|ERROR".to_string());
+        uvi.field_patterns
+            .insert("pad".to_string(), " +".to_string());
+        uvi.entry_start = "^(?:INFO|ERROR):".to_string();
+        uvi.compile().unwrap();
+        app.project.add_extractor(uvi).unwrap();
+
+        let file_id = app.project.files[0].file_id.clone();
+        app.open_source_editor_for(&file_id);
+        let Mode::SourceEditor(mut editor) = app.mode.clone() else {
+            panic!("expected the source editor, got {:?}", app.mode);
+        };
+        // A fresh single-format detection; add a second schema (dedup on repeat).
+        assert_eq!(editor.schemas, vec!["Bracketed default".to_string()]);
+        editor.add_schema("Uvi".to_string());
+        editor.add_schema("Uvi".to_string());
+        assert_eq!(
+            editor.schemas,
+            vec!["Bracketed default".to_string(), "Uvi".to_string()]
+        );
+        app.mode = Mode::SourceEditor(editor);
+        press(&mut app, KeyCode::Enter);
+        app.finish_work();
+
+        // Each row is parsed by its own schema.
+        let file = app.project.get_file(&file_id).unwrap();
+        assert!(file.is_multi_schema());
+        let brack = file
+            .entries
+            .iter()
+            .find(|entry| entry.raw.contains("bracketed row"))
+            .unwrap();
+        assert_eq!(file.log_schema_name_for(brack), "Bracketed default");
+        assert_eq!(file.level(brack), "Info");
+        let uvi_row = file
+            .entries
+            .iter()
+            .find(|entry| entry.raw.contains("uvicorn row"))
+            .unwrap();
+        assert_eq!(file.log_schema_name_for(uvi_row), "Uvi");
+        assert_eq!(file.level(uvi_row), "INFO");
+
+        // The set survives a project round trip.
+        let app = reopen(app);
+        assert!(app.project.get_file(&file_id).unwrap().is_multi_schema());
+    }
+
+    #[test]
+    fn inferring_from_selected_lines_appends_a_schema_to_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("mixed.log");
+        std::fs::write(
+            &log,
+            "2026-06-16 10:00:00.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][a.cpp:1] bracketed row\n\
+             INFO:     uvicorn row\n",
+        )
+        .unwrap();
+        let mut app = boot(Project::load(tmp.path()), &log);
+        let file_id = app.project.files[0].file_id.clone();
+        assert!(!app.project.get_file(&file_id).unwrap().is_multi_schema());
+
+        // Pane `i` with no LLM key still routes through selection gathering to the key check.
+        app.focus = Focus::Pane;
+        if let Some(view) = app.active_view_mut() {
+            view.move_cursor_to(1); // the uvicorn row
+        }
+        press(&mut app, KeyCode::Char('i'));
+        assert!(
+            app.status.contains("Configure an LLM") || app.status.contains("Inferring"),
+            "{}",
+            app.status
+        );
+
+        // Simulate the LLM reply: a uvicorn schema, appended to the source of the selection.
+        let schema_json = r#"{"name":"Uvi","format":"<level>:<pad><message>","timestamp_format":"%Y-%m-%d %H:%M:%S","field_patterns":{"level":"INFO|ERROR","pad":" +"},"entry_start":"^(?:INFO|ERROR):"}"#;
+        app.apply_schema_reply(
+            Ok(Assistant {
+                text: schema_json.to_string(),
+                tool_calls: Vec::new(),
+            }),
+            SchemaInferTarget::Append {
+                file_ids: vec![file_id.clone()],
+                sample: vec!["INFO:     uvicorn row".to_string()],
+            },
+        );
+        app.finish_work();
+
+        // The source is now multi-schema: the bracketed schema kept, the uvicorn one added.
+        let file = app.project.get_file(&file_id).unwrap();
+        assert!(file.is_multi_schema());
+        let names: Vec<&str> = file.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Bracketed default", "Uvi"]);
+        let brack = file
+            .entries
+            .iter()
+            .find(|entry| entry.raw.contains("bracketed row"))
+            .unwrap();
+        assert_eq!(file.log_schema_name_for(brack), "Bracketed default");
+        let uvi_row = file
+            .entries
+            .iter()
+            .find(|entry| entry.raw.contains("uvicorn row"))
+            .unwrap();
+        assert_eq!(file.log_schema_name_for(uvi_row), "Uvi");
+        assert_eq!(file.level(uvi_row), "INFO");
     }
 
     #[test]
@@ -17435,9 +17785,10 @@ mod tests {
         app.finish_work();
         let file_id = app.active_view().unwrap().file_id.clone();
 
-        app.apply_schema_text_to_file(
-            &file_id,
-            "simple | <timestamp> <level>: <message> | %H:%M:%S | compact service log",
+        // The `e` (edit manually) flow defines a schema from `name | format | ts | desc`
+        // text and applies it to the active source.
+        app.submit_extractor(
+            "simple | <timestamp> <level>: <message> | %H:%M:%S | compact service log".to_string(),
         );
         app.finish_work();
 

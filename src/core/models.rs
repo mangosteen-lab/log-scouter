@@ -35,6 +35,10 @@ pub enum LiveSourceKind {
     Kubernetes,
     Docker,
     Journalctl,
+    /// The process's own stdin (`some-command | logscout -i`). Unlike the others there is
+    /// no command to spawn -- the pipe is already open -- and it cannot be reconnected, so
+    /// a stdin source is never persisted to the project.
+    Stdin,
 }
 
 impl LiveSourceKind {
@@ -43,6 +47,7 @@ impl LiveSourceKind {
             Self::Kubernetes => "kubectl",
             Self::Docker => "docker",
             Self::Journalctl => "journalctl",
+            Self::Stdin => "stdin",
         }
     }
 }
@@ -113,6 +118,7 @@ impl LiveSourceConfig {
                     format!("journalctl {}", self.unit.trim())
                 }
             }
+            LiveSourceKind::Stdin => "stdin".to_string(),
         }
     }
 
@@ -133,6 +139,7 @@ impl LiveSourceConfig {
                     return Err("systemd unit is required".to_string());
                 }
             }
+            LiveSourceKind::Stdin => {}
         }
         Ok(())
     }
@@ -200,10 +207,15 @@ impl LiveSourceConfig {
                 }
                 ("journalctl".to_string(), args)
             }
+            // No command is spawned for stdin; the pipe is read directly.
+            LiveSourceKind::Stdin => ("stdin".to_string(), Vec::new()),
         }
     }
 
     pub fn command_preview(&self) -> String {
+        if self.kind == LiveSourceKind::Stdin {
+            return "stdin (piped input)".to_string();
+        }
         let (program, args) = self.command_parts();
         std::iter::once(program)
             .chain(args)
@@ -274,6 +286,11 @@ pub struct LogFileModel {
     pub description: String,
     pub tag: String,
     pub extractor: Option<Extractor>,
+    /// Ordered candidate schemas for a non-merged source. Empty means single-schema (use
+    /// `extractor`); when set, an entry is parsed by the first schema whose pattern matches
+    /// it, and `extractor`/`extractor_name` mirror `schemas[0]`. Not used by merged models,
+    /// which resolve per contributing file through `sources`.
+    pub schemas: Vec<Extractor>,
     pub entries: Vec<LogEntry>,
     pub loaded: bool,
     pub error: String,
@@ -319,6 +336,7 @@ impl LogFileModel {
             description: String::new(),
             tag: String::new(),
             extractor,
+            schemas: Vec::new(),
             entries: Vec::new(),
             loaded: false,
             error: String::new(),
@@ -338,6 +356,12 @@ impl LogFileModel {
         self.live.is_some()
     }
 
+    /// A source reading the process's own stdin. Transient: it is never written to
+    /// `project.json`, because a closed pipe cannot be reopened next session.
+    pub fn is_stdin_source(&self) -> bool {
+        matches!(&self.live, Some(config) if config.kind == LiveSourceKind::Stdin)
+    }
+
     /// The schema that parsed this entry. Merged models keep one per source file.
     pub fn extractor_for(&self, entry: &LogEntry) -> Option<&Extractor> {
         if self.sources.is_empty() {
@@ -352,6 +376,78 @@ impl LogFileModel {
         self.sources
             .get(entry.source as usize)
             .map(|source| source.display_name.as_str())
+            // A multi-schema (non-merged) source names its `sources` after schemas and
+            // leaves `display_name` empty, so the "from" row stays hidden for it.
+            .filter(|name| !name.is_empty())
+    }
+
+    /// A non-merged source carrying more than one candidate schema. Each entry is parsed by
+    /// the first schema in the set whose pattern matches it.
+    pub fn is_multi_schema(&self) -> bool {
+        self.merged_from.is_empty() && self.schemas.len() > 1
+    }
+
+    /// The id of the real source file an entry originates from: the contributing file for a
+    /// merged view, and this file itself otherwise (`sources` names schemas for a
+    /// multi-schema source, but each carries this file's id).
+    pub fn source_file_id_for(&self, entry: &LogEntry) -> &str {
+        self.sources
+            .get(entry.source as usize)
+            .map(|source| source.file_id.as_str())
+            .unwrap_or(self.file_id.as_str())
+    }
+
+    /// The ordered schemas this source is parsed with: the explicit `schemas` set, or the
+    /// single `extractor` as a one-element set.
+    pub fn schema_set(&self) -> Vec<&Extractor> {
+        if self.schemas.is_empty() {
+            self.extractor.iter().collect()
+        } else {
+            self.schemas.iter().collect()
+        }
+    }
+
+    /// Index into `schema_set()` of the first schema that parses `raw`; 0 (the primary) when
+    /// none match -- such an entry shows its raw text as the message. The `is_start` probe is
+    /// tried first so a huge non-matching line is not fed to every schema's capture engine.
+    pub fn resolve_schema_index(&self, raw: &str) -> u16 {
+        let schemas = self.schema_set();
+        if schemas.len() < 2 {
+            return 0;
+        }
+        let head = raw.split_once('\n').map(|(head, _)| head).unwrap_or(raw);
+        schemas
+            .iter()
+            .position(|schema| schema.is_start(head) && schema.captures(raw).is_some())
+            .or_else(|| {
+                schemas
+                    .iter()
+                    .position(|schema| schema.captures(raw).is_some())
+            })
+            .unwrap_or(0) as u16
+    }
+
+    /// After grouping, tag each entry with the schema that parsed it and mirror the set into
+    /// `sources`, so `extractor_for`/`log_schema_name_for` resolve per entry. A no-op for a
+    /// single-schema source (its entries keep `source = 0` and `sources` stays empty).
+    pub fn assign_schema_indices(&mut self) {
+        if self.schemas.len() < 2 {
+            return;
+        }
+        self.sources = self
+            .schemas
+            .iter()
+            .map(|schema| SourceInfo {
+                file_id: self.file_id.clone(),
+                display_name: String::new(),
+                extractor_name: schema.name.clone(),
+                extractor: Some(schema.clone()),
+            })
+            .collect();
+        for index in 0..self.entries.len() {
+            let resolved = self.resolve_schema_index(&self.entries[index].raw);
+            self.entries[index].source = resolved;
+        }
     }
 
     /// The log schema assigned to this entry. Merged models resolve it per source.
@@ -366,9 +462,12 @@ impl LogFileModel {
     }
 
     pub fn load(&mut self) -> std::io::Result<()> {
-        self.entries = parser::read_entries(&self.path, self.extractor.as_ref(), None)?;
+        let schemas: Vec<Extractor> = self.schema_set().into_iter().cloned().collect();
+        let refs: Vec<&Extractor> = schemas.iter().collect();
+        self.entries = parser::read_entries(&self.path, &refs, None)?;
         self.loaded = true;
         self.error.clear();
+        self.assign_schema_indices();
         Ok(())
     }
 
@@ -377,8 +476,11 @@ impl LogFileModel {
         I: IntoIterator,
         I::Item: AsRef<str>,
     {
-        self.entries = parser::build_entries(lines, self.extractor.as_ref());
+        let schemas: Vec<Extractor> = self.schema_set().into_iter().cloned().collect();
+        let refs: Vec<&Extractor> = schemas.iter().collect();
+        self.entries = parser::build_entries_multi(lines, &refs);
         self.loaded = true;
+        self.assign_schema_indices();
     }
 
     pub fn get_field(&self, entry: &LogEntry, name: &str) -> String {
@@ -561,6 +663,28 @@ impl LogFileModel {
 
     pub fn refresh_extractor(&mut self, extractor: Option<Extractor>) {
         self.extractor = extractor;
+        // A single-schema assignment supersedes any multi-schema set.
+        self.schemas.clear();
+        self.sources.clear();
+        self.concrete.clear();
+    }
+
+    /// Set the source's ordered candidate schema set. One (or zero) schema collapses to the
+    /// single-schema representation; two or more are kept as the set. `extractor` /
+    /// `extractor_name` always mirror the primary (first). `sources` is repopulated on the
+    /// next load by `assign_schema_indices`.
+    pub fn set_schemas(&mut self, schemas: Vec<Extractor>) {
+        self.extractor = schemas.first().cloned();
+        self.extractor_name = schemas
+            .first()
+            .map(|schema| schema.name.clone())
+            .unwrap_or_default();
+        self.schemas = if schemas.len() > 1 {
+            schemas
+        } else {
+            Vec::new()
+        };
+        self.sources.clear();
         self.concrete.clear();
     }
 }

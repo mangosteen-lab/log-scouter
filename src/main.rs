@@ -21,6 +21,10 @@ struct Cli {
     folder: Option<String>,
     #[arg()]
     files: Vec<String>,
+    /// Read the process's own stdin as a live log source, e.g.
+    /// `kubectl logs -f ... | logscout -i`. Works alongside an optional folder.
+    #[arg(short = 'i', long = "stdin")]
+    stdin: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -63,7 +67,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Config { action }) => run_config(action.unwrap_or(ConfigAction::List)),
-        None => run_tui(cli.folder, cli.files),
+        None => run_tui(cli.folder, cli.files, cli.stdin),
     }
 }
 
@@ -138,10 +142,14 @@ fn mask(key: &str) -> String {
     format!("{first}…{last}")
 }
 
-fn run_tui(folder: Option<String>, files: Vec<String>) -> anyhow::Result<()> {
+fn run_tui(folder: Option<String>, files: Vec<String>, stdin: bool) -> anyhow::Result<()> {
     let Some(folder_arg) = folder else {
         let root = std::env::current_dir().context("logscout: could not read current folder")?;
-        return log_scouter::tui::run(Project::new(root));
+        let mut project = Project::new(root);
+        if stdin {
+            project.add_stdin_source();
+        }
+        return log_scouter::tui::run(project);
     };
 
     let folder = std::fs::canonicalize(&folder_arg)
@@ -169,6 +177,10 @@ fn run_tui(folder: Option<String>, files: Vec<String>) -> anyhow::Result<()> {
                 eprintln!("logscout: skipping missing file: {}", resolved.display());
             }
         }
+    }
+
+    if stdin {
+        project.add_stdin_source();
     }
 
     log_scouter::tui::run(project)

@@ -604,6 +604,53 @@ where
     })
 }
 
+/// The ordered *set* of schemas a source should be parsed with -- one per format present in
+/// `lines`. Where `detect` returns the single best, this attributes each line to the
+/// most-specific schema that parses it (so a permissive `.*` format cannot swallow another's
+/// lines) and keeps every schema that wins at least a fifth of the lines, most specific
+/// first. The `Generic line` catch-all is never included: it explains nothing structurally,
+/// and an unmatched line already falls back to showing its raw text.
+///
+/// An interleaved uvicorn + nginx log yields `[nginx, uvicorn]`; a single-format log yields
+/// one schema; a log no schema explains yields an empty set (the caller falls back).
+pub fn detect_all<'a, I>(candidates: I, lines: &[String]) -> Vec<&'a Extractor>
+where
+    I: IntoIterator<Item = &'a Extractor>,
+{
+    let considered = lines.iter().filter(|line| !line.trim().is_empty()).count();
+    if considered == 0 {
+        return Vec::new();
+    }
+
+    let mut ordered: Vec<&Extractor> = candidates
+        .into_iter()
+        .filter(|extractor| extractor.name != GENERIC_EXTRACTOR_NAME)
+        .collect();
+    ordered.sort_by(|left, right| {
+        right
+            .specificity()
+            .cmp(&left.specificity())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let mut counts = vec![0usize; ordered.len()];
+    for line in lines.iter().filter(|line| !line.trim().is_empty()) {
+        if let Some(index) = ordered.iter().position(|ex| ex.captures(line).is_some()) {
+            counts[index] += 1;
+        }
+    }
+
+    // A schema earns its place by being the best match for a fifth of the lines -- enough to
+    // pick up a genuine second format while ignoring the odd coincidental match.
+    let threshold = considered.div_ceil(5).max(1);
+    ordered
+        .into_iter()
+        .zip(counts)
+        .filter(|(_, count)| *count >= threshold)
+        .map(|(extractor, _)| extractor)
+        .collect()
+}
+
 fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
