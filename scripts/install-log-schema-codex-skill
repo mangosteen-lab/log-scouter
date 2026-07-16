@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Install the log-scouter "log-schema" skill for OpenAI Codex CLI.
+#
+#   curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install-log-schema-codex-skill | bash
+#
+# Downloads SKILL.md (+ openai.yaml) into ${CODEX_HOME:-$HOME/.codex}/skills/log-schema/.
+# Overrides: LOG_SCOUTER_REPO (owner/repo), LOG_SCOUTER_REF (branch/tag), CODEX_HOME.
+set -euo pipefail
+
+REPO="${LOG_SCOUTER_REPO:-mangosteen-lab/log-scouter}"
+REF="${LOG_SCOUTER_REF:-master}"
+BASE="https://raw.githubusercontent.com/${REPO}/${REF}/skills/log-schema"
+DEST="${CODEX_HOME:-$HOME/.codex}/skills/log-schema"
+
+die() { echo "install-log-schema-codex-skill: $*" >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || die "curl is required"
+
+mkdir -p "$DEST"
+curl -fsSL "$BASE/SKILL.md" -o "$DEST/SKILL.md" || die "could not download SKILL.md from $BASE"
+# openai.yaml is optional Codex metadata; do not fail the install if it is absent.
+curl -fsSL "$BASE/openai.yaml" -o "$DEST/openai.yaml" 2>/dev/null || true
+
+echo "Installed the 'log-schema' skill to $DEST"
+echo "Start a new Codex session, then ask it to generate a logscout schema from your log file."

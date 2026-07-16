@@ -1,0 +1,6 @@
+# Codex CLI metadata for the log-schema skill. Claude Code reads SKILL.md directly and
+# ignores this file.
+name: log-schema
+description: >-
+  Generate a log-scouter (logscout) user-level log schema from sample log lines and write
+  it to ~/.log-scouter/schemas/<name>.json, so logscout can parse a new/custom log format.

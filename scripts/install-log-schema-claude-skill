@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Install the log-scouter "log-schema" skill for Claude Code.
+#
+#   curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install-log-schema-claude-skill | bash
+#
+# Downloads SKILL.md into ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/log-schema/.
+# Overrides: LOG_SCOUTER_REPO (owner/repo), LOG_SCOUTER_REF (branch/tag), CLAUDE_CONFIG_DIR.
+set -euo pipefail
+
+REPO="${LOG_SCOUTER_REPO:-mangosteen-lab/log-scouter}"
+REF="${LOG_SCOUTER_REF:-master}"
+BASE="https://raw.githubusercontent.com/${REPO}/${REF}/skills/log-schema"
+DEST="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/log-schema"
+
+die() { echo "install-log-schema-claude-skill: $*" >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || die "curl is required"
+
+mkdir -p "$DEST"
+curl -fsSL "$BASE/SKILL.md" -o "$DEST/SKILL.md" || die "could not download SKILL.md from $BASE"
+
+echo "Installed the 'log-schema' skill to $DEST"
+echo "Start a new Claude Code session, then ask it to generate a logscout schema from your log file."
