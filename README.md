@@ -167,9 +167,9 @@ curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/s
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/install.ps1 | iex
-irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/upgrade.ps1 | iex
-irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/upgrade.ps1 | iex
+irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/uninstall.ps1 | iex
 ```
 
 Proxy users can pass the proxy to the outer `curl` and to the installer downloads:
@@ -968,6 +968,19 @@ curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/s
 # Claude Code       ->  ~/.claude/skills/log-schema/
 curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install-log-schema-claude-skill | bash
 ```
+
+Windows PowerShell:
+
+```powershell
+# OpenAI Codex CLI  ->  $HOME\.codex\skills\log-schema\
+irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install-log-schema-codex-skill.ps1 | iex
+
+# Claude Code       ->  $HOME\.claude\skills\log-schema\
+irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install-log-schema-claude-skill.ps1 | iex
+```
+
+Both honour `CODEX_HOME` / `CLAUDE_CONFIG_DIR` for the destination, and `LOG_SCOUTER_REPO`,
+`LOG_SCOUTER_REF` and `LOG_SCOUTER_PROXY` for where they download from.
 
 Then start a new agent session and ask it to generate a logscout schema from your log. The
 skill teaches the schema format — the template DSL, chrono timestamp formats, multi-line
