@@ -1,8 +1,8 @@
 use chrono::{NaiveDate, Timelike};
 use log_scouter::core::extractor::{
-    default_extractor, detect, detect_all, export_schemas_to_folder, generic_extractor,
-    load_schemas_from_folder, preview_extraction, sniff_timestamp, user_schema_dir, Extractor,
-    SampleLine, BRACKETED_LEGACY_FORMAT, GENERIC_EXTRACTOR_NAME,
+    bundled_schemas, default_extractor, detect, detect_all, export_schemas_to_folder,
+    generic_extractor, load_schemas_from_folder, preview_extraction, sniff_timestamp,
+    user_schema_dir, Extractor, SampleLine, BRACKETED_LEGACY_FORMAT, GENERIC_EXTRACTOR_NAME,
 };
 use log_scouter::core::filters::{
     common_message_pattern, expand_tilde, export_filters_to_folder, hide_like,
@@ -2598,4 +2598,170 @@ fn multiline_block_schema_extracts_a_message_value_that_spans_lines() {
                 .unwrap()
         )
     );
+}
+
+// ---- bundled schemas -------------------------------------------------------------
+
+const SPRING_BOOT_LOG: &str = r#"2026-07-16 10:00:01.123  INFO 12345 --- [           main] c.e.demo.DemoApplication                 : Starting DemoApplication using Java 17
+2026-07-16 10:00:01.456 DEBUG 12345 --- [           main] o.s.b.f.s.DefaultListableBeanFactory     : Creating shared instance of singleton bean 'reportService'
+2026-07-16 10:00:02.789  WARN 12345 --- [nio-8080-exec-1] c.e.demo.ReportService                   : slow query took 4210 ms
+2026-07-16 10:00:03.001 ERROR 12345 --- [nio-8080-exec-1] c.e.demo.ReportService                   : report 41 failed
+java.lang.IllegalStateException: no such report
+	at com.example.demo.ReportService.load(ReportService.java:88)
+2026-07-16 10:00:04.500  INFO 12345 --- [           main] c.e.demo.DemoApplication                 : Started DemoApplication in 3.42 seconds"#;
+
+const TOMCAT_CATALINA_LOG: &str = r#"16-Jul-2026 10:00:01.123 INFO [main] org.apache.catalina.startup.VersionLoggerListener.log Server version name:   Apache Tomcat/10.1.20
+16-Jul-2026 10:00:01.456 INFO [main] org.apache.coyote.AbstractProtocol.init Initializing ProtocolHandler ["http-nio-8080"]
+16-Jul-2026 10:00:02.456 SEVERE [http-nio-8080-exec-1] org.apache.catalina.core.StandardWrapperValve.invoke Servlet.service() for servlet [dispatcher] threw exception
+	java.lang.NullPointerException
+		at com.example.demo.Handler.handle(Handler.java:42)
+16-Jul-2026 10:00:03.789 INFO [main] org.apache.catalina.startup.Catalina.start Server startup in [1234] milliseconds"#;
+
+const TOMCAT_ACCESS_LOG: &str = r#"10.0.0.7 - - [16/Jul/2026:10:00:01 +0000] "GET /app/health HTTP/1.1" 200 42
+10.0.0.8 - admin [16/Jul/2026:10:00:02 +0000] "POST /app/api/report HTTP/1.1" 500 - "https://example.com/app" "Mozilla/5.0 (X11; Linux x86_64)"
+10.0.0.9 - - [16/Jul/2026:10:00:03 +0000] "GET /app/static/main.css HTTP/1.1" 304 0"#;
+
+const LOG4J2_LOG: &str = r#"2026-07-16 10:00:01,123 [main] INFO  com.example.demo.Bootstrap - context refreshed in 812 ms
+2026-07-16 10:00:02,456 [pool-2-thread-1] ERROR com.example.demo.JobRunner - job 41 failed
+2026-07-16 10:00:03,789 [pool-2-thread-1] DEBUG com.example.demo.JobRunner - retrying job 41"#;
+
+fn bundled(name: &str) -> Extractor {
+    bundled_schemas()
+        .into_iter()
+        .find(|schema| schema.name == name)
+        .unwrap_or_else(|| panic!("bundled schema {name} is missing"))
+}
+
+/// `compile` validates samples too, so this is what stops a bundled schema from shipping
+/// broken -- it is the same check a user's library file gets on load.
+#[test]
+fn every_bundled_schema_compiles_and_its_samples_parse() {
+    let schemas = bundled_schemas();
+    assert_eq!(
+        schemas.len(),
+        log_scouter::core::extractor::BUNDLED_SCHEMA_FILES.len(),
+        "a bundled schema failed to parse or compile"
+    );
+    for schema in &schemas {
+        assert!(
+            !schema.samples.is_empty(),
+            "{} ships no samples, so nothing pins its fields",
+            schema.name
+        );
+    }
+}
+
+#[test]
+fn bundled_schemas_detect_their_own_formats() {
+    let cases = [
+        ("Spring Boot", SPRING_BOOT_LOG),
+        ("Tomcat Catalina", TOMCAT_CATALINA_LOG),
+        ("Tomcat Access Log", TOMCAT_ACCESS_LOG),
+        ("Log4j2 Default", LOG4J2_LOG),
+    ];
+    let candidates = bundled_schemas();
+    let mut pool: Vec<&Extractor> = candidates.iter().collect();
+    let default = default_extractor();
+    let generic = generic_extractor();
+    pool.push(&default);
+    pool.push(&generic);
+
+    for (expected, body) in cases {
+        let lines: Vec<String> = body.lines().map(str::to_string).collect();
+        let picked = detect(pool.iter().copied(), &lines).map(|ex| ex.name.clone());
+        assert_eq!(
+            picked.as_deref(),
+            Some(expected),
+            "detected {picked:?} for the {expected} log"
+        );
+    }
+}
+
+#[test]
+fn spring_boot_schema_extracts_clean_padded_fields() {
+    let schema = bundled("Spring Boot");
+    let fields = schema
+        .extract("2026-07-16 10:00:02.789  WARN 12345 --- [nio-8080-exec-1] c.e.demo.ReportService                   : slow query took 4210 ms")
+        .expect("the line parses");
+    // The pad fields exist so these three stay free of the pattern's alignment spaces.
+    assert_eq!(fields["level"], "WARN");
+    assert_eq!(fields["thread"], "nio-8080-exec-1");
+    assert_eq!(fields["module"], "c.e.demo.ReportService");
+    assert_eq!(fields["pid"], "12345");
+    assert_eq!(fields["message"], "slow query took 4210 ms");
+    assert_eq!(
+        schema.parse_timestamp(&fields),
+        Some(
+            NaiveDate::from_ymd_opt(2026, 7, 16)
+                .unwrap()
+                .and_hms_milli_opt(10, 0, 2, 789)
+                .unwrap()
+        )
+    );
+}
+
+#[test]
+fn tomcat_access_schema_reads_common_and_combined_lines() {
+    let schema = bundled("Tomcat Access Log");
+    let common = schema
+        .extract(r#"10.0.0.7 - - [16/Jul/2026:10:00:01 +0000] "GET /app/health HTTP/1.1" 200 42"#)
+        .expect("the common line parses");
+    assert_eq!(common["status"], "200");
+    assert_eq!(common["bytes"], "42");
+    assert_eq!(common["request"], "GET /app/health HTTP/1.1");
+    assert_eq!(common["extra"], "");
+
+    let combined = schema
+        .extract(r#"10.0.0.8 - admin [16/Jul/2026:10:00:02 +0000] "POST /app/api/report HTTP/1.1" 500 - "https://example.com/app" "Mozilla/5.0 (X11; Linux x86_64)""#)
+        .expect("the combined line parses");
+    assert_eq!(combined["remote_user"], "admin");
+    assert_eq!(combined["status"], "500");
+    assert_eq!(combined["bytes"], "-");
+    assert!(combined["extra"].contains("Mozilla/5.0"));
+}
+
+#[test]
+fn a_user_schema_shadows_a_bundled_one_of_the_same_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join(".logscouter").join("schemas");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mine = Extractor::new("Spring Boot", "<timestamp> mine <message>").unwrap();
+    export_schemas_to_folder(&[mine], &folder).unwrap();
+
+    let project = Project::new(tmp.path());
+    let found: Vec<&Extractor> = project
+        .library
+        .iter()
+        .filter(|schema| schema.name == "Spring Boot")
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "the name must resolve to exactly one schema"
+    );
+    assert!(
+        found[0].format.contains("mine"),
+        "the project's own schema must win over the bundled one"
+    );
+}
+
+/// Sample validation asserts `level`, not the timestamp -- and a `timestamp_format` that
+/// cannot read its own sample fails silently, leaving every entry without a time (no
+/// timeline, no merge position). Pin it for every bundled schema.
+#[test]
+fn every_bundled_schema_parses_the_timestamp_of_its_own_samples() {
+    for schema in bundled_schemas() {
+        for sample in &schema.samples {
+            let fields = schema
+                .extract(&sample.line)
+                .unwrap_or_else(|| panic!("{}: sample does not parse", schema.name));
+            assert!(
+                schema.parse_timestamp(&fields).is_some(),
+                "{}: timestamp_format {:?} cannot read {:?}",
+                schema.name,
+                schema.timestamp_format,
+                fields.get(&schema.timestamp_field)
+            );
+        }
+    }
 }

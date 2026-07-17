@@ -1,0 +1,32 @@
+{
+  "name": "Spring Boot",
+  "description": "Spring Boot 2.x default console/file pattern: date, right-padded level, pid, --- [thread] logger : message. Stack traces fold into the line above.",
+  "schema": {
+    "name": "Spring Boot",
+    "description": "Spring Boot 2.x default console/file pattern: date, right-padded level, pid, --- [thread] logger : message. Stack traces fold into the line above.",
+    "format": "<timestamp> <levelpad><level> <pid> --- [<threadpad><thread>] <module><modulepad> : <message>",
+    "timestamp_field": "timestamp",
+    "timestamp_format": "%Y-%m-%d %H:%M:%S%.3f",
+    "field_patterns": {
+      "levelpad": " *",
+      "level": "[A-Z]+",
+      "pid": "\\d+",
+      "threadpad": " *",
+      "thread": "[^\\]]*",
+      "module": "\\S+",
+      "modulepad": " *",
+      "timestamp": "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}"
+    },
+    "entry_start": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}",
+    "samples": [
+      {
+        "line": "2026-07-16 10:00:01.123  INFO 12345 --- [           main] c.e.demo.DemoApplication                 : Started DemoApplication in 3.42 seconds (JVM running for 4.1)",
+        "level": "INFO"
+      },
+      {
+        "line": "2026-07-16 10:00:02.500 ERROR 12345 --- [nio-8080-exec-1] o.a.c.c.C.[.[.[/].[dispatcherServlet]    : Servlet.service() threw exception",
+        "level": "ERROR"
+      }
+    ]
+  }
+}

@@ -892,6 +892,28 @@ wins a file no other format explains -- which is the point, because under a form
 matches nothing at all, no line starts a record and the whole file folds into one entry.
 A file whose stored format explains none of its opening lines is re-detected on load.
 
+### Bundled schemas
+
+Schemas for common third-party formats ship with the binary and join detection automatically —
+nothing to install:
+
+| Schema | Reads |
+|---|---|
+| `Spring Boot` | Spring Boot 2.x default pattern (`2026-07-16 10:00:01.123  INFO 12345 --- [main] c.e.App : msg`) |
+| `Spring Boot 3` | Spring Boot 3.x default pattern (ISO-8601 timestamp with `Z` or an offset) |
+| `Tomcat Catalina` | `catalina.out` as written by JULI's `OneLineFormatter` (Tomcat 8+) |
+| `Tomcat Access Log` | Tomcat `AccessLogValve` / Apache httpd access logs, common and combined |
+| `Log4j2 Default` | The Log4j2 / Logback `%d [%t] %-5level %logger{36} - %msg` pattern |
+
+They are ordinary library schemas, not built-ins: they never enter `project.json`, and they sit
+*below* both `.logscouter/schemas` and `~/.log-scouter/schemas` in precedence. So a schema of
+yours with the same name always wins, and upgrading log-scouter cannot change how a log you
+already have a schema for is parsed. All of them fold Java stack traces into the line above.
+
+The JSON lives in [`schemas/`](schemas/) in this repo, in the same shape as a user library file —
+to propose one, copy an existing file and add it to `BUNDLED_SCHEMA_FILES` in
+`src/core/extractor.rs`. Each must carry `samples`, which the test suite validates.
+
 Select a source in the sidebar and press `Enter` to edit its short name, description,
 tag, and schema. In the schema row, press `e` to edit the schema manually, `i` to infer it
 with the configured LLM, `L` to load one from the user schema library, or `X` to save the

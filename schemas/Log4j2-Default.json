@@ -1,0 +1,29 @@
+{
+  "name": "Log4j2 Default",
+  "description": "Log4j2 / Logback pattern %d [%t] %-5level %logger{36} - %msg with the %d{DEFAULT} date (yyyy-MM-dd HH:mm:ss,SSS). Stack traces fold into the line above.",
+  "schema": {
+    "name": "Log4j2 Default",
+    "description": "Log4j2 / Logback pattern %d [%t] %-5level %logger{36} - %msg with the %d{DEFAULT} date (yyyy-MM-dd HH:mm:ss,SSS). Stack traces fold into the line above.",
+    "format": "<timestamp> [<thread>] <level><levelpad> <module> - <message>",
+    "timestamp_field": "timestamp",
+    "timestamp_format": "%Y-%m-%d %H:%M:%S,%3f",
+    "field_patterns": {
+      "thread": "[^\\]]*",
+      "level": "[A-Z]+",
+      "levelpad": " *",
+      "module": "\\S+",
+      "timestamp": "\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},\\d{3}"
+    },
+    "entry_start": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},\\d{3}",
+    "samples": [
+      {
+        "line": "2026-07-16 10:00:01,123 [main] INFO  com.example.demo.Bootstrap - context refreshed in 812 ms",
+        "level": "INFO"
+      },
+      {
+        "line": "2026-07-16 10:00:02,456 [pool-2-thread-1] ERROR com.example.demo.JobRunner - job 41 failed",
+        "level": "ERROR"
+      }
+    ]
+  }
+}

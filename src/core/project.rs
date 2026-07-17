@@ -1,8 +1,8 @@
 use crate::core::extractor::{
-    builtin_extractors, default_extractor, detect, detect_all, extractor_from_project,
-    load_schemas_from_folder, user_schema_dir, Extractor, BRACKETED_DEFAULT_FORMAT,
-    BRACKETED_LEGACY_FORMAT, DEFAULT_EXTRACTOR_NAME, DETECT_LINES, GENERIC_EXTRACTOR_NAME,
-    USER_SCHEMAS_SUBDIR,
+    builtin_extractors, bundled_schemas, default_extractor, detect, detect_all,
+    extractor_from_project, load_schemas_from_folder, user_schema_dir, Extractor,
+    BRACKETED_DEFAULT_FORMAT, BRACKETED_LEGACY_FORMAT, DEFAULT_EXTRACTOR_NAME, DETECT_LINES,
+    GENERIC_EXTRACTOR_NAME, USER_SCHEMAS_SUBDIR,
 };
 use crate::core::filters::FilterSet;
 use crate::core::models::{display_name, merge_files, LiveSourceConfig, LogFileModel};
@@ -187,10 +187,14 @@ impl Project {
         project
     }
 
-    /// Load the on-disk schema libraries into `self.library`: the project's own
-    /// `.logscouter/schemas` first, then the shared `~/.log-scouter/schemas`, deduped so a
-    /// project schema shadows a user one of the same name. Bad or missing folders are simply
+    /// Load the schema libraries into `self.library`: the project's own
+    /// `.logscouter/schemas` first, then the shared `~/.log-scouter/schemas`, then the
+    /// schemas bundled with the binary -- deduped so a project schema shadows a user one of
+    /// the same name, and either shadows a bundled one. Bad or missing folders are simply
     /// empty -- detection must never fail because a library file does not parse.
+    ///
+    /// Bundled schemas come last so that adopting a new release cannot change how a log the
+    /// user already has a schema for is parsed.
     pub fn load_schema_libraries(&mut self) {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut library: Vec<Extractor> = Vec::new();
@@ -209,6 +213,11 @@ impl Project {
                 if seen.insert(name) {
                     library.push(schema);
                 }
+            }
+        }
+        for schema in bundled_schemas() {
+            if seen.insert(schema.name.clone()) {
+                library.push(schema);
             }
         }
         self.library = library;

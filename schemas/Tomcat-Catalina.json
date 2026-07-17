@@ -1,0 +1,28 @@
+{
+  "name": "Tomcat Catalina",
+  "description": "Tomcat catalina.out / catalina.<date>.log as written by JULI's OneLineFormatter (Tomcat 8+): dd-MMM-yyyy HH:mm:ss.SSS LEVEL [thread] source.method message. Stack traces fold into the line above.",
+  "schema": {
+    "name": "Tomcat Catalina",
+    "description": "Tomcat catalina.out / catalina.<date>.log as written by JULI's OneLineFormatter (Tomcat 8+): dd-MMM-yyyy HH:mm:ss.SSS LEVEL [thread] source.method message. Stack traces fold into the line above.",
+    "format": "<timestamp> <level> [<thread>] <module> <message>",
+    "timestamp_field": "timestamp",
+    "timestamp_format": "%d-%b-%Y %H:%M:%S%.3f",
+    "field_patterns": {
+      "level": "[A-Z]+",
+      "thread": "[^\\]]*",
+      "module": "\\S+",
+      "timestamp": "\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}"
+    },
+    "entry_start": "^\\d{2}-[A-Za-z]{3}-\\d{4} \\d{2}:\\d{2}:\\d{2}",
+    "samples": [
+      {
+        "line": "16-Jul-2026 10:00:01.123 INFO [main] org.apache.catalina.startup.Catalina.start Server startup in [1234] milliseconds",
+        "level": "INFO"
+      },
+      {
+        "line": "16-Jul-2026 10:00:02.456 SEVERE [http-nio-8080-exec-1] org.apache.catalina.core.StandardWrapperValve.invoke Servlet.service() for servlet [dispatcher] threw exception",
+        "level": "SEVERE"
+      }
+    ]
+  }
+}

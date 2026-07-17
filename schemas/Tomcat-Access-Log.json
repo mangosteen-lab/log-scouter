@@ -1,0 +1,29 @@
+{
+  "name": "Tomcat Access Log",
+  "description": "Tomcat/Apache httpd access log (AccessLogValve common and combined): host - user [time] \"request\" status bytes, with the combined referer/user-agent tail captured as <extra>.",
+  "schema": {
+    "name": "Tomcat Access Log",
+    "description": "Tomcat/Apache httpd access log (AccessLogValve common and combined): host - user [time] \"request\" status bytes, with the combined referer/user-agent tail captured as <extra>.",
+    "format": "<remote_host> <ident> <remote_user> [<timestamp>] \"<request>\" <status> <bytes><extra?>",
+    "timestamp_field": "timestamp",
+    "timestamp_format": "%d/%b/%Y:%H:%M:%S %z",
+    "field_patterns": {
+      "remote_host": "\\S+",
+      "ident": "\\S+",
+      "remote_user": "\\S+",
+      "status": "\\d{3}",
+      "bytes": "[\\d-]+",
+      "extra": " .*",
+      "timestamp": "[^\\]]+"
+    },
+    "entry_start": "^\\S+ \\S+ \\S+ \\[",
+    "samples": [
+      {
+        "line": "10.0.0.7 - - [16/Jul/2026:10:00:01 +0000] \"GET /app/health HTTP/1.1\" 200 42"
+      },
+      {
+        "line": "10.0.0.7 - admin [16/Jul/2026:10:00:02 +0000] \"POST /app/api/report HTTP/1.1\" 500 - \"https://example.com/app\" \"Mozilla/5.0 (X11; Linux x86_64)\""
+      }
+    ]
+  }
+}

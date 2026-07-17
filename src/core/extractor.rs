@@ -507,8 +507,56 @@ pub fn generic_extractor() -> Extractor {
 }
 
 /// The schemas every project has, whether or not its `project.json` mentions them.
+///
+/// Only the two structural schemas live here: one is `detect`'s deterministic fallback, the
+/// other its catch-all. Schemas for ordinary third-party formats are *bundled* instead (see
+/// `bundled_schemas`), which keeps them out of `project.json` and lets a user file of the
+/// same name shadow them.
 pub fn builtin_extractors() -> Vec<Extractor> {
     vec![default_extractor(), generic_extractor()]
+}
+
+/// Schemas for common third-party log formats, compiled into the binary as the same JSON a
+/// user schema library holds. They join detection as the lowest-precedence library layer, so
+/// a file in `~/.log-scouter/schemas` with the same name wins and nothing here can silently
+/// change how an existing project parses.
+///
+/// A malformed entry here is a build-time mistake, not a user error: `bundled_schemas_tests`
+/// compiles every one, which also validates its samples.
+pub const BUNDLED_SCHEMA_FILES: &[(&str, &str)] = &[
+    (
+        "Spring-Boot",
+        include_str!("../../schemas/Spring-Boot.json"),
+    ),
+    (
+        "Spring-Boot-3",
+        include_str!("../../schemas/Spring-Boot-3.json"),
+    ),
+    (
+        "Tomcat-Catalina",
+        include_str!("../../schemas/Tomcat-Catalina.json"),
+    ),
+    (
+        "Tomcat-Access-Log",
+        include_str!("../../schemas/Tomcat-Access-Log.json"),
+    ),
+    (
+        "Log4j2-Default",
+        include_str!("../../schemas/Log4j2-Default.json"),
+    ),
+];
+
+/// Every bundled schema, compiled. A schema that fails to parse or compile is skipped rather
+/// than panicking: a broken bundle must not stop the app from opening a folder.
+pub fn bundled_schemas() -> Vec<Extractor> {
+    BUNDLED_SCHEMA_FILES
+        .iter()
+        .filter_map(|(_, body)| {
+            let mut schema = parse_schema_file(body).ok()?.schema;
+            schema.compile().ok()?;
+            Some(schema)
+        })
+        .collect()
 }
 
 /// A timestamp at the head of a line, read without help from a schema.

@@ -1,0 +1,33 @@
+{
+  "name": "Spring Boot 3",
+  "description": "Spring Boot 3.x default pattern: ISO-8601 timestamp with offset, right-padded level, pid, --- [thread] logger : message. The offset is captured as <zone> rather than read by timestamp_format, which cannot accept both 'Z' and '+08:00'. Stack traces fold into the line above.",
+  "schema": {
+    "name": "Spring Boot 3",
+    "description": "Spring Boot 3.x default pattern: ISO-8601 timestamp with offset, right-padded level, pid, --- [thread] logger : message. The offset is captured as <zone> rather than read by timestamp_format, which cannot accept both 'Z' and '+08:00'. Stack traces fold into the line above.",
+    "format": "<timestamp><zone> <levelpad><level> <pid> --- [<threadpad><thread>] <module><modulepad> : <message>",
+    "timestamp_field": "timestamp",
+    "timestamp_format": "%Y-%m-%dT%H:%M:%S%.3f",
+    "field_patterns": {
+      "zone": "(?:Z|[+-]\\d{2}:\\d{2})?",
+      "levelpad": " *",
+      "level": "[A-Z]+",
+      "pid": "\\d+",
+      "threadpad": " *",
+      "thread": "[^\\]]*",
+      "module": "\\S+",
+      "modulepad": " *",
+      "timestamp": "\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}"
+    },
+    "entry_start": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}",
+    "samples": [
+      {
+        "line": "2026-07-16T10:00:01.123+08:00  INFO 12345 --- [           main] c.e.demo.DemoApplication                 : Started DemoApplication in 3.42 seconds (JVM running for 4.1)",
+        "level": "INFO"
+      },
+      {
+        "line": "2026-07-16T10:00:02.500Z ERROR 12345 --- [nio-8080-exec-1] o.s.b.w.s.support.ErrorPageFilter        : Forwarding to error page from request",
+        "level": "ERROR"
+      }
+    ]
+  }
+}
