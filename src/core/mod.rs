@@ -5,4 +5,5 @@ pub mod library;
 pub mod models;
 pub mod parser;
 pub mod project;
+pub mod release;
 pub mod search;

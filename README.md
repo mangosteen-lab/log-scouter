@@ -147,7 +147,9 @@ logscout -f app.log -f errors.log
 A few side commands stand apart from opening logs:
 
 ```bash
-logscout version                                        # print the version
+logscout --version                                      # version, and whether one is newer
+logscout upgrade                                        # replace this binary with the latest
+logscout uninstall                                      # remove it again
 logscout config set --provider anthropic --api-key ...  # set up the AI assistant once
 logscout config list                                    # show the current AI settings
 logscout hub list                                       # the shared libraries you have
@@ -167,7 +169,22 @@ logscout reads the pipe on stdin and takes keystrokes from the terminal (`/dev/t
 stream is spooled while you browse, but a stdin source is transient — it is not saved to the
 project, since a closed pipe cannot be reopened. `-i` also works alongside a folder argument.
 
-Upgrade or uninstall with the matching scripts:
+Once installed, `logscout` upgrades and removes itself — no script needed:
+
+```bash
+logscout upgrade                  # replace this binary with the latest release
+logscout upgrade --check          # is there a newer one? change nothing
+logscout upgrade --version 0.0.15 # install an exact release (downgrades allowed)
+logscout uninstall                # remove the binary; asks first
+logscout uninstall --purge -y     # also remove ~/.log-scouter, no prompt
+```
+
+`upgrade` replaces **the binary you ran** (`current_exe`), wherever it lives, so it cannot
+leave you on a stale copy by installing somewhere else. `uninstall` keeps
+`~/.log-scouter` — your schemas, filters, saved searches and hubs — unless you pass
+`--purge`; a project's own `.logscouter` folder is never touched either way.
+
+The install scripts are still there for the first install, and for anyone who prefers them:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/upgrade.sh | bash
@@ -180,6 +197,31 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/install.ps1 | iex
 irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/upgrade.ps1 | iex
 irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/uninstall.ps1 | iex
+```
+
+### Knowing when a release is out
+
+`logscout --version` says so:
+
+```text
+$ logscout --version
+logscout 0.0.16
+
+A new release of logscout is available: 0.0.16 -> 0.0.17
+https://github.com/mangosteen-lab/log-scouter/releases/tag/v0.0.17
+Run `logscout upgrade` to update.
+```
+
+The lookup is cached in `~/.log-scouter/update.json` and refreshed **at most once a day**, so
+only the first `--version` each day touches the network — a script calling it in a loop pays
+nothing and cannot be rate-limited into failing. Failures are silent: no network, no home
+directory, GitHub down, all mean you get the plain version and exit 0. A version banner is
+never worth an error.
+
+To turn the check off entirely:
+
+```bash
+LOGSCOUT_NO_UPDATE_CHECK=1 logscout --version   # per run, or export it
 ```
 
 Proxy users can pass the proxy to the outer `curl` and to the installer downloads:
@@ -281,6 +323,7 @@ src/
     search.rs      the query language: compile a string to a Query, then match entries
     hub.rs         remote shared libraries: hubs.json, tarball sync, namespaced loading
     library.rs     Origin (project/user/hub/bundled) and the tagged items pickers show
+    release.rs     the update check (cached daily), self-upgrade, and uninstall
     project.rs     the Project: sources, formats, filters, searches, session; JSON persist
   tui/           Ratatui application — one big AppState in mod.rs
   ai/            the AI assistant (see below)

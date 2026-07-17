@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use log_scouter::ai::{config::AiConfig, Provider};
 use log_scouter::core::hub::{self, HubConfig};
 use log_scouter::core::project::Project;
+use log_scouter::core::release::{self, CURRENT_VERSION};
+use std::io;
 use std::path::PathBuf;
 
 /// Where the LLM config lives, for messages.
@@ -13,9 +15,15 @@ const AI_CONFIG_PATH: &str = "~/.log-scouter/ai.json";
     name = "logscout",
     version,
     about = "A keyboard-driven Rust TUI for browsing large server logs.",
-    args_conflicts_with_subcommands = true
+    args_conflicts_with_subcommands = true,
+    // Clap's own `--version` prints and exits inside `parse`, which leaves nowhere to add
+    // the "a new release is available" notice. Handle the flag ourselves instead.
+    disable_version_flag = true
 )]
 struct Cli {
+    /// Print the version, and whether a newer release is available.
+    #[arg(short = 'V', long = "version", action = clap::ArgAction::SetTrue)]
+    version: bool,
     /// Folder to open. When provided without explicit files, every direct text file in
     /// the folder is added as a log source. With no folder, Log Scouter starts empty.
     #[arg()]
@@ -48,8 +56,28 @@ enum Command {
         #[command(subcommand)]
         action: Option<HubCommand>,
     },
-    /// Print the logscout version.
+    /// Print the version, and whether a newer release is available.
     Version,
+    /// Replace this binary with the latest release.
+    Upgrade {
+        /// Install this exact version instead of the latest, e.g. `--version 0.0.15` to go
+        /// back to one. Downgrades are allowed: an explicit version is an instruction.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+        /// Report what an upgrade would do, and change nothing.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Remove this binary from the machine.
+    Uninstall {
+        /// Also remove ~/.log-scouter: your schemas, filters, saved searches and hubs.
+        /// Project-local .logscouter folders are never touched.
+        #[arg(long)]
+        purge: bool,
+        /// Uninstall without the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -102,15 +130,104 @@ enum ConfigAction {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.version {
+        print_version();
+        return Ok(());
+    }
     match cli.command {
         Some(Command::Version) => {
-            println!("logscout {}", env!("CARGO_PKG_VERSION"));
+            print_version();
             Ok(())
         }
         Some(Command::Config { action }) => run_config(action.unwrap_or(ConfigAction::List)),
         Some(Command::Hub { action }) => run_hub(action.unwrap_or(HubCommand::List)),
+        Some(Command::Upgrade { version, check }) => run_upgrade(version.as_deref(), check),
+        Some(Command::Uninstall { purge, yes }) => run_uninstall(purge, yes),
         None => run_tui(cli.folder, cli.files, cli.file, cli.stdin),
     }
+}
+
+/// The version, plus a notice when a newer release exists.
+///
+/// The notice goes to stdout under the version, where `gh` and friends put theirs. The
+/// lookup is cached for a day and silent on failure, so `logscout --version` in a script
+/// stays fast and never fails because GitHub is unreachable.
+fn print_version() {
+    println!("logscout {CURRENT_VERSION}");
+    if let Some(notice) = release::update_notice(CURRENT_VERSION) {
+        println!("{notice}");
+    }
+}
+
+fn run_upgrade(version: Option<&str>, check: bool) -> anyhow::Result<()> {
+    if check {
+        return match release::available_update(CURRENT_VERSION) {
+            Some(latest) => {
+                println!("logscout {CURRENT_VERSION} -> {latest} available.");
+                println!("Run `logscout upgrade` to install it.");
+                Ok(())
+            }
+            None => {
+                println!("logscout {CURRENT_VERSION} is the latest release.");
+                Ok(())
+            }
+        };
+    }
+
+    // Progress on stderr: the useful line for a script is the outcome, not the play-by-play.
+    let mut progress = |step: &str| eprintln!("  {step}");
+    match release::upgrade(CURRENT_VERSION, version, &mut progress).map_err(anyhow::Error::msg)? {
+        release::Upgraded::AlreadyCurrent(version) => {
+            println!("logscout {version} is already the latest release.");
+        }
+        release::Upgraded::Replaced { path, version } => {
+            println!("Upgraded to logscout {version} at {}.", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_uninstall(purge: bool, yes: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("could not find the running binary")?;
+    if !yes {
+        // Removing a binary is not undoable, and `--purge` takes hand-written schemas with
+        // it. Say exactly what is about to go, and make confirming deliberate.
+        println!("This will remove {}.", exe.display());
+        match (purge, release::user_library_dir()) {
+            (true, Some(dir)) => println!(
+                "It will also remove {} — your schemas, filters, saved searches and hubs.",
+                dir.display()
+            ),
+            (false, Some(dir)) => println!(
+                "{} is kept (schemas, filters, hubs). Pass --purge to remove it too.",
+                dir.display()
+            ),
+            _ => {}
+        }
+        print!("Continue? [y/N] ");
+        io::Write::flush(&mut io::stdout()).ok();
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .context("could not read the answer")?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Left everything as it is.");
+            return Ok(());
+        }
+    }
+
+    let removed = release::uninstall(purge).map_err(anyhow::Error::msg)?;
+    if let Some(path) = removed.binary {
+        println!("Removed {}.", path.display());
+    }
+    match (removed.library, release::user_library_dir()) {
+        (Some(dir), _) => println!("Removed {}.", dir.display()),
+        (None, Some(dir)) if !purge && dir.is_dir() => {
+            println!("Kept {} — remove it with `--purge`.", dir.display());
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The `hub` subcommands. Everything here is the same core the TUI's Hubs prompt drives, so
