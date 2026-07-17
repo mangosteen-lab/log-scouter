@@ -19169,6 +19169,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_lines(tmp.path(), 5);
         app.focus = Focus::Sidebar;
+        // The pickers only open when the library has something in them, so give the project
+        // its own. Leaning on `~/.log-scouter` instead would pass on a machine that happens
+        // to have filters and fail on a clean one.
+        seed_project_library(tmp.path());
 
         app.sidebar_selected = sidebar_row(&app, "file");
         press(&mut app, KeyCode::Char('X'));
@@ -20533,6 +20537,29 @@ mod tests {
         );
     }
 
+    /// Put one filter and one saved search in the project's own library folders.
+    ///
+    /// A picker with nothing to show does not open, so any test that expects one has to
+    /// supply the contents itself. Reading them off the machine's `~/.log-scouter` would
+    /// make the test pass or fail depending on whose machine it runs on — which is exactly
+    /// how a green local run turned into a red CI one.
+    fn seed_project_library(root: &Path) {
+        let config = root.join(CONFIG_DIR);
+        std::fs::create_dir_all(config.join("filters")).unwrap();
+        std::fs::write(
+            config.join("filters/trace.json"),
+            r#"{"name":"Hide TRACE","description":"",
+                "filter":{"field":"level","op":"equals","value":"Trace","action":"exclude"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(config.join("searches")).unwrap();
+        std::fs::write(
+            config.join("searches/errors.json"),
+            r#"{"name":"Errors","description":"all errors","query":"level=Error"}"#,
+        )
+        .unwrap();
+    }
+
     /// Every sidebar row's text, for asserting on what the user sees.
     fn line_texts_of_sidebar(app: &AppState) -> Vec<String> {
         app.sidebar_items()
@@ -20565,22 +20592,7 @@ mod tests {
             "no saved searches: the heading and its hint are the only rows"
         );
 
-        // Seed the project's own library folders, so the pickers have something to show
-        // whatever the machine's `~/.log-scouter` happens to hold.
-        let config = tmp.path().join(CONFIG_DIR);
-        std::fs::create_dir_all(config.join("searches")).unwrap();
-        std::fs::write(
-            config.join("searches/errors.json"),
-            r#"{"name":"Errors","description":"all errors","query":"level=Error"}"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(config.join("filters")).unwrap();
-        std::fs::write(
-            config.join("filters/trace.json"),
-            r#"{"name":"Hide TRACE","description":"",
-                "filter":{"field":"level","op":"equals","value":"Trace","action":"exclude"}}"#,
-        )
-        .unwrap();
+        seed_project_library(tmp.path());
 
         // Both the `Saved Searches` heading and the `none` hint under it.
         let heading = app
