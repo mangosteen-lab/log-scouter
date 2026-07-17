@@ -9,6 +9,7 @@ use log_scouter::core::filters::{
     load_filters_from_folder, message_template, pattern_candidates, user_filter_dir, FilterFile,
     FilterRule, FilterSet,
 };
+use log_scouter::core::library::{LibraryItem, Origin};
 use log_scouter::core::models::{
     merge_files, LiveSourceConfig, LiveSourceKind, LogFileModel, ViewModel, VisibleIndices,
 };
@@ -1015,7 +1016,9 @@ fn a_library_schema_name_resolves_as_a_known_schema() {
     let tmp = tempfile::tempdir().unwrap();
     let mut project = Project::load(tmp.path());
     project.library.clear();
-    project.library.push(nginx_schema());
+    project
+        .library
+        .push(LibraryItem::new(nginx_schema(), Origin::User));
 
     assert!(!project.extractors.contains_key("Nginx"));
     assert!(project.has_extractor("Nginx"));
@@ -2732,6 +2735,7 @@ fn a_user_schema_shadows_a_bundled_one_of_the_same_name() {
     let found: Vec<&Extractor> = project
         .library
         .iter()
+        .map(|entry| &entry.item)
         .filter(|schema| schema.name == "Spring Boot")
         .collect();
     assert_eq!(

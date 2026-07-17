@@ -9,9 +9,14 @@ use crate::core::extractor::{
 use crate::core::filters::{
     common_message_pattern, expand_tilde, export_filters_to_folder, hide_like, home_dir,
     json_file_paths, load_filters_from_folder, message_template, pattern_candidates,
-    sanitize_file_component, user_filter_dir, FilterRule, FilterSet, PatternOption, USER_DIR,
-    USER_FILTERS_SUBDIR,
+    sanitize_file_component, save_filter_file, user_filter_dir, FilterFile, FilterRule, FilterSet,
+    PatternOption, USER_DIR, USER_FILTERS_SUBDIR,
 };
+use crate::core::hub::{
+    add_and_sync, auto_sync_disabled_by_env, describe_hub, hub_cache_dir, remove_hub_cache,
+    spawn_sync, sync_named, HubConfig, SyncOutcome, NO_AUTO_SYNC_VAR,
+};
+use crate::core::library::{LibraryItem, Origin};
 use crate::core::models::{
     apply_context, merge_files, LiveSourceConfig, LiveSourceKind, LogEntry, LogFileModel,
     ViewModel, VisibleIndices,
@@ -20,8 +25,8 @@ use crate::core::parser::{self, EntryBuilder};
 use crate::core::project::{Bookmark, PaneSession, Project, Session, CONFIG_DIR};
 use crate::core::search::{
     compile_query, export_searches_to_folder, install_default_search_library,
-    load_searches_from_folder, parse_datetime, user_search_dir, Predicate, Query,
-    USER_SEARCHES_SUBDIR,
+    load_searches_from_folder, parse_datetime, save_search_file, user_search_dir, Predicate, Query,
+    SearchFile, USER_SEARCHES_SUBDIR,
 };
 use chrono::{Duration as ChronoDuration, NaiveDateTime};
 use crossterm::event::{
@@ -50,6 +55,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 const CONTEXT_CYCLE: &[usize] = &[0, 3, 10];
 const DETAIL_LABEL_WIDTH: usize = 14;
+/// Shortest useful results panel: a border, a row, a border.
+const MIN_RESULTS_HEIGHT: u16 = 3;
+/// Two borders, a hint, a blank and the input row.
+const MIN_POPUP_HEIGHT: u16 = 5;
+/// How tall the results panel opens by default, before the user drags it.
+const DEFAULT_RESULTS_HEIGHT_MAX: u16 = 8;
+/// What the results panel cannot have: the header, the status bar, and a row of pane.
+const RESULTS_RESERVED_ROWS: u16 = 6;
 const USER_BOOKMARKS_SUBDIR: &str = "bookmarks";
 const SCHEMA_INFER_SAMPLE_LINES: usize = 100;
 /// Minimum non-empty lines a live/stdin source must capture before its one-shot schema
@@ -167,6 +180,90 @@ impl UiConfig {
 
 fn ui_config_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(USER_DIR).join("ui.json"))
+}
+
+/// What the hub prompt was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HubAction {
+    List,
+    Add { repo: String, name: Option<String> },
+    Sync { name: Option<String> },
+    Remove { name: String },
+    SetEnabled { name: String, enabled: bool },
+    SetAutoSync { enabled: bool },
+}
+
+/// Parse the hub prompt. An empty line lists, which makes the popup's default action the
+/// harmless one.
+fn parse_hub_command(input: &str) -> Result<HubAction, String> {
+    let words: Vec<&str> = input.split_whitespace().collect();
+    let (verb, rest) = match words.as_slice() {
+        [] => return Ok(HubAction::List),
+        [verb, rest @ ..] => (verb.to_lowercase(), rest),
+    };
+
+    let one_name = |what: &str| match rest {
+        [name] => Ok((*name).to_string()),
+        _ => Err(format!("usage: {what} <name>")),
+    };
+
+    match verb.as_str() {
+        "list" | "ls" => Ok(HubAction::List),
+        "add" => match rest {
+            [] => Err("usage: add <owner/repo> [as <name>]".to_string()),
+            [repo] => Ok(HubAction::Add {
+                repo: (*repo).to_string(),
+                name: None,
+            }),
+            [repo, "as", name] => Ok(HubAction::Add {
+                repo: (*repo).to_string(),
+                name: Some((*name).to_string()),
+            }),
+            _ => Err("usage: add <owner/repo> [as <name>]".to_string()),
+        },
+        "sync" | "update" => match rest {
+            [] => Ok(HubAction::Sync { name: None }),
+            [name] => Ok(HubAction::Sync {
+                name: Some((*name).to_string()),
+            }),
+            _ => Err("usage: sync [<name>]".to_string()),
+        },
+        "auto-sync" | "auto_sync" | "autosync" => match rest {
+            ["on"] => Ok(HubAction::SetAutoSync { enabled: true }),
+            ["off"] => Ok(HubAction::SetAutoSync { enabled: false }),
+            _ => Err("usage: auto-sync on|off".to_string()),
+        },
+        "remove" | "rm" => Ok(HubAction::Remove {
+            name: one_name("remove")?,
+        }),
+        "enable" => Ok(HubAction::SetEnabled {
+            name: one_name("enable")?,
+            enabled: true,
+        }),
+        "disable" => Ok(HubAction::SetEnabled {
+            name: one_name("disable")?,
+            enabled: false,
+        }),
+        other => Err(format!(
+            "unknown hub command '{other}' — try add / sync / remove / enable / disable / list"
+        )),
+    }
+}
+
+/// Every hub on one line, for the status bar.
+fn describe_hubs(config: &HubConfig) -> String {
+    if config.hubs.is_empty() {
+        return "no hubs configured — try: add acme/log-scouter-hub".to_string();
+    }
+    let entries: Vec<String> = config.hubs.iter().map(describe_hub).collect();
+    format!("hubs: {}", entries.join(" · "))
+}
+
+/// `hub:<name>` in a folder prompt means that hub's cached `<subdir>` — so importing a
+/// hub's filters is the same command as importing anyone else's folder of filters.
+fn hub_folder_from_input(input: &str, subdir: &str) -> Option<PathBuf> {
+    let name = input.trim().strip_prefix("hub:")?.trim();
+    hub_cache_dir(name).map(|dir| dir.join(subdir))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1220,7 +1317,20 @@ impl LiveSourceEditor {
 #[derive(Debug, Clone)]
 struct SchemaLibraryPicker {
     target: SchemaPickerTarget,
-    options: Vec<Extractor>,
+    options: Vec<LibraryItem<Extractor>>,
+    selected: usize,
+}
+
+/// Pick a filter or a saved search out of the library, the same way `L` picks a schema.
+#[derive(Debug, Clone)]
+struct FilterLibraryPicker {
+    options: Vec<LibraryItem<FilterFile>>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SearchLibraryPicker {
+    options: Vec<LibraryItem<SearchFile>>,
     selected: usize,
 }
 
@@ -1266,6 +1376,8 @@ enum Mode {
     ImportBookmarks(String),
     ExportSchemas(String),
     ImportSchemas(String),
+    /// The hub console: one prompt taking `add`/`sync`/`remove`/`enable`/`disable`/`list`.
+    Hubs(String),
     ExportIncident(String),
     Extractor(String),
     SaveSourceSchema {
@@ -1275,6 +1387,8 @@ enum Mode {
     SourceEditor(SourceEditor),
     LiveSourceEditor(LiveSourceEditor),
     SchemaLibraryPicker(SchemaLibraryPicker),
+    FilterLibraryPicker(FilterLibraryPicker),
+    SearchLibraryPicker(SearchLibraryPicker),
     LiveQuickPick(LiveQuickPick),
     LiveSchemaEditor {
         editor: LiveSourceEditor,
@@ -1336,6 +1450,7 @@ enum Command {
     ExportSearches,
     ImportSchemas,
     ExportSchemas,
+    Hubs,
     ExportIncident,
     AskAi,
     Copy,
@@ -1385,6 +1500,7 @@ impl Command {
             Command::ExportSearches => "Export saved-search library",
             Command::ImportSchemas => "Import schema library",
             Command::ExportSchemas => "Export schema library",
+            Command::Hubs => "Hubs (add / sync / remove a shared library)",
             Command::ExportIncident => "Export incident Markdown",
             Command::AskAi => "Ask AI to help",
             Command::Copy => "Copy selection",
@@ -1434,6 +1550,7 @@ impl Command {
             Command::ExportSearches => "X",
             Command::ImportSchemas => "",
             Command::ExportSchemas => "",
+            Command::Hubs => "",
             Command::ExportIncident => "E",
             Command::AskAi => "A",
             Command::Copy => "y",
@@ -2116,6 +2233,7 @@ pub fn run(project: Project) -> anyhow::Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let mut app = AppState::new(project);
     app.queue_initial_loads();
+    app.start_hub_sync();
 
     loop {
         // A reply from the AI worker may have arrived; run any tools it asked for. Wrap it
@@ -2131,6 +2249,8 @@ pub fn run(project: Project) -> anyhow::Result<()> {
         app.drain_schema_events();
         app.drain_live_events();
         app.drain_live_pick_events();
+        // A start-up hub refresh may have landed; pick up any new schemas.
+        app.drain_hub_events();
         app.check_source_modifications();
 
         // Long work runs in slices between frames, so the progress bar animates and
@@ -2281,6 +2401,8 @@ struct AppState {
     dirty_sources: HashSet<String>,
     last_source_check: Instant,
     live_pick_rx: Option<Receiver<LivePickResult>>,
+    /// A start-up hub refresh in flight. `None` once every outcome has been drained.
+    hub_sync_rx: Option<Receiver<SyncOutcome>>,
     /// Char index of the edit caret within the active input popup.
     input_cursor: usize,
     /// Panes of the restored session that want a merge. A merge interleaves entries by
@@ -2353,6 +2475,7 @@ impl AppState {
             dirty_sources: HashSet::new(),
             last_source_check: Instant::now(),
             live_pick_rx: None,
+            hub_sync_rx: None,
             input_cursor: 0,
             pending_merges: Vec::new(),
             ai: None,
@@ -2626,6 +2749,85 @@ impl AppState {
 
     fn live_active(&self) -> bool {
         !self.live_sources.is_empty()
+    }
+
+    /// Configure the official hub on first run, then refresh anything stale in the
+    /// background.
+    ///
+    /// Everything here is best-effort and silent. A start must not be slower, noisier, or
+    /// more fragile because a shared library exists: no home directory, no network, an
+    /// unwritable `hubs.json`, a hub that 404s — each leaves the app exactly as it would
+    /// have been, using whatever is already cached.
+    fn start_hub_sync(&mut self) {
+        let Ok(mut config) = HubConfig::load() else {
+            return;
+        };
+        // Seeding is a local write, so it happens even when the environment forbids the
+        // network: the official hub shows up configured, ready for a manual `sync`.
+        if config.ensure_official() && config.save().is_err() {
+            // The seed did not persist, so do not sync against it: next start tries again.
+            return;
+        }
+        if auto_sync_disabled_by_env() {
+            return;
+        }
+        let due = config.due_for_auto_sync(chrono::Local::now());
+        if due.is_empty() {
+            return;
+        }
+        self.hub_sync_rx = Some(spawn_sync(due));
+    }
+
+    /// Take any finished background sync. Called every loop, so a refresh that lands while
+    /// the user is reading shows up without them doing anything.
+    fn drain_hub_events(&mut self) {
+        let Some(rx) = &self.hub_sync_rx else {
+            return;
+        };
+        let mut synced = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(outcome) => synced.push(outcome),
+                // The worker is one-shot: disconnected means it finished.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.hub_sync_rx = None;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        if synced.is_empty() {
+            return;
+        }
+
+        // Record `last_synced` against the config as it stands now, rather than the copy the
+        // worker was handed: the user may have edited hubs while the fetch was in flight.
+        let Ok(mut config) = HubConfig::load() else {
+            return;
+        };
+        let mut refreshed = 0;
+        for outcome in synced {
+            let Ok(report) = outcome.result else {
+                // A background refresh that fails is not worth interrupting anyone over: the
+                // cache still works, and `sync` from the Hubs palette reports properly.
+                continue;
+            };
+            if let Some(hub) = config.get_mut(&outcome.hub.name) {
+                hub.last_synced = outcome.hub.last_synced;
+                refreshed += report.total();
+            }
+        }
+        let _ = config.save();
+        if refreshed == 0 {
+            return;
+        }
+
+        // New schemas may now be available, so rebuild the library. Sources already parsed
+        // keep their schema: this adds to what detection can choose, it does not re-parse.
+        self.project.load_schema_libraries();
+        if self.status.is_empty() {
+            self.status = format!("hub sync: {refreshed} item(s) updated");
+        }
     }
 
     fn drain_live_pick_events(&mut self) {
@@ -3516,14 +3718,28 @@ impl AppState {
         let root = frame.area();
         let focus = self.workspace.focus_mode;
         // Focus mode hides the results panel too; otherwise it shows when a search is running
-        // and the user has not toggled it off.
-        let show_results = self.search_results_visible() && self.workspace.show_results && !focus;
+        // and the user has not toggled it off -- and only if the terminal has the rows to
+        // spare. A window too short for the panel simply does not get one; the search still
+        // runs and its matches are still highlighted in the pane.
+        let results_room = root.height.saturating_sub(RESULTS_RESERVED_ROWS);
+        let show_results = self.search_results_visible()
+            && self.workspace.show_results
+            && !focus
+            && results_room >= MIN_RESULTS_HEIGHT;
         self.panel_separators.clear();
+        // `max(MIN_RESULTS_HEIGHT)` keeps the clamp range non-empty on a short window, where
+        // `results_room` is smaller than the minimum. The height is unused in that case --
+        // `show_results` is already false -- but the clamp is evaluated either way, and an
+        // inverted range is a panic, not a clamp.
         let result_height = self
             .workspace
             .results_height
-            .unwrap_or_else(|| root.height.saturating_sub(4).clamp(3, 8))
-            .clamp(3, root.height.saturating_sub(6));
+            .unwrap_or_else(|| {
+                root.height
+                    .saturating_sub(4)
+                    .clamp(MIN_RESULTS_HEIGHT, DEFAULT_RESULTS_HEIGHT_MAX)
+            })
+            .clamp(MIN_RESULTS_HEIGHT, results_room.max(MIN_RESULTS_HEIGHT));
         let constraints = if show_results {
             vec![
                 Constraint::Length(1),
@@ -4260,10 +4476,10 @@ impl AppState {
         let items = self.sidebar_items();
         let item = items.get(self.sidebar_selected)?;
         match item {
-            SidebarItem::File { file_id, .. } => self
-                .project
-                .get_file(file_id)
-                .map(|file| file_detail_lines(file, width)),
+            SidebarItem::File { file_id, .. } => self.project.get_file(file_id).map(|file| {
+                let origin = self.project.schema_origin(&file.extractor_name);
+                file_detail_lines(file, origin.as_ref(), width)
+            }),
             SidebarItem::Filter { index, .. } => self
                 .project
                 .filters
@@ -4703,6 +4919,11 @@ impl AppState {
                 "Folder of exported filter JSON files to merge into this project",
                 &text,
             ),
+            Mode::Hubs(text) => {
+                let hint = self.hub_prompt_hint();
+                let hint: Vec<&str> = hint.iter().map(String::as_str).collect();
+                self.draw_input_popup_lines(frame, root, "Hubs", &hint, &text)
+            }
             Mode::ExportSearches(text) => self.draw_input_popup(
                 frame,
                 root,
@@ -4779,6 +5000,12 @@ impl AppState {
             }
             Mode::SchemaLibraryPicker(picker) => {
                 self.draw_schema_library_picker(frame, root, &picker)
+            }
+            Mode::FilterLibraryPicker(picker) => {
+                self.draw_filter_library_picker(frame, root, &picker)
+            }
+            Mode::SearchLibraryPicker(picker) => {
+                self.draw_search_library_picker(frame, root, &picker)
             }
             Mode::LiveQuickPick(picker) => self.draw_live_quick_pick(frame, root, &picker),
             Mode::EditFilter { text, .. } => self.draw_input_popup(
@@ -5026,14 +5253,17 @@ impl AppState {
             ("Description".to_string(), editor.description.clone()),
             ("Tag".to_string(), editor.tag.clone()),
         ];
-        // One row per schema, numbered by priority; only the first carries the "Schemas" label.
+        // One row per schema, numbered by priority; only the first carries the "Schemas"
+        // label. Each is tagged with the tier it resolves from, so it is clear whether this
+        // source is parsed by your `Spring Boot` or a hub's.
         for (index, name) in editor.schemas.iter().enumerate() {
             let label = if index == 0 {
                 "Schemas".to_string()
             } else {
                 String::new()
             };
-            rows.push((label, format!("{}. {name}", index + 1)));
+            let origin = tag_prefix(self.project.schema_origin(name).as_ref());
+            rows.push((label, format!("{}. {origin}{name}", index + 1)));
         }
 
         let mut lines = Vec::new();
@@ -5191,16 +5421,23 @@ impl AppState {
         let text_width = inner.width as usize;
         let start = picker.selected.saturating_sub(visible.saturating_sub(1));
 
+        let origin_width = library_origin_width(picker.options.iter().map(|entry| &entry.origin));
         let mut lines = Vec::new();
-        for (index, schema) in picker.options.iter().enumerate().skip(start).take(visible) {
+        for (index, entry) in picker.options.iter().enumerate().skip(start).take(visible) {
             let selected = index == picker.selected;
             let marker = if selected { "> " } else { "  " };
+            let schema = &entry.item;
             let desc = if schema.description.trim().is_empty() {
                 schema.format.as_str()
             } else {
                 schema.description.as_str()
             };
-            let row = format!("{marker}{:<24} {}", schema.name, desc);
+            let row = format!(
+                "{marker}{:<origin_width$} {:<24} {}",
+                entry.origin.label(),
+                schema.name,
+                desc
+            );
             lines.push(Line::from(Span::styled(
                 crop(&row, 0, text_width),
                 if selected {
@@ -5212,7 +5449,117 @@ impl AppState {
         }
         if picker.options.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  no schemas in ~/.log-scouter/schemas",
+                "  the library is empty",
+                theme.dim(),
+            )));
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    }
+
+    /// The filter and saved-search library pickers. Same shape as the schema picker: an
+    /// origin tag, a name, and what the thing actually does.
+    fn draw_filter_library_picker(
+        &self,
+        frame: &mut Frame,
+        root: Rect,
+        picker: &FilterLibraryPicker,
+    ) {
+        let rows: Vec<(String, String, &Origin)> = picker
+            .options
+            .iter()
+            .map(|entry| {
+                let description = if entry.item.description.trim().is_empty() {
+                    entry.item.filter.describe()
+                } else {
+                    entry.item.description.clone()
+                };
+                (entry.item.name.clone(), description, &entry.origin)
+            })
+            .collect();
+        self.draw_library_picker(
+            frame,
+            root,
+            "Filter Library  Enter add  Esc cancel",
+            &rows,
+            picker.selected,
+        );
+    }
+
+    fn draw_search_library_picker(
+        &self,
+        frame: &mut Frame,
+        root: Rect,
+        picker: &SearchLibraryPicker,
+    ) {
+        let rows: Vec<(String, String, &Origin)> = picker
+            .options
+            .iter()
+            .map(|entry| {
+                let description = if entry.item.description.trim().is_empty() {
+                    entry.item.query.clone()
+                } else {
+                    format!("{}  —  {}", entry.item.description, entry.item.query)
+                };
+                (entry.item.name.clone(), description, &entry.origin)
+            })
+            .collect();
+        self.draw_library_picker(
+            frame,
+            root,
+            "Saved Search Library  Enter add  Esc cancel",
+            &rows,
+            picker.selected,
+        );
+    }
+
+    /// One list of `[origin] name  description`, scrolled to keep `selected` on screen.
+    fn draw_library_picker(
+        &self,
+        frame: &mut Frame,
+        root: Rect,
+        title: &str,
+        rows: &[(String, String, &Origin)],
+        selected: usize,
+    ) {
+        let theme = self.theme();
+        let width = root.width.saturating_sub(4).min(96).max(root.width.min(64));
+        let visible = 10usize;
+        let height = ((rows.len().min(visible) + 3) as u16).min(root.height.max(7));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title(title.to_string())
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent()));
+        let inner = block.inner(area);
+        let text_width = inner.width as usize;
+        let start = selected.saturating_sub(visible.saturating_sub(1));
+        let origin_width = library_origin_width(rows.iter().map(|(_, _, origin)| *origin));
+
+        let mut lines = Vec::new();
+        for (index, (name, description, origin)) in
+            rows.iter().enumerate().skip(start).take(visible)
+        {
+            let is_selected = index == selected;
+            let marker = if is_selected { "> " } else { "  " };
+            let row = format!(
+                "{marker}{:<origin_width$} {:<28} {}",
+                origin.label(),
+                name,
+                description
+            );
+            lines.push(Line::from(Span::styled(
+                crop(&row, 0, text_width),
+                if is_selected {
+                    theme.selected()
+                } else {
+                    Style::default()
+                },
+            )));
+        }
+        if rows.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  the library is empty",
                 theme.dim(),
             )));
         }
@@ -5555,17 +5902,51 @@ impl AppState {
         hint: &str,
         value: &str,
     ) {
+        self.draw_input_popup_lines(frame, root, title, std::slice::from_ref(&hint), value)
+    }
+
+    /// An input popup whose hint runs to several lines.
+    ///
+    /// Every hint line is wrapped to the popup's width rather than clipped: a hint that
+    /// runs off the right edge is not a cosmetic problem, it is information the user
+    /// cannot read — which is exactly how the hub list managed to be invisible.
+    fn draw_input_popup_lines(
+        &self,
+        frame: &mut Frame,
+        root: Rect,
+        title: &str,
+        hint: &[&str],
+        value: &str,
+    ) {
         let width = 82.min(root.width);
-        let value_width = (width as usize).saturating_sub(4).max(1);
-        let wrapped = chunk_chars(value, value_width);
-        let height = (wrapped.len() as u16 + 5).min(root.height.max(5));
+        let text_width = (width as usize).saturating_sub(4).max(1);
+        let hint: Vec<String> = hint
+            .iter()
+            .flat_map(|line| {
+                // An empty hint line is a deliberate blank, which `wrap_words` drops.
+                if line.is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrap_words(line, text_width)
+                }
+            })
+            .collect();
+        let wrapped = chunk_chars(value, text_width);
+        let height =
+            ((wrapped.len() + hint.len() + 4) as u16).min(root.height.max(MIN_POPUP_HEIGHT));
         let area = centered_rect(width, height, root);
         frame.render_widget(Clear, area);
 
-        let mut lines = vec![
-            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
-            Line::from(""),
-        ];
+        let mut lines: Vec<Line> = hint
+            .iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ))
+            })
+            .collect();
+        lines.push(Line::from(""));
         for (index, chunk) in wrapped.iter().enumerate() {
             let prefix = if index == 0 { "> " } else { "  " };
             lines.push(Line::from(Span::raw(format!("{prefix}{chunk}"))));
@@ -5580,11 +5961,12 @@ impl AppState {
             area,
         );
 
-        // Put a real terminal caret where the next character lands.
+        // Put a real terminal caret where the next character lands: past the hint and the
+        // blank line under it.
         let caret = self.input_cursor.min(value.chars().count());
-        let (row, column) = (caret / value_width, caret % value_width);
+        let (row, column) = (caret / text_width, caret % text_width);
         let x = inner.x + 2 + column as u16;
-        let y = inner.y + 2 + row as u16;
+        let y = inner.y + hint.len() as u16 + 1 + row as u16;
         if x < inner.right() && y < inner.bottom() {
             frame.set_cursor_position((x, y));
         }
@@ -5797,6 +6179,7 @@ impl AppState {
             | Mode::ImportSearches(_)
             | Mode::ExportBookmarks(_)
             | Mode::ImportBookmarks(_)
+            | Mode::Hubs(_)
             | Mode::ExportSchemas(_)
             | Mode::ImportSchemas(_)
             | Mode::ExportIncident(_)
@@ -5820,6 +6203,8 @@ impl AppState {
             Mode::SchemaLibraryPicker(_) => 12,
             Mode::LiveSourceEditor(_) => 13,
             Mode::LiveQuickPick(_) => 14,
+            Mode::FilterLibraryPicker(_) => 15,
+            Mode::SearchLibraryPicker(_) => 16,
         };
 
         match mode_kind {
@@ -5841,6 +6226,8 @@ impl AppState {
             12 => self.handle_schema_library_picker_key(key),
             13 => self.handle_live_source_editor_key(key),
             14 => self.handle_live_quick_pick_key(key),
+            15 => self.handle_filter_library_picker_key(key),
+            16 => self.handle_search_library_picker_key(key),
             _ => Ok(false),
         }
     }
@@ -6294,35 +6681,115 @@ impl AppState {
             .flatten()
     }
 
+    /// `L` on a sidebar row: pick one item out of the library, whatever kind of row it is.
+    ///
+    /// Schemas, filters and searches all work the same way now -- a list of what every tier
+    /// offers, tagged with where it came from. The palette's `Import ... pack` commands are
+    /// still there for the bulk, folder-at-a-time route.
     fn open_library_load(&mut self) {
         match self.selected_sidebar_item() {
             Some(SidebarItem::File { file_id, .. }) => self.open_schema_library_picker(file_id),
-            Some(SidebarItem::Search { .. }) => {
-                self.open_input(Mode::ImportSearches(self.default_search_folder_input()))
-            }
+            Some(SidebarItem::Search { .. }) => self.open_search_library_picker(),
             Some(SidebarItem::Bookmark { .. }) => {
                 self.open_input(Mode::ImportBookmarks(self.default_bookmark_folder_input()))
             }
-            Some(SidebarItem::Filter { .. } | SidebarItem::TimeFilter { .. }) | None => {
-                self.open_input(Mode::LoadFilters(self.default_filter_folder_input()))
-            }
-            _ => self.open_input(Mode::LoadFilters(self.default_filter_folder_input())),
+            // A section heading, a sub-heading, or a `none` hint: there is no item under the
+            // cursor, so go by the section it sits in. This is the row you are on when a
+            // section is *empty*, which is exactly when loading from the library matters
+            // most -- with no saved searches yet, `Saved Searches / none` is the only row
+            // there is, and it has to reach the search library.
+            _ => match self.selected_sidebar_section().as_deref() {
+                Some("Saved Searches") => self.open_search_library_picker(),
+                Some("Bookmarks") => {
+                    self.open_input(Mode::ImportBookmarks(self.default_bookmark_folder_input()))
+                }
+                Some("Files") => {
+                    self.status = "select a source to load a schema for it".to_string()
+                }
+                _ => self.open_filter_library_picker(),
+            },
         }
     }
 
+    /// The section the sidebar cursor sits in: the nearest `Section` heading at or above it.
+    fn selected_sidebar_section(&self) -> Option<String> {
+        let items = self.sidebar_items();
+        items
+            .iter()
+            .take(self.sidebar_selected + 1)
+            .rev()
+            .find_map(|item| match item {
+                SidebarItem::Section(name) => Some(name.clone()),
+                _ => None,
+            })
+    }
+
+    /// `X` on a sidebar row: save the selected item to the user library, so every project
+    /// can pick it up with `L`.
     fn open_library_save(&mut self) {
         match self.selected_sidebar_item() {
             Some(SidebarItem::File { file_id, .. }) => self.open_save_source_schema(file_id),
-            Some(SidebarItem::Search { .. }) => {
-                self.open_input(Mode::ExportSearches(self.default_search_folder_input()))
-            }
+            Some(SidebarItem::Search { index, .. }) => self.save_search_to_user_library(index),
             Some(SidebarItem::Bookmark { .. }) => {
                 self.open_input(Mode::ExportBookmarks(self.default_bookmark_folder_input()))
             }
-            Some(SidebarItem::Filter { .. } | SidebarItem::TimeFilter { .. }) | None => {
-                self.open_input(Mode::ExportFilters(self.default_filter_folder_input()))
-            }
-            _ => self.open_input(Mode::ExportFilters(self.default_filter_folder_input())),
+            Some(SidebarItem::Filter { index, .. }) => self.save_filter_to_user_library(index),
+            // No single item under the cursor: fall back to the whole set of whatever
+            // section it is, which is the only sensible unit for a heading or a hint.
+            _ => match self.selected_sidebar_section().as_deref() {
+                Some("Saved Searches") => {
+                    self.open_input(Mode::ExportSearches(self.default_search_folder_input()))
+                }
+                Some("Bookmarks") => {
+                    self.open_input(Mode::ExportBookmarks(self.default_bookmark_folder_input()))
+                }
+                _ => self.open_input(Mode::ExportFilters(self.default_filter_folder_input())),
+            },
+        }
+    }
+
+    /// Save one filter to `~/.log-scouter/filters`, mirroring `X` on a schema.
+    fn save_filter_to_user_library(&mut self, index: usize) {
+        self.save_filter_to_folder(index, &self.default_filter_folder_path());
+    }
+
+    /// Split from `save_filter_to_user_library` so a test can point it somewhere other than
+    /// the real `$HOME` -- the suite must never write into the user's own library.
+    fn save_filter_to_folder(&mut self, index: usize, folder: &Path) {
+        let Some(rule) = self.project.filters.rules.get(index).cloned() else {
+            self.status = "no filter selected".to_string();
+            return;
+        };
+        let name = rule.describe();
+        let file = FilterFile {
+            name: name.clone(),
+            description: String::new(),
+            filter: rule,
+        };
+        match save_filter_file(&file, folder) {
+            Ok(path) => self.status = format!("saved filter '{name}' to {}", path.display()),
+            Err(error) => self.status = format!("save failed: {error}"),
+        }
+    }
+
+    /// Save one saved search to `~/.log-scouter/searches`.
+    fn save_search_to_user_library(&mut self, index: usize) {
+        self.save_search_to_folder(index, &self.default_search_folder_path());
+    }
+
+    fn save_search_to_folder(&mut self, index: usize, folder: &Path) {
+        let Some(query) = self.project.saved_searches.get(index).cloned() else {
+            self.status = "no saved search selected".to_string();
+            return;
+        };
+        let file = SearchFile {
+            name: query.clone(),
+            description: String::new(),
+            query,
+        };
+        match save_search_file(&file, folder) {
+            Ok(path) => self.status = format!("saved search '{}' to {}", file.name, path.display()),
+            Err(error) => self.status = format!("save failed: {error}"),
         }
     }
 
@@ -6754,6 +7221,7 @@ impl AppState {
             | Mode::ImportSearches(text)
             | Mode::ExportBookmarks(text)
             | Mode::ImportBookmarks(text)
+            | Mode::Hubs(text)
             | Mode::ExportSchemas(text)
             | Mode::ImportSchemas(text)
             | Mode::ExportIncident(text)
@@ -6929,6 +7397,7 @@ impl AppState {
             | Mode::ImportSearches(input)
             | Mode::ExportBookmarks(input)
             | Mode::ImportBookmarks(input)
+            | Mode::Hubs(input)
             | Mode::ExportSchemas(input)
             | Mode::ImportSchemas(input)
             | Mode::ExportIncident(input)
@@ -6957,6 +7426,7 @@ impl AppState {
             Mode::ImportBookmarks(folder) => self.submit_import_bookmarks(folder),
             Mode::ExportSchemas(folder) => self.submit_export_schemas(folder),
             Mode::ImportSchemas(folder) => self.submit_import_schemas(folder),
+            Mode::Hubs(text) => self.submit_hub_command(text),
             Mode::ExportIncident(path) => self.submit_export_incident(path),
             Mode::Extractor(text) => self.submit_extractor(text),
             Mode::SaveSourceSchema { file_id, text } => {
@@ -8189,6 +8659,7 @@ impl AppState {
             Command::ExportSearches,
             Command::ImportSchemas,
             Command::ExportSchemas,
+            Command::Hubs,
             Command::ExportIncident,
             Command::AskAi,
             Command::Undo,
@@ -8247,6 +8718,7 @@ impl AppState {
             Command::ExportSchemas => {
                 self.open_input(Mode::ExportSchemas(self.default_schema_folder_input()))
             }
+            Command::Hubs => self.open_input(Mode::Hubs(String::new())),
             Command::ExportIncident => {
                 self.open_input(Mode::ExportIncident(self.default_incident_file_input()))
             }
@@ -8836,7 +9308,8 @@ impl AppState {
             }
             KeyCode::Enter => {
                 let selected = picker.options.get(picker.selected).cloned();
-                if let Some(schema) = selected {
+                if let Some(entry) = selected {
+                    let schema = entry.item;
                     match picker.target {
                         SchemaPickerTarget::File(file_id) => {
                             self.mode = Mode::Normal;
@@ -8856,6 +9329,119 @@ impl AppState {
             _ => self.mode = Mode::SchemaLibraryPicker(picker),
         }
         Ok(false)
+    }
+
+    /// The filter library picker: `L` on a filter row.
+    fn handle_filter_library_picker_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::FilterLibraryPicker(mut picker) = self.mode.clone() else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+                self.mode = Mode::FilterLibraryPicker(picker);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(picker.options.len().saturating_sub(1));
+                self.mode = Mode::FilterLibraryPicker(picker);
+            }
+            KeyCode::Enter => {
+                let selected = picker.options.get(picker.selected).cloned();
+                self.mode = Mode::Normal;
+                if let Some(entry) = selected {
+                    self.apply_library_filter(entry);
+                }
+            }
+            _ => self.mode = Mode::FilterLibraryPicker(picker),
+        }
+        Ok(false)
+    }
+
+    /// The saved-search library picker: `L` on a saved-search row.
+    fn handle_search_library_picker_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::SearchLibraryPicker(mut picker) = self.mode.clone() else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+                self.mode = Mode::SearchLibraryPicker(picker);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(picker.options.len().saturating_sub(1));
+                self.mode = Mode::SearchLibraryPicker(picker);
+            }
+            KeyCode::Enter => {
+                let selected = picker.options.get(picker.selected).cloned();
+                self.mode = Mode::Normal;
+                if let Some(entry) = selected {
+                    self.apply_library_search(entry);
+                }
+            }
+            _ => self.mode = Mode::SearchLibraryPicker(picker),
+        }
+        Ok(false)
+    }
+
+    /// Open the filter library: everything the project, the user library and the hubs offer.
+    fn open_filter_library_picker(&mut self) {
+        let options = self.project.filter_library();
+        if options.is_empty() {
+            self.status =
+                "no filters in the library — press X to save one, or add a hub".to_string();
+            return;
+        }
+        self.mode = Mode::FilterLibraryPicker(FilterLibraryPicker {
+            options,
+            selected: 0,
+        });
+    }
+
+    fn open_search_library_picker(&mut self) {
+        let options = self.project.search_library();
+        if options.is_empty() {
+            self.status =
+                "no saved searches in the library — press X to save one, or add a hub".to_string();
+            return;
+        }
+        self.mode = Mode::SearchLibraryPicker(SearchLibraryPicker {
+            options,
+            selected: 0,
+        });
+    }
+
+    /// Copy a library filter into the project. Like importing a schema, this takes a copy:
+    /// the rule is the project's from here on, and the hub it came from can go away.
+    fn apply_library_filter(&mut self, entry: LibraryItem<FilterFile>) {
+        let name = entry.item.name.clone();
+        // Remember which library it came from: once copied in, nothing else records that
+        // this rule is the team's rather than one you typed.
+        let rule = entry.item.filter.from_library(entry.origin.clone());
+        if self
+            .project
+            .filters
+            .rules
+            .iter()
+            .any(|existing| existing.same_rule(&rule))
+        {
+            self.status = format!("'{name}' is already one of this project's filters");
+            return;
+        }
+        self.mutate_filters(|filters| filters.add(rule));
+        self.status = format!("added filter '{name}' from {}", entry.origin.label());
+    }
+
+    /// Copy a library search into the project's saved searches, and run it.
+    fn apply_library_search(&mut self, entry: LibraryItem<SearchFile>) {
+        let name = entry.item.name.clone();
+        let query = entry.item.query;
+        self.project
+            .search_origins
+            .insert(query.clone(), entry.origin.clone());
+        self.submit_search(query);
+        self.status = format!("ran saved search '{name}' from {}", entry.origin.label());
     }
 
     // ---- Guided filter builder --------------------------------------------------------
@@ -9306,7 +9892,11 @@ impl AppState {
         let count = loaded.len();
         self.mutate_filters(|filters| {
             for filter_file in loaded {
-                if !filters.rules.contains(&filter_file.filter) {
+                if !filters
+                    .rules
+                    .iter()
+                    .any(|existing| existing.same_rule(&filter_file.filter))
+                {
                     filters.add(filter_file.filter);
                 }
             }
@@ -9625,34 +10215,21 @@ impl AppState {
         self.open_schema_library_picker_for_target(SchemaPickerTarget::LiveEditor(editor));
     }
 
+    /// Offer every schema the project can resolve by name -- its own `.logscouter/schemas`,
+    /// the user library, every enabled hub, and the bundled formats.
+    ///
+    /// This reads `project.library` rather than a folder off disk. The library is the thing
+    /// `get_extractor` resolves against, so what the picker lists and what a source can
+    /// actually be set to are the same set by construction. Reading one folder instead is
+    /// how this used to miss the hub and bundled schemas entirely.
     fn open_schema_library_picker_for_target(&mut self, target: SchemaPickerTarget) {
-        let folder = self.default_schema_folder_path();
-        if !folder.is_dir() {
-            self.status = format!("no schema folder: {}", folder.display());
-            self.restore_schema_picker_target(target);
-            return;
-        }
-        let loaded = match load_schemas_from_folder(&folder) {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                self.status = format!("load failed: {error}");
-                self.restore_schema_picker_target(target);
-                return;
-            }
-        };
-        let mut options: Vec<Extractor> = loaded
-            .into_iter()
-            .map(|schema_file| {
-                let mut schema = schema_file.schema;
-                if schema.description.trim().is_empty() {
-                    schema.description = schema_file.description;
-                }
-                schema
-            })
-            .collect();
-        options.sort_by(|left, right| left.name.cmp(&right.name));
+        // Pick up anything synced or edited since the project was opened.
+        self.project.load_schema_libraries();
+        let mut options: Vec<LibraryItem<Extractor>> = self.project.library.clone();
+        options.sort_by(|left, right| left.item.name.cmp(&right.item.name));
         if options.is_empty() {
-            self.status = format!("no schema JSON files in {}", folder.display());
+            self.status =
+                "no schemas in the library — press X to save one, or add a hub".to_string();
             self.restore_schema_picker_target(target);
             return;
         }
@@ -11936,15 +12513,18 @@ impl AppState {
     }
 
     fn schema_folder_from_input(&self, input: &str) -> PathBuf {
-        self.folder_from_input(input, Self::default_schema_folder_path)
+        hub_folder_from_input(input, USER_SCHEMAS_SUBDIR)
+            .unwrap_or_else(|| self.folder_from_input(input, Self::default_schema_folder_path))
     }
 
     fn filter_folder_from_input(&self, input: &str) -> PathBuf {
-        self.folder_from_input(input, Self::default_filter_folder_path)
+        hub_folder_from_input(input, USER_FILTERS_SUBDIR)
+            .unwrap_or_else(|| self.folder_from_input(input, Self::default_filter_folder_path))
     }
 
     fn search_folder_from_input(&self, input: &str) -> PathBuf {
-        self.folder_from_input(input, Self::default_search_folder_path)
+        hub_folder_from_input(input, USER_SEARCHES_SUBDIR)
+            .unwrap_or_else(|| self.folder_from_input(input, Self::default_search_folder_path))
     }
 
     fn bookmark_folder_from_input(&self, input: &str) -> PathBuf {
@@ -11959,6 +12539,162 @@ impl AppState {
             return Err(None);
         }
         install_default_search_library(folder).map_err(Some)
+    }
+
+    /// The Hubs popup's body: the hubs you have, one per line, then the grammar.
+    ///
+    /// The list leads because "what have I got?" is the question you open this with — and
+    /// a popup is the only place that answers it without leaving the app.
+    fn hub_prompt_hint(&self) -> Vec<String> {
+        let mut lines = match HubConfig::load() {
+            Ok(config) => {
+                let mut lines = if config.hubs.is_empty() {
+                    vec!["no hubs yet — try: add acme/log-scouter-hub".to_string()]
+                } else {
+                    config.hubs.iter().map(describe_hub).collect()
+                };
+                lines.push(match (config.auto_sync, auto_sync_disabled_by_env()) {
+                    // The env var overrides the file, so say which one is in charge.
+                    (_, true) => format!("auto-sync off ({NO_AUTO_SYNC_VAR} is set)"),
+                    (true, false) => {
+                        "auto-sync: stale hubs refresh on start, at most daily".to_string()
+                    }
+                    (false, false) => "auto-sync off — hubs refresh only when you sync".to_string(),
+                });
+                lines
+            }
+            Err(error) => vec![format!("hubs.json: {error}")],
+        };
+        lines.push(String::new());
+        lines.push(
+            "add <owner/repo> [as <name>] · sync [<name>] · remove <name> · \
+             enable|disable <name> · auto-sync on|off"
+                .to_string(),
+        );
+        lines
+    }
+
+    fn submit_hub_command(&mut self, text: String) {
+        let action = match parse_hub_command(&text) {
+            Ok(action) => action,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        let mut config = match HubConfig::load() {
+            Ok(config) => config,
+            Err(error) => {
+                self.status = format!("hubs.json: {error}");
+                return;
+            }
+        };
+
+        match action {
+            HubAction::List => self.status = describe_hubs(&config),
+            HubAction::Add { repo, name } => self.add_hub(&mut config, &repo, name),
+            HubAction::Sync { name } => self.sync_hubs(&mut config, name.as_deref()),
+            HubAction::Remove { name } => self.remove_hub(&mut config, &name),
+            HubAction::SetEnabled { name, enabled } => {
+                self.set_hub_enabled(&mut config, &name, enabled)
+            }
+            HubAction::SetAutoSync { enabled } => self.set_auto_sync(&mut config, enabled),
+        }
+    }
+
+    fn set_auto_sync(&mut self, config: &mut HubConfig, enabled: bool) {
+        config.auto_sync = enabled;
+        if let Err(error) = config.save() {
+            self.status = format!("could not save hubs.json: {error}");
+            return;
+        }
+        self.status = match (enabled, auto_sync_disabled_by_env()) {
+            // Saying "on" while the environment forbids it would be a lie.
+            (true, true) => {
+                format!("auto-sync on, but {NO_AUTO_SYNC_VAR} is set and still wins")
+            }
+            (true, false) => "auto-sync on: stale hubs refresh on start, at most daily".to_string(),
+            (false, _) => "auto-sync off: hubs refresh only when you sync them".to_string(),
+        };
+    }
+
+    /// Add a hub and sync it immediately: a configured hub that has not been fetched holds
+    /// nothing, so the useful unit of work is "add and fetch".
+    fn add_hub(&mut self, config: &mut HubConfig, repo: &str, name: Option<String>) {
+        self.status = match add_and_sync(config, repo, name) {
+            Ok((hub, report)) => {
+                self.reload_hub_schemas();
+                format!("added hub '{}': {}", hub.name, report.describe())
+            }
+            Err(error) => error,
+        };
+    }
+
+    /// Sync one hub, or every configured hub when `name` is `None`.
+    fn sync_hubs(&mut self, config: &mut HubConfig, name: Option<&str>) {
+        let summary = match sync_named(config, name) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.reload_hub_schemas();
+        self.status = match summary.failures.as_slice() {
+            [] => format!(
+                "synced {} hub(s), {} item(s)",
+                summary.synced, summary.items
+            ),
+            failures => format!(
+                "synced {} hub(s), {} item(s); failed: {}",
+                summary.synced,
+                summary.items,
+                failures.join("; ")
+            ),
+        };
+    }
+
+    /// Forget a hub and delete its cache. Nothing under `~/.log-scouter/{schemas,filters,
+    /// searches}` is touched, and filters or searches already imported into this project
+    /// stay: they were copied in, and removing a hub is not a reason to undo the user's work.
+    fn remove_hub(&mut self, config: &mut HubConfig, name: &str) {
+        if config.remove(name).is_none() {
+            self.status = format!("no hub '{name}'");
+            return;
+        }
+        if let Err(error) = config.save() {
+            self.status = format!("could not save hubs.json: {error}");
+            return;
+        }
+        let cache = remove_hub_cache(name);
+        self.reload_hub_schemas();
+        self.status = match cache {
+            Ok(()) => format!("removed hub '{name}'"),
+            Err(error) => format!("removed hub '{name}' (cache: {error})"),
+        };
+    }
+
+    fn set_hub_enabled(&mut self, config: &mut HubConfig, name: &str, enabled: bool) {
+        let Some(hub) = config.get_mut(name) else {
+            self.status = format!("no hub '{name}'");
+            return;
+        };
+        hub.enabled = enabled;
+        if let Err(error) = config.save() {
+            self.status = format!("could not save hubs.json: {error}");
+            return;
+        }
+        self.reload_hub_schemas();
+        let state = if enabled { "enabled" } else { "disabled" };
+        self.status = format!("{state} hub '{name}'");
+    }
+
+    /// Re-read the schema tiers so a hub change shows up without restarting. Only the
+    /// library is rebuilt: the project's own schemas, and the schema each open file is
+    /// already parsed with, are left exactly as they are.
+    fn reload_hub_schemas(&mut self) {
+        self.project.load_schema_libraries();
     }
 
     /// `~` expands, an absolute path is taken as-is, and a relative one resolves inside
@@ -12053,7 +12789,11 @@ impl AppState {
                 let mark = if rule.enabled { "*" } else { "o" };
                 items.push(SidebarItem::Filter {
                     index,
-                    label: format!("{mark} {}", rule.describe()),
+                    label: format!(
+                        "{mark} {}{}",
+                        tag_prefix(rule.origin.as_ref()),
+                        rule.describe()
+                    ),
                 });
             }
         }
@@ -12090,7 +12830,10 @@ impl AppState {
                 items.push(SidebarItem::Search {
                     index,
                     text: search.clone(),
-                    label: format!("{mark} /{search}"),
+                    label: format!(
+                        "{mark} {}/{search}",
+                        tag_prefix(self.project.search_origins.get(search))
+                    ),
                 });
             }
         }
@@ -12185,6 +12928,54 @@ const MIN_PANE_WIDTH: u16 = 20;
 
 /// Split into fixed-width character chunks. Unlike word wrapping this never reflows,
 /// so the caret's (row, column) is a plain division.
+/// An origin tag with a trailing space, ready to prefix a row -- or nothing at all when the
+/// item was made by hand. A row with no tag is one you wrote yourself.
+fn tag_prefix(origin: Option<&Origin>) -> String {
+    match origin {
+        Some(origin) => format!("{} ", origin.label()),
+        None => String::new(),
+    }
+}
+
+/// How wide the origin column has to be to line the names up. Sized to the widest tag
+/// actually on show, so a library with no hubs does not pay for `[Hub some-long-name]`.
+fn library_origin_width<'a>(origins: impl Iterator<Item = &'a Origin>) -> usize {
+    origins
+        .map(|origin| origin.label().chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Wrap `text` to `width` on word boundaries, for prose the user reads rather than edits.
+/// A word longer than the line is chopped by `chunk_chars` instead of overflowing.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let candidate = line.chars().count() + 1 + word.chars().count();
+        if line.is_empty() {
+            line = word.to_string();
+        } else if candidate <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut line));
+            line = word.to_string();
+        }
+        // The word itself does not fit: break it and carry the tail on.
+        if line.chars().count() > width {
+            let mut chunks = chunk_chars(&line, width);
+            line = chunks.pop().unwrap_or_default();
+            lines.extend(chunks);
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 fn chunk_chars(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let chars: Vec<char> = text.chars().collect();
@@ -13062,7 +13853,13 @@ fn pretty_body_lines(body: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn file_detail_lines(file: &LogFileModel, width: usize) -> Vec<Line<'static>> {
+/// `schema_origin` is the tier the source's schema resolves from, passed in because the
+/// detail panel renders from a file alone and does not know about the library.
+fn file_detail_lines(
+    file: &LogFileModel,
+    schema_origin: Option<&Origin>,
+    width: usize,
+) -> Vec<Line<'static>> {
     let value_width = width.saturating_sub(DETAIL_LABEL_WIDTH + 1).max(8);
     let plain = Style::default();
     let mut lines = Vec::new();
@@ -13086,7 +13883,7 @@ fn file_detail_lines(file: &LogFileModel, width: usize) -> Vec<Line<'static>> {
     push_detail(
         &mut lines,
         "schema",
-        &file.extractor_name,
+        &format!("{}{}", tag_prefix(schema_origin), file.extractor_name),
         value_width,
         plain,
     );
@@ -13944,6 +14741,7 @@ Press y to copy help text, or any other key to close."
 mod tests {
     use super::*;
     use crate::core::extractor::{DEFAULT_EXTRACTOR_NAME, GENERIC_EXTRACTOR_NAME};
+    use crate::core::hub::{parse_repo, repo_is_official, Hub, OFFICIAL_HUB_NAME};
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -15658,9 +16456,13 @@ mod tests {
         let rendered = line_texts(&lines);
 
         assert!(rendered.iter().any(|line| line.starts_with("file")));
-        assert!(rendered
-            .iter()
-            .any(|line| line.starts_with("schema         Bracketed default")));
+        // The schema row names its tier: this one ships in the binary, so `[Built-in]`.
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.starts_with("schema         [Built-in] Bracketed default")),
+            "{rendered:?}"
+        );
         assert!(rendered
             .iter()
             .any(|line| line.starts_with("entries        2")));
@@ -16326,6 +17128,41 @@ mod tests {
         // The placeholder default collapses: the pick becomes the source's only schema.
         assert_eq!(editor.schemas, vec!["picked".to_string()]);
         assert!(app.project.extractors.contains_key("picked"));
+    }
+
+    /// `L` must offer everything the project can resolve — including the bundled formats
+    /// and any hub's schemas. It used to read `~/.log-scouter/schemas` alone, so a schema
+    /// that came from a hub, or shipped in the binary, could never be picked.
+    #[test]
+    fn the_schema_picker_offers_the_whole_library_not_just_the_user_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(Project::new(tmp.path()));
+        app.open_schema_library_picker_for_target(SchemaPickerTarget::LiveEditor(
+            LiveSourceEditor::new(),
+        ));
+
+        let Mode::SchemaLibraryPicker(picker) = &app.mode else {
+            panic!("expected the library picker, got {:?}", app.mode);
+        };
+        let names: Vec<&str> = picker
+            .options
+            .iter()
+            .map(|entry| entry.item.name.as_str())
+            .collect();
+
+        // The bundled formats reach the picker through `project.library` -- the same tier a
+        // hub's schemas arrive on. Reading `~/.log-scouter/schemas` alone offered neither.
+        for bundled in ["Spring Boot", "Tomcat Catalina", "Log4j2 Default"] {
+            assert!(names.contains(&bundled), "{bundled} is offered: {names:?}");
+        }
+        // Whatever the library holds, the picker must offer exactly that: anything it lists
+        // has to be resolvable by name, or picking it would fall back to the default schema.
+        for name in &names {
+            assert!(
+                app.project.has_extractor(name),
+                "{name} is offered but does not resolve"
+            );
+        }
     }
 
     #[test]
@@ -18198,7 +19035,7 @@ mod tests {
             schema.compile().unwrap();
             app.mode = Mode::SchemaLibraryPicker(SchemaLibraryPicker {
                 target: SchemaPickerTarget::LiveEditor(editor),
-                options: vec![schema],
+                options: vec![LibraryItem::new(schema, Origin::User)],
                 selected: 0,
             });
             press(&mut app, KeyCode::Enter);
@@ -18239,7 +19076,7 @@ mod tests {
             .insert("pad".to_string(), " +".to_string());
         uvi.entry_start = "^(?:INFO|ERROR):".to_string();
         uvi.compile().unwrap();
-        project.library.push(uvi);
+        project.library.push(LibraryItem::new(uvi, Origin::User));
         assert!(!project.extractors.contains_key("Uvi"));
 
         let file_id = project.add_stdin_source().file_id.clone();
@@ -18338,24 +19175,22 @@ mod tests {
         assert!(matches!(app.mode, Mode::SaveSourceSchema { .. }));
         app.mode = Mode::Normal;
 
+        // On a filter, `L` now opens the library picker, the same as it does on a schema.
+        // `X` saves the selected filter to the user library -- covered by
+        // `saving_one_filter_or_search_writes_a_library_file`, which can point it at a temp
+        // folder. Pressing `X` here would write into the real `~/.log-scouter/filters`.
         app.submit_filter("message contains include queued".to_string());
         app.finish_work();
         app.sidebar_selected = sidebar_row(&app, "text");
-        press(&mut app, KeyCode::Char('X'));
-        assert!(matches!(app.mode, Mode::ExportFilters(_)));
-        app.mode = Mode::Normal;
         press(&mut app, KeyCode::Char('L'));
-        assert!(matches!(app.mode, Mode::LoadFilters(_)));
+        assert!(matches!(app.mode, Mode::FilterLibraryPicker(_)));
         app.mode = Mode::Normal;
 
         app.submit_search("queued 3".to_string());
         app.finish_work();
         app.sidebar_selected = sidebar_row(&app, "search");
-        press(&mut app, KeyCode::Char('X'));
-        assert!(matches!(app.mode, Mode::ExportSearches(_)));
-        app.mode = Mode::Normal;
         press(&mut app, KeyCode::Char('L'));
-        assert!(matches!(app.mode, Mode::ImportSearches(_)));
+        assert!(matches!(app.mode, Mode::SearchLibraryPicker(_)));
         app.mode = Mode::Normal;
 
         app.focus = Focus::Pane;
@@ -19541,5 +20376,494 @@ mod tests {
         press(&mut app, KeyCode::Char('T'));
         assert!(app.elapsed_mark.is_none());
         assert_eq!(app.status, "this line has no timestamp to measure from");
+    }
+
+    /// A window too short for the results panel must render without one, not panic.
+    ///
+    /// `logscout` used to die on start in any terminal under 9 rows: the panel's height was
+    /// clamped into an inverted range (`min = 3`, `max = height - 6`) before anything checked
+    /// whether there was room for a panel at all.
+    #[test]
+    fn a_short_window_renders_without_the_results_panel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 40);
+        // With a search resolved, the results panel wants to be shown.
+        app.submit_search("line".to_string());
+        app.finish_work();
+        assert!(app.search_results_visible(), "the panel wants to show");
+
+        for height in 0..=12 {
+            for width in [0, 1, 20, 120] {
+                render(&mut app, width, height);
+            }
+        }
+
+        // Once there is room for it, it comes back.
+        let tall = render(&mut app, 120, 40);
+        assert!(tall.contains("Matches "), "panel returns when it fits");
+        // ... and a window one row too short for it stays panel-less rather than cramped.
+        let short = render(
+            &mut app,
+            120,
+            MIN_RESULTS_HEIGHT + RESULTS_RESERVED_ROWS - 1,
+        );
+        assert!(!short.contains("Matches "), "no panel when it does not fit");
+    }
+
+    /// The Hubs popup must actually *show* the hubs. It used to cram them onto the end of a
+    /// single hint line, which the popup clipped at its width — so a configured hub was
+    /// invisible, and the app looked like it had none.
+    #[test]
+    fn the_hub_popup_shows_each_hub_on_its_own_line() {
+        let width = 82usize;
+        let hint = vec![
+            describe_hub(&Hub {
+                name: "official".into(),
+                url: "mangosteen-lab/log-scouter-hub".into(),
+                branch: None,
+                enabled: true,
+                last_synced: Some("2026-07-17T01:53:57-04:00".into()),
+                official: true,
+            }),
+            describe_hub(&Hub {
+                name: "acme".into(),
+                url: "acme/hub".into(),
+                branch: None,
+                enabled: false,
+                last_synced: None,
+                official: false,
+            }),
+        ];
+
+        // Whatever a hub's line says, it has to fit the popup once wrapped.
+        for line in &hint {
+            for wrapped in wrap_words(line, width - 4) {
+                assert!(
+                    wrapped.chars().count() <= width - 4,
+                    "hub line does not fit the popup: {wrapped:?}"
+                );
+            }
+        }
+        assert!(hint[0].contains("mangosteen-lab/log-scouter-hub"));
+        assert!(hint[0].contains("synced 2026-07-17"), "{}", hint[0]);
+        // The official hub is not labelled "official (official)".
+        assert!(!hint[0].contains("(official)"), "{}", hint[0]);
+        assert!(hint[1].contains("disabled"), "{}", hint[1]);
+    }
+
+    /// A filter or search picked from a library remembers which one, shows it in the
+    /// sidebar, and still says so after the project is closed and reopened. One typed by
+    /// hand carries no tag rather than a made-up one.
+    #[test]
+    fn a_picked_filter_remembers_and_shows_where_it_came_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+
+        let from_hub = LibraryItem::new(
+            FilterFile {
+                name: "Hide TRACE".to_string(),
+                description: "drop trace".to_string(),
+                filter: FilterRule::new("message", "contains", "queued", "exclude"),
+            },
+            Origin::Hub("official".into()),
+        );
+        app.apply_library_filter(from_hub.clone());
+        app.submit_filter("message contains exclude typed-by-hand".to_string());
+        app.finish_work();
+
+        let rows = line_texts_of_sidebar(&app);
+        assert!(
+            rows.iter().any(|row| row.contains("[Hub official]")),
+            "the picked filter is tagged: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("typed-by-hand") && !row.contains('[')),
+            "a hand-typed filter carries no tag: {rows:?}"
+        );
+
+        // Picking the same rule again is a duplicate, whatever tier it came from...
+        let before = app.project.filters.rules.len();
+        let same_rule_other_tier = LibraryItem::new(from_hub.item.clone(), Origin::User);
+        app.apply_library_filter(same_rule_other_tier);
+        assert_eq!(
+            app.project.filters.rules.len(),
+            before,
+            "origin is provenance, not identity"
+        );
+
+        // ... and the tag survives a save/load round trip.
+        app.project.save().unwrap();
+        let reopened = Project::load(tmp.path());
+        let tagged = reopened
+            .filters
+            .rules
+            .iter()
+            .find(|rule| rule.origin.is_some())
+            .expect("the picked filter kept its origin");
+        assert_eq!(tagged.origin, Some(Origin::Hub("official".into())));
+    }
+
+    #[test]
+    fn a_picked_search_remembers_where_it_came_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        app.apply_library_search(LibraryItem::new(
+            SearchFile {
+                name: "Errors".to_string(),
+                description: String::new(),
+                query: "queued 3".to_string(),
+            },
+            Origin::User,
+        ));
+        app.finish_work();
+
+        let rows = line_texts_of_sidebar(&app);
+        assert!(
+            rows.iter().any(|row| row.contains("[User] /queued 3")),
+            "the search row is tagged: {rows:?}"
+        );
+
+        app.project.save().unwrap();
+        let reopened = Project::load(tmp.path());
+        assert_eq!(
+            reopened.search_origins.get("queued 3"),
+            Some(&Origin::User),
+            "the tag survives a reopen"
+        );
+    }
+
+    /// Every sidebar row's text, for asserting on what the user sees.
+    fn line_texts_of_sidebar(app: &AppState) -> Vec<String> {
+        app.sidebar_items()
+            .iter()
+            .map(|item| match item {
+                SidebarItem::Section(text)
+                | SidebarItem::SubSection(text)
+                | SidebarItem::Hint(text) => text.clone(),
+                SidebarItem::File { label, .. }
+                | SidebarItem::Filter { label, .. }
+                | SidebarItem::TimeFilter { label, .. }
+                | SidebarItem::Search { label, .. }
+                | SidebarItem::Bookmark { label, .. } => label.clone(),
+            })
+            .collect()
+    }
+
+    /// `L` on an *empty* section still reaches that section's library.
+    ///
+    /// With no saved searches yet there is no `Search` row to stand on — only the heading
+    /// and a `none` hint — and those used to fall through to the filter picker, so the
+    /// search library was unreachable exactly when you needed it to bootstrap one.
+    #[test]
+    fn l_on_an_empty_section_opens_that_sections_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        app.focus = Focus::Sidebar;
+        assert!(
+            app.project.saved_searches.is_empty(),
+            "no saved searches: the heading and its hint are the only rows"
+        );
+
+        // Seed the project's own library folders, so the pickers have something to show
+        // whatever the machine's `~/.log-scouter` happens to hold.
+        let config = tmp.path().join(CONFIG_DIR);
+        std::fs::create_dir_all(config.join("searches")).unwrap();
+        std::fs::write(
+            config.join("searches/errors.json"),
+            r#"{"name":"Errors","description":"all errors","query":"level=Error"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(config.join("filters")).unwrap();
+        std::fs::write(
+            config.join("filters/trace.json"),
+            r#"{"name":"Hide TRACE","description":"",
+                "filter":{"field":"level","op":"equals","value":"Trace","action":"exclude"}}"#,
+        )
+        .unwrap();
+
+        // Both the `Saved Searches` heading and the `none` hint under it.
+        let heading = app
+            .sidebar_items()
+            .iter()
+            .position(|item| matches!(item, SidebarItem::Section(name) if name == "Saved Searches"))
+            .expect("a Saved Searches section");
+        for row in [heading, heading + 1] {
+            app.sidebar_selected = row;
+            app.mode = Mode::Normal;
+            press(&mut app, KeyCode::Char('L'));
+            assert!(
+                matches!(app.mode, Mode::SearchLibraryPicker(_)),
+                "row {row} opened {:?}, not the search library",
+                app.mode
+            );
+        }
+
+        // The Filters section still reaches the filter library from its own empty rows.
+        let filters = app
+            .sidebar_items()
+            .iter()
+            .position(|item| matches!(item, SidebarItem::Section(name) if name == "Filters"))
+            .expect("a Filters section");
+        app.sidebar_selected = filters;
+        app.mode = Mode::Normal;
+        press(&mut app, KeyCode::Char('L'));
+        assert!(
+            matches!(app.mode, Mode::FilterLibraryPicker(_)),
+            "{:?}",
+            app.mode
+        );
+    }
+
+    /// `X` on a filter or a search writes one JSON into the library, the way `X` on a schema
+    /// does — and a second save of the same name steps aside rather than overwriting.
+    #[test]
+    fn saving_one_filter_or_search_writes_a_library_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        let library = tmp.path().join("library");
+
+        app.submit_filter("message contains include queued".to_string());
+        app.finish_work();
+        app.save_filter_to_folder(0, &library.join("filters"));
+        assert!(app.status.starts_with("saved filter"), "{}", app.status);
+
+        app.submit_search("queued 3".to_string());
+        app.finish_work();
+        app.save_search_to_folder(0, &library.join("searches"));
+        assert!(app.status.starts_with("saved search"), "{}", app.status);
+
+        // Each is a library file the pickers can read back.
+        let filters = load_filters_from_folder(&library.join("filters")).unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].filter.value, "queued");
+        let searches = load_searches_from_folder(&library.join("searches")).unwrap();
+        assert_eq!(searches.len(), 1);
+        assert_eq!(searches[0].query, "queued 3");
+
+        // Saving the same filter again keeps both rather than clobbering the first.
+        app.save_filter_to_folder(0, &library.join("filters"));
+        assert_eq!(
+            load_filters_from_folder(&library.join("filters"))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// The pickers show which tier each item came from, so two `Hide TRACE`s can be told
+    /// apart, and the column is wide enough for the longest tag on show.
+    #[test]
+    fn library_rows_are_tagged_with_their_origin() {
+        let origins = [
+            Origin::Project,
+            Origin::User,
+            Origin::Hub("official".into()),
+            Origin::Bundled,
+        ];
+        let width = library_origin_width(origins.iter());
+        assert_eq!(width, "[Hub official]".chars().count());
+        for origin in &origins {
+            assert!(origin.label().chars().count() <= width);
+        }
+        // No items, no column.
+        assert_eq!(library_origin_width([].iter()), 0);
+    }
+
+    /// The filter library gathers every tier, and picking one copies it into the project.
+    #[test]
+    fn the_filter_picker_lists_the_library_and_applies_a_pick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        // A filter in the project's own library folder shows up as [Project].
+        let folder = tmp.path().join(CONFIG_DIR).join("filters");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("hide-trace.json"),
+            r#"{"name":"Hide TRACE","description":"drop trace",
+                "filter":{"field":"level","op":"equals","value":"Trace","action":"exclude"}}"#,
+        )
+        .unwrap();
+
+        app.focus = Focus::Sidebar;
+        app.open_filter_library_picker();
+        let Mode::FilterLibraryPicker(picker) = app.mode.clone() else {
+            panic!("expected the filter picker, got {:?}", app.mode);
+        };
+        let mine = picker
+            .options
+            .iter()
+            .find(|entry| entry.item.name == "Hide TRACE")
+            .expect("the project's own filter is listed");
+        assert_eq!(mine.origin, Origin::Project);
+
+        // Enter copies it into the project's filters.
+        let before = app.project.filters.rules.len();
+        app.apply_library_filter(mine.clone());
+        assert_eq!(app.project.filters.rules.len(), before + 1);
+        assert!(app.status.contains("[Project]"), "{}", app.status);
+
+        // Applying the same one twice does not double it up.
+        app.apply_library_filter(mine.clone());
+        assert_eq!(app.project.filters.rules.len(), before + 1);
+        assert!(app.status.contains("already"), "{}", app.status);
+    }
+
+    /// Words are not chopped in half, and an over-long word still cannot overflow.
+    #[test]
+    fn hint_text_wraps_on_word_boundaries() {
+        assert_eq!(
+            wrap_words("the quick brown fox jumps", 10),
+            ["the quick", "brown fox", "jumps"]
+        );
+        assert_eq!(wrap_words("", 10), Vec::<String>::new());
+        for line in wrap_words("supercalifragilistic and more", 8) {
+            assert!(line.chars().count() <= 8, "{line:?} overflows");
+        }
+    }
+
+    /// The palette reaches the hub console, and the prompt renders without a hub configured.
+    #[test]
+    fn the_palette_opens_the_hub_console() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        assert!(app.palette_commands().contains(&Command::Hubs));
+
+        press(&mut app, KeyCode::Char(':'));
+        for ch in "hubs".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Hubs(_)), "hub console opened");
+        render(&mut app, 120, 24);
+    }
+
+    /// Asking to sync or remove a hub that is not configured says so, rather than failing
+    /// somewhere in the network stack.
+    #[test]
+    fn hub_actions_on_an_unknown_hub_report_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 5);
+        let unknown = "no-such-hub-xyz";
+
+        app.submit_hub_command(format!("remove {unknown}"));
+        assert_eq!(app.status, format!("no hub '{unknown}'"));
+
+        app.submit_hub_command(format!("sync {unknown}"));
+        assert_eq!(app.status, format!("no hub '{unknown}'"));
+
+        app.submit_hub_command(format!("disable {unknown}"));
+        assert_eq!(app.status, format!("no hub '{unknown}'"));
+    }
+
+    #[test]
+    fn the_hub_prompt_parses_each_verb() {
+        let parse = |input| parse_hub_command(input).unwrap();
+        assert_eq!(
+            parse("add acme/log-scouter-hub"),
+            HubAction::Add {
+                repo: "acme/log-scouter-hub".into(),
+                name: None
+            }
+        );
+        assert_eq!(
+            parse("add acme/hub as ops"),
+            HubAction::Add {
+                repo: "acme/hub".into(),
+                name: Some("ops".into())
+            }
+        );
+        assert_eq!(parse("sync"), HubAction::Sync { name: None });
+        assert_eq!(
+            parse("sync acme"),
+            HubAction::Sync {
+                name: Some("acme".into())
+            }
+        );
+        assert_eq!(
+            parse("remove acme"),
+            HubAction::Remove {
+                name: "acme".into()
+            }
+        );
+        assert_eq!(
+            parse("disable acme"),
+            HubAction::SetEnabled {
+                name: "acme".into(),
+                enabled: false
+            }
+        );
+        assert_eq!(
+            parse("enable acme"),
+            HubAction::SetEnabled {
+                name: "acme".into(),
+                enabled: true
+            }
+        );
+        assert_eq!(
+            parse("auto-sync off"),
+            HubAction::SetAutoSync { enabled: false }
+        );
+        assert_eq!(
+            parse("auto-sync on"),
+            HubAction::SetAutoSync { enabled: true }
+        );
+        // An empty prompt lists rather than doing anything.
+        assert_eq!(parse("  "), HubAction::List);
+        assert_eq!(parse("list"), HubAction::List);
+    }
+
+    /// Adding the official repo by hand produces the official hub — bare names, standard
+    /// name — rather than a namespaced stranger pointing at the same content.
+    #[test]
+    fn adding_the_official_repo_by_hand_makes_it_the_official_hub() {
+        for repo in [
+            "mangosteen-lab/log-scouter-hub",
+            "https://github.com/mangosteen-lab/log-scouter-hub",
+        ] {
+            let parsed = parse_repo(repo).unwrap();
+            assert!(repo_is_official(repo));
+            // `add_hub` names it from the repo unless told otherwise; the official repo
+            // takes the official name so it matches what a seeded install already has.
+            assert_eq!(parsed.default_hub_name(), "log-scouter-hub");
+            assert_eq!(OFFICIAL_HUB_NAME, "official");
+        }
+        assert!(!repo_is_official("acme/log-scouter-hub"));
+    }
+
+    #[test]
+    fn the_hub_prompt_reports_what_it_could_not_parse() {
+        for (input, expected) in [
+            ("add", "usage: add"),
+            ("add a/b as", "usage: add"),
+            ("remove", "usage: remove <name>"),
+            ("sync a b", "usage: sync"),
+            ("frobnicate acme", "unknown hub command 'frobnicate'"),
+        ] {
+            let error = parse_hub_command(input).unwrap_err();
+            assert!(error.contains(expected), "{input:?} gave {error:?}");
+        }
+    }
+
+    /// `hub:<name>` in an import prompt resolves to that hub's cached folder, so importing
+    /// a hub's filters uses the same command as any other folder of filters.
+    #[test]
+    fn hub_prefixed_import_paths_resolve_to_the_cache() {
+        let Some(expected) = hub_cache_dir("acme") else {
+            return; // no home directory in this environment
+        };
+        assert_eq!(
+            hub_folder_from_input("hub:acme", USER_FILTERS_SUBDIR),
+            Some(expected.join("filters"))
+        );
+        assert_eq!(
+            hub_folder_from_input(" hub:acme ", USER_SCHEMAS_SUBDIR),
+            Some(expected.join("schemas"))
+        );
+        // An ordinary path is left to the normal folder handling.
+        assert_eq!(
+            hub_folder_from_input("~/somewhere", USER_FILTERS_SUBDIR),
+            None
+        );
     }
 }

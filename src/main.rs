@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use log_scouter::ai::{config::AiConfig, Provider};
+use log_scouter::core::hub::{self, HubConfig};
 use log_scouter::core::project::Project;
 use std::path::PathBuf;
 
@@ -41,8 +42,44 @@ enum Command {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// Manage hubs: shared libraries of schemas, filters and saved searches, published as
+    /// GitHub repos. With no action, lists them.
+    Hub {
+        #[command(subcommand)]
+        action: Option<HubCommand>,
+    },
     /// Print the logscout version.
     Version,
+}
+
+#[derive(Subcommand)]
+enum HubCommand {
+    /// List the configured hubs: what each holds and when it last synced.
+    List,
+    /// Add a hub and sync it now: `logscout hub add acme/log-scouter-hub`. Accepts
+    /// owner/repo, an HTTPS or SSH URL, or a /tree/<branch> URL to pin a branch.
+    Add {
+        /// The repo to track.
+        repo: String,
+        /// Local name for the hub, and the namespace its items appear under.
+        /// Defaults to the repo's name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Forget a hub and delete its cache. Your own schemas, filters and searches are
+    /// untouched, as are any already imported into a project.
+    Remove { name: String },
+    /// Refresh every hub, or just the one named.
+    Sync { name: Option<String> },
+    /// Let a hub contribute schemas again.
+    Enable { name: String },
+    /// Keep a hub configured and cached, but contributing nothing.
+    Disable { name: String },
+    /// Refresh stale hubs on start (`on`), or only when asked (`off`).
+    AutoSync {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -71,7 +108,110 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(Command::Config { action }) => run_config(action.unwrap_or(ConfigAction::List)),
+        Some(Command::Hub { action }) => run_hub(action.unwrap_or(HubCommand::List)),
         None => run_tui(cli.folder, cli.files, cli.file, cli.stdin),
+    }
+}
+
+/// The `hub` subcommands. Everything here is the same core the TUI's Hubs prompt drives, so
+/// a hub added from a script and one added from the app are the same hub.
+fn run_hub(action: HubCommand) -> anyhow::Result<()> {
+    let mut config = HubConfig::load().context("could not read ~/.log-scouter/hubs.json")?;
+    // A script that only ever uses the CLI should still get the official hub.
+    let seeded = config.ensure_official();
+    if seeded {
+        config.save().context("could not write hubs.json")?;
+    }
+
+    match action {
+        HubCommand::List => print_hubs(&config, seeded),
+        HubCommand::Add { repo, name } => {
+            let (hub, report) =
+                hub::add_and_sync(&mut config, &repo, name).map_err(anyhow::Error::msg)?;
+            println!("Added hub '{}': {}", hub.name, report.describe());
+            println!("  {}", hub::describe_hub(&hub));
+        }
+        HubCommand::Remove { name } => {
+            if config.remove(&name).is_none() {
+                anyhow::bail!("no hub '{name}'");
+            }
+            config.save().context("could not write hubs.json")?;
+            hub::remove_hub_cache(&name).context("could not delete the hub's cache")?;
+            println!("Removed hub '{name}'.");
+        }
+        HubCommand::Sync { name } => {
+            let summary =
+                hub::sync_named(&mut config, name.as_deref()).map_err(anyhow::Error::msg)?;
+            println!(
+                "Synced {} hub(s), {} item(s).",
+                summary.synced, summary.items
+            );
+            for failure in &summary.failures {
+                eprintln!("  failed: {failure}");
+            }
+            // A sync that reached nothing is a failure worth an exit code, so a CI step or a
+            // `&&` chain notices instead of reporting success.
+            if summary.synced == 0 && !summary.failures.is_empty() {
+                anyhow::bail!("no hub synced");
+            }
+        }
+        HubCommand::Enable { name } => set_hub_enabled(&mut config, &name, true)?,
+        HubCommand::Disable { name } => set_hub_enabled(&mut config, &name, false)?,
+        HubCommand::AutoSync { state } => {
+            config.auto_sync = state == "on";
+            config.save().context("could not write hubs.json")?;
+            if config.auto_sync && hub::auto_sync_disabled_by_env() {
+                println!(
+                    "Auto-sync on, but {} is set in the environment and still wins.",
+                    hub::NO_AUTO_SYNC_VAR
+                );
+            } else if config.auto_sync {
+                println!("Auto-sync on: stale hubs refresh on start, at most daily.");
+            } else {
+                println!("Auto-sync off: hubs refresh only when you run `logscout hub sync`.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn set_hub_enabled(config: &mut HubConfig, name: &str, enabled: bool) -> anyhow::Result<()> {
+    let hub = config
+        .get_mut(name)
+        .with_context(|| format!("no hub '{name}'"))?;
+    hub.enabled = enabled;
+    config.save().context("could not write hubs.json")?;
+    let state = if enabled { "enabled" } else { "disabled" };
+    println!("Hub '{name}' {state}.");
+    Ok(())
+}
+
+/// The configured hubs, one per line.
+fn print_hubs(config: &HubConfig, seeded: bool) {
+    if seeded {
+        println!(
+            "Configured the official hub ({}).\n",
+            hub::OFFICIAL_HUB_REPO
+        );
+    }
+    if config.hubs.is_empty() {
+        println!("No hubs configured. Add one with `logscout hub add <owner/repo>`.");
+        return;
+    }
+    for hub in &config.hubs {
+        println!("{}", hub::describe_hub(hub));
+    }
+    println!();
+    match (config.auto_sync, hub::auto_sync_disabled_by_env()) {
+        (_, true) => println!(
+            "Auto-sync: off ({} is set in the environment).",
+            hub::NO_AUTO_SYNC_VAR
+        ),
+        (true, false) => println!("Auto-sync: stale hubs refresh on start, at most daily."),
+        (false, false) => println!("Auto-sync: off — hubs refresh only when you sync them."),
+    }
+    if let Some(path) = hub::hub_config_path() {
+        println!("Configured in {}", path.display());
     }
 }
 

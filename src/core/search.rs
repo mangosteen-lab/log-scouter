@@ -1,5 +1,7 @@
 use crate::core::filters::contains_ignore_case;
-use crate::core::filters::{home_dir, json_file_paths, sanitize_file_component, USER_DIR};
+use crate::core::filters::{
+    home_dir, json_file_paths, sanitize_file_component, write_library_file, USER_DIR,
+};
 use crate::core::models::{LogEntry, LogFileModel};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use regex::Regex;
@@ -178,6 +180,13 @@ pub fn install_default_search_library(folder: &Path) -> io::Result<usize> {
         written += 1;
     }
     Ok(written)
+}
+
+/// Save one saved search into `folder` as its own JSON, returning where it landed. The
+/// counterpart to saving a single schema or filter.
+pub fn save_search_file(file: &SearchFile, folder: &Path) -> io::Result<PathBuf> {
+    let body = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
+    write_library_file(folder, &sanitize_file_component(&file.name), &body)
 }
 
 pub fn export_searches_to_folder(searches: &[String], folder: &Path) -> io::Result<usize> {

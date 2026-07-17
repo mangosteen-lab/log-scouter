@@ -4,9 +4,16 @@ use crate::core::extractor::{
     BRACKETED_DEFAULT_FORMAT, BRACKETED_LEGACY_FORMAT, DEFAULT_EXTRACTOR_NAME, DETECT_LINES,
     GENERIC_EXTRACTOR_NAME, USER_SCHEMAS_SUBDIR,
 };
-use crate::core::filters::FilterSet;
+use crate::core::filters::{
+    load_filters_from_folder, user_filter_dir, FilterFile, FilterSet, USER_FILTERS_SUBDIR,
+};
+use crate::core::hub::{hub_filters, hub_schemas, hub_searches, HubConfig};
+use crate::core::library::{LibraryItem, Origin};
 use crate::core::models::{display_name, merge_files, LiveSourceConfig, LogFileModel};
 use crate::core::parser;
+use crate::core::search::{
+    load_searches_from_folder, user_search_dir, SearchFile, USER_SEARCHES_SUBDIR,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -23,12 +30,19 @@ pub struct Project {
     pub root: PathBuf,
     pub files: Vec<LogFileModel>,
     pub extractors: HashMap<String, Extractor>,
-    /// Schemas loaded from the on-disk libraries (`.logscouter/schemas` then
-    /// `~/.log-scouter/schemas`), deduped project-first. Consulted for detection and name
-    /// resolution but never persisted -- a source references a library schema by name and
-    /// re-resolves it from disk on each open, so `project.json` stays lean.
-    pub library: Vec<Extractor>,
+    /// Schemas loaded from the on-disk libraries (`.logscouter/schemas`, then
+    /// `~/.log-scouter/schemas`, then each hub, then the bundle), deduped project-first and
+    /// each tagged with the tier it came from. Consulted for detection and name resolution
+    /// but never persisted -- a source references a library schema by name and re-resolves it
+    /// from disk on each open, so `project.json` stays lean.
+    pub library: Vec<LibraryItem<Extractor>>,
     pub saved_searches: Vec<String>,
+    /// Which library each saved search came from, keyed by the query itself.
+    ///
+    /// A saved search *is* its query string (`saved_searches: Vec<String>`), so there is no
+    /// item to hang provenance off. Keying by query keeps that shape -- reordering the MRU
+    /// cannot lose the tag -- and a query with no entry is simply one you typed.
+    pub search_origins: HashMap<String, Origin>,
     pub filters: FilterSet,
     pub bookmarks: Vec<Bookmark>,
     /// What was on screen when the folder was last closed. Filters live in `filters`
@@ -118,6 +132,8 @@ struct ProjectData {
     extractors: Vec<Extractor>,
     #[serde(default)]
     saved_searches: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    search_origins: HashMap<String, Origin>,
     #[serde(default)]
     filters: FilterSet,
     #[serde(default)]
@@ -160,6 +176,7 @@ impl Project {
             extractors: HashMap::new(),
             library: Vec::new(),
             saved_searches: Vec::new(),
+            search_origins: HashMap::new(),
             filters: FilterSet::default(),
             bookmarks: Vec::new(),
             session: None,
@@ -188,21 +205,30 @@ impl Project {
     }
 
     /// Load the schema libraries into `self.library`: the project's own
-    /// `.logscouter/schemas` first, then the shared `~/.log-scouter/schemas`, then the
-    /// schemas bundled with the binary -- deduped so a project schema shadows a user one of
-    /// the same name, and either shadows a bundled one. Bad or missing folders are simply
-    /// empty -- detection must never fail because a library file does not parse.
+    /// `.logscouter/schemas` first, then the shared `~/.log-scouter/schemas`, then every
+    /// enabled hub in configured order, then the schemas bundled with the binary -- deduped
+    /// so a project schema shadows a user one of the same name, and either shadows a bundled
+    /// one. Bad or missing folders are simply empty -- detection must never fail because a
+    /// library file does not parse.
+    ///
+    /// Hub schemas arrive namespaced `<hub>/<name>`, so they cannot collide with a local
+    /// schema or with each other; their position here is what makes precedence real, by
+    /// deciding the order `detect` tries them in.
     ///
     /// Bundled schemas come last so that adopting a new release cannot change how a log the
     /// user already has a schema for is parsed.
     pub fn load_schema_libraries(&mut self) {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut library: Vec<Extractor> = Vec::new();
+        let mut library: Vec<LibraryItem<Extractor>> = Vec::new();
         let folders = [
-            Some(self.config_dir().join(USER_SCHEMAS_SUBDIR)),
-            user_schema_dir(),
+            (
+                Some(self.config_dir().join(USER_SCHEMAS_SUBDIR)),
+                Origin::Project,
+            ),
+            (user_schema_dir(), Origin::User),
         ];
-        for folder in folders.into_iter().flatten() {
+        for (folder, origin) in folders {
+            let Some(folder) = folder else { continue };
             let loaded = load_schemas_from_folder(&folder).unwrap_or_default();
             let mut names: Vec<(String, Extractor)> = loaded
                 .into_iter()
@@ -211,16 +237,81 @@ impl Project {
             names.sort_by(|left, right| left.0.cmp(&right.0));
             for (name, schema) in names {
                 if seen.insert(name) {
-                    library.push(schema);
+                    library.push(LibraryItem::new(schema, origin.clone()));
+                }
+            }
+        }
+        // Per hub rather than `all_hub_schemas`, so each schema remembers which hub it came
+        // from -- that is what the library picker shows.
+        let hubs = HubConfig::load().unwrap_or_default();
+        for hub in hubs.active() {
+            for file in hub_schemas(hub) {
+                if seen.insert(file.schema.name.clone()) {
+                    library.push(LibraryItem::new(file.schema, Origin::Hub(hub.name.clone())));
                 }
             }
         }
         for schema in bundled_schemas() {
             if seen.insert(schema.name.clone()) {
-                library.push(schema);
+                library.push(LibraryItem::new(schema, Origin::Bundled));
             }
         }
         self.library = library;
+    }
+
+    /// Every filter the project can offer, in tier order: its own `.logscouter/filters`, the
+    /// user's library, then each enabled hub.
+    ///
+    /// Unlike schemas, filters are *copied* into the project when applied rather than
+    /// resolved by name, so nothing is deduped here: two tiers offering a `Hide TRACE` are
+    /// two things the user may want to choose between, told apart by their origin.
+    pub fn filter_library(&self) -> Vec<LibraryItem<FilterFile>> {
+        let mut items = Vec::new();
+        let folders = [
+            (
+                Some(self.config_dir().join(USER_FILTERS_SUBDIR)),
+                Origin::Project,
+            ),
+            (user_filter_dir(), Origin::User),
+        ];
+        for (folder, origin) in folders {
+            let Some(folder) = folder else { continue };
+            for file in load_filters_from_folder(&folder).unwrap_or_default() {
+                items.push(LibraryItem::new(file, origin.clone()));
+            }
+        }
+        let hubs = HubConfig::load().unwrap_or_default();
+        for hub in hubs.active() {
+            for file in hub_filters(hub) {
+                items.push(LibraryItem::new(file, Origin::Hub(hub.name.clone())));
+            }
+        }
+        items
+    }
+
+    /// Every saved search the project can offer, in the same tier order as `filter_library`.
+    pub fn search_library(&self) -> Vec<LibraryItem<SearchFile>> {
+        let mut items = Vec::new();
+        let folders = [
+            (
+                Some(self.config_dir().join(USER_SEARCHES_SUBDIR)),
+                Origin::Project,
+            ),
+            (user_search_dir(), Origin::User),
+        ];
+        for (folder, origin) in folders {
+            let Some(folder) = folder else { continue };
+            for file in load_searches_from_folder(&folder).unwrap_or_default() {
+                items.push(LibraryItem::new(file, origin.clone()));
+            }
+        }
+        let hubs = HubConfig::load().unwrap_or_default();
+        for hub in hubs.active() {
+            for file in hub_searches(hub) {
+                items.push(LibraryItem::new(file, Origin::Hub(hub.name.clone())));
+            }
+        }
+        items
     }
 
     /// Add any built-in schema the project does not already define. A schema the user has
@@ -254,17 +345,35 @@ impl Project {
         }
         // A source may name a schema that lives only in a disk library; resolve it from there
         // rather than falling straight to the default.
-        if let Some(extractor) = self.library.iter().find(|schema| schema.name == name) {
-            return extractor.clone();
+        if let Some(entry) = self.library.iter().find(|entry| entry.item.name == name) {
+            return entry.item.clone();
         }
         self.default_extractor_obj()
+    }
+
+    /// Where the schema `name` resolves from, or `None` when nothing resolves it.
+    ///
+    /// Mirrors `get_extractor`'s order, so the tag shown against a source names the copy it
+    /// is actually parsed with. The built-ins are checked first because they live in
+    /// `extractors` like a saved schema but are neither the project's nor a library's.
+    pub fn schema_origin(&self, name: &str) -> Option<Origin> {
+        if matches!(name, DEFAULT_EXTRACTOR_NAME | GENERIC_EXTRACTOR_NAME) {
+            return Some(Origin::Builtin);
+        }
+        if self.extractors.contains_key(name) {
+            return Some(Origin::Project);
+        }
+        self.library
+            .iter()
+            .find(|entry| entry.item.name == name)
+            .map(|entry| entry.origin.clone())
     }
 
     /// Whether `get_extractor` resolves `name` to a real schema rather than falling back to the
     /// default. Anything that validates a schema name typed or held by a source must ask this,
     /// not `extractors` alone: a library schema is referenced by name and lives only on disk.
     pub fn has_extractor(&self, name: &str) -> bool {
-        self.extractors.contains_key(name) || self.library.iter().any(|schema| schema.name == name)
+        self.extractors.contains_key(name) || self.library.iter().any(|e| e.item.name == name)
     }
 
     /// Every schema detection may pick from: the project's in-memory extractors (built-ins +
@@ -272,9 +381,9 @@ impl Project {
     /// specificity, so a specific library schema still beats the generic built-ins.
     fn detection_candidates(&self) -> Vec<&Extractor> {
         let mut candidates: Vec<&Extractor> = self.extractors.values().collect();
-        for schema in &self.library {
-            if !self.extractors.contains_key(&schema.name) {
-                candidates.push(schema);
+        for entry in &self.library {
+            if !self.extractors.contains_key(&entry.item.name) {
+                candidates.push(&entry.item);
             }
         }
         candidates
@@ -660,6 +769,7 @@ impl Project {
     fn apply(&mut self, data: ProjectData) {
         self.file_counter = data.file_counter;
         self.saved_searches = data.saved_searches;
+        self.search_origins = data.search_origins;
         self.filters = data.filters;
         self.bookmarks = data.bookmarks;
         // A project written before the time slot was enforced can hold several ranges;
@@ -739,6 +849,7 @@ impl Project {
                 .collect(),
             extractors: self.extractors.values().cloned().collect(),
             saved_searches: self.saved_searches.clone(),
+            search_origins: self.search_origins.clone(),
             filters: self.filters.clone(),
             bookmarks: self.bookmarks.clone(),
             session: self.session.clone(),

@@ -1,3 +1,4 @@
+use crate::core::library::Origin;
 use crate::core::models::{LogEntry, LogFileModel};
 use crate::core::search::parse_datetime;
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,14 @@ pub struct FilterRule {
     pub action: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Which library this rule was picked from, kept so the sidebar can say whose rule it
+    /// is. `None` for one typed by hand, and for every project saved before this existed --
+    /// which is why it is optional rather than defaulted to `Project`: "no idea" and "the
+    /// project's own" are different answers, and only one of them is true.
+    ///
+    /// Provenance, not identity: `same_rule` ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,7 +111,26 @@ impl FilterRule {
             value: value.into(),
             action: action.into(),
             enabled: true,
+            origin: None,
         }
+    }
+
+    /// Tag this rule with the library it came from.
+    pub fn from_library(mut self, origin: Origin) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    /// Whether two rules filter the same way. Ignores `origin`: the same rule picked from
+    /// two different tiers is one rule, and adding it twice would be a duplicate, not a
+    /// second opinion.
+    pub fn same_rule(&self, other: &Self) -> bool {
+        self.log_schema == other.log_schema
+            && self.field == other.field
+            && self.op == other.op
+            && self.value == other.value
+            && self.action == other.action
+            && self.enabled == other.enabled
     }
 
     pub fn for_log_schema(mut self, log_schema: impl Into<String>) -> Self {
@@ -874,6 +902,32 @@ fn common_subsequence<'a>(left: &[&'a str], right: &[&'a str]) -> Vec<&'a str> {
         }
     }
     out
+}
+
+/// Save one filter into `folder` as its own JSON, returning where it landed.
+///
+/// The counterpart to saving a single schema: `X` on a filter puts it in the user library so
+/// every project can pick it up with `L`. A name already taken gets a `-2`, `-3` suffix
+/// rather than overwriting -- two different rules can reasonably describe themselves the
+/// same way, and silently replacing the older one would lose it.
+pub fn save_filter_file(file: &FilterFile, folder: &Path) -> io::Result<PathBuf> {
+    let body = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
+    write_library_file(folder, &sanitize_file_component(&file.name), &body)
+}
+
+/// Write `body` to `folder/<stem>.json`, stepping the name aside if it is taken.
+pub(crate) fn write_library_file(folder: &Path, stem: &str, body: &str) -> io::Result<PathBuf> {
+    fs::create_dir_all(folder)?;
+    let stem = if stem.is_empty() { "item" } else { stem };
+    let mut path = folder.join(format!("{stem}.json"));
+    for suffix in 2..100 {
+        if !path.exists() {
+            break;
+        }
+        path = folder.join(format!("{stem}-{suffix}.json"));
+    }
+    fs::write(&path, body)?;
+    Ok(path)
 }
 
 pub fn export_filters_to_folder(filter_set: &FilterSet, folder: &Path) -> io::Result<usize> {

@@ -13,7 +13,8 @@ Built with Rust, [Ratatui](https://ratatui.rs), and Crossterm.
 [Filter Builder](#filter-builder) · [Timeline](#timeline) ·
 [Filters](#filters-text-and-time) · [Search](#search-query-language) ·
 [Hiding by Example](#hiding-by-example) · [AI Assistant](#ai-assistant) ·
-[Log Formats](#log-formats) · [Building from Source](#building-from-source) ·
+[Log Formats](#log-formats) · [Library](#library-schemas-filters-and-searches) ·
+[Hubs](#hubs-shared-remote-libraries) · [Building from Source](#building-from-source) ·
 [Development](#development) · [Releasing](#releasing)
 
 New to the code? Read [Concept Model](#concept-model) then [Architecture](#architecture) —
@@ -36,6 +37,11 @@ together they explain what the app is built out of and how the pieces fit and ru
 - **Validated schemas.** A log format can carry sample lines with their expected level.
   A format that matches a sample but extracts the wrong value is rejected when it is
   defined or imported, rather than quietly mis-parsing your logs.
+- **Hubs.** Shared libraries of schemas, filters and saved searches, published as ordinary
+  GitHub repos. The official hub is configured out of the box and refreshes in the
+  background daily, so new schemas arrive without a release — and the bundled copies keep
+  working offline. Add your team's own; items are namespaced `<hub>/<name>`, so hubs never
+  collide, and your own schemas always win.
 - **Elapsed time.** Press `T` on a line to measure every other line from it: the
   timestamp column becomes `+1m56.531s`, `-28.812s`.
 - **One operation model.** `Space` selects or deselects whatever the cursor is on —
@@ -138,13 +144,17 @@ logscout -f /var/log/app.log
 logscout -f app.log -f errors.log
 ```
 
-Two side commands stand apart from opening logs:
+A few side commands stand apart from opening logs:
 
 ```bash
 logscout version                                        # print the version
 logscout config set --provider anthropic --api-key ...  # set up the AI assistant once
 logscout config list                                    # show the current AI settings
+logscout hub list                                       # the shared libraries you have
+logscout hub add acme/log-scouter-hub                   # add a team's hub and sync it
 ```
+
+See [Hubs](#hubs-shared-remote-libraries) for the rest of `logscout hub`.
 
 Pipe any command's output straight into logscout as a live source with `-i` (Linux/macOS):
 
@@ -269,6 +279,8 @@ src/
     models.rs      LogFileModel (one source or a merged view), LogEntry, ViewModel
     filters.rs     FilterRule / FilterSet, the include/exclude engine, user dirs
     search.rs      the query language: compile a string to a Query, then match entries
+    hub.rs         remote shared libraries: hubs.json, tarball sync, namespaced loading
+    library.rs     Origin (project/user/hub/bundled) and the tagged items pickers show
     project.rs     the Project: sources, formats, filters, searches, session; JSON persist
   tui/           Ratatui application — one big AppState in mod.rs
   ai/            the AI assistant (see below)
@@ -295,8 +307,8 @@ and selection — which the pane renders. A **merged view** interleaves several 
 timestamp into one synthetic `LogFileModel`; each entry remembers its origin so it is still
 parsed by its own format.
 
-**The AI assistant bridges sync and async.** The chat cannot block the render loop on a
-network call, so the model request is the *only* thing that leaves the main thread:
+**The AI assistant bridges sync and async.** The chat cannot block the render loop on an
+open-ended model call, so it moves off the main thread:
 
 ```text
 main thread (TUI, owns all state)          worker thread (owns a tokio runtime + reqwest)
@@ -319,10 +331,21 @@ captured JSON in `tests/ai.rs` with no network. `ai/tools.rs` declares the tool 
 model sees; `ai/config.rs` handles provider/model/key resolution and `~/.log-scouter/ai.json`;
 `ai/skills.rs` reads the user's markdown skills.
 
+**A hub sync runs on whichever side of that line it belongs.** A sync the user *asked* for
+(the Hubs prompt) blocks the frame: `core/hub.rs` builds a short-lived tokio runtime, the
+client carries a 30-second timeout, and a handful of small JSON files finishes fast enough
+that a worker thread — a second channel, generations, a spinner — would buy nothing. The
+**start-up refresh** cannot block, so it does not: `spawn_sync` hands the stale hubs to a
+one-shot thread, and `drain_hub_events` picks up the outcomes each loop and rebuilds the
+schema library. It is best-effort throughout — no home directory, no network, an unwritable
+`hubs.json`, a hub that 404s each leave the app exactly as it would have been, on whatever
+is already cached.
+
 **Persistence** is centralized in `<project>/.logscouter/project.json` (sources, formats,
 filters, saved searches, settings, last session), with user-level libraries under
-`~/.log-scouter/` for filter packs (`filters/`), schema packs (`schemas/`), AI config
-(`ai.json`), and AI skills (`skills/`).
+`~/.log-scouter/` for filter packs (`filters/`), schema packs (`schemas/`), saved searches
+(`searches/`), hubs (`hubs.json` plus cached snapshots in `hubs/`), AI config (`ai.json`),
+and AI skills (`skills/`).
 
 ## Keys
 
@@ -346,7 +369,7 @@ filters, saved searches, settings, last session), with user-level libraries unde
 | `f` / `t` | guided filter builder / open the time range picker |
 | `T` | measure elapsed time from the current line (again to turn off) |
 | `Enter` (source) | edit the log source name, description, tag, and schema |
-| `L` / `X` | load / save the selected schema, filters, bookmarks, or saved search library |
+| `L` / `X` | pick the selected row's schema / filter / saved search out of the library, or save it into the library |
 | `H` | hide logs like the selection, using fields from the log format |
 | `i` (pane) | infer a schema from the selected lines and append it to the source's set |
 | `Space` (hide menu) | pick a field; `Enter` ANDs the picks into one regex |
@@ -906,18 +929,99 @@ nothing to install:
 | `Log4j2 Default` | The Log4j2 / Logback `%d [%t] %-5level %logger{36} - %msg` pattern |
 
 They are ordinary library schemas, not built-ins: they never enter `project.json`, and they sit
-*below* both `.logscouter/schemas` and `~/.log-scouter/schemas` in precedence. So a schema of
-yours with the same name always wins, and upgrading log-scouter cannot change how a log you
-already have a schema for is parsed. All of them fold Java stack traces into the line above.
+*below* `.logscouter/schemas`, `~/.log-scouter/schemas` and any [hub](#hubs-shared-remote-libraries)
+in precedence. So a schema of yours with the same name always wins, and upgrading log-scouter
+cannot change how a log you already have a schema for is parsed. All of them fold Java stack traces into the line above.
 
-The JSON lives in [`schemas/`](schemas/) in this repo, in the same shape as a user library file —
-to propose one, copy an existing file and add it to `BUNDLED_SCHEMA_FILES` in
-`src/core/extractor.rs`. Each must carry `samples`, which the test suite validates.
+The JSON lives in [`schemas/`](schemas/) in this repo, in the same shape as a user library file.
+The same five are published in the
+[official hub](#the-official-hub-and-the-bundled-schemas), which takes precedence once synced —
+the bundle is the offline floor, the hub is how a fix ships without a release.
+
+To propose a schema, open a PR against
+[log-scouter-hub](https://github.com/mangosteen-lab/log-scouter-hub); it reaches users within
+a day. Bundling it as well means adding it to `BUNDLED_SCHEMA_FILES` in
+`src/core/extractor.rs`, which is worth it only for formats common enough to want offline.
+Either way it must carry `samples`, which the test suite validates.
 
 Select a source in the sidebar and press `Enter` to edit its short name, description,
 tag, and schema. In the schema row, press `e` to edit the schema manually, `i` to infer it
-with the configured LLM, `L` to load one from the user schema library, or `X` to save the
-current schema to that library.
+with the configured LLM, `L` to load one from the schema library, or `X` to save the
+current schema to the user library.
+
+`L` offers **everything the project can resolve by name**: its own `.logscouter/schemas`,
+your `~/.log-scouter/schemas`, every enabled [hub](#hubs-shared-remote-libraries), and the
+bundled formats — the same set, in the same precedence order, that detection picks from.
+Each row is tagged with where it came from:
+
+```text
+┌Schema Library  Enter apply  Esc cancel───────────────────────────────────┐
+│> [User]         Nginx Access Log     Nginx combined access log           │
+│  [Hub official] Spring Boot          Spring Boot 2.x default pattern     │
+│  [Hub acme]     Gateway-Access       our edge logs                       │
+│  [Bundled]      Tomcat Catalina      catalina.out via JULI               │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+## Library: schemas, filters and searches
+
+Schemas, filters and saved searches all work the same way. On any of them in the sidebar:
+
+| Key | Does |
+|---|---|
+| `L` | Pick one out of the library — every tier, tagged with where it came from |
+| `X` | Save the selected one **into** your `~/.log-scouter` library, so every project can pick it up |
+
+`L` works on an empty section too: with no saved searches yet, `L` on the `Saved Searches`
+heading (or its `none` hint) still opens the search library — that is how you get your
+first one.
+
+The origin tag is the point: two tiers can offer a `Hide TRACE`, and the tag is what tells
+them apart. The same tag then follows the item **after** you pick it — the sidebar says
+whose rule each one is, and a source's schema row says which `Spring Boot` is parsing it:
+
+```text
+Filters
+  Text
+    * [Hub official] exclude level equals 'Trace'
+    * [User]         include level equals 'ERROR'
+    * exclude message contains 'healthz'      <- typed by hand: no tag, because
+Saved Searches                                   nothing claims to know where it came from
+    * [Hub official] /level=Error
+```
+
+A picked filter or search records its origin in `project.json`; one you typed carries no tag
+rather than a guessed one. Schemas need no such record — they resolve by name, so the tag is
+read live from the library and follows the copy that actually wins:
+
+| Tag | Means |
+|---|---|
+| `[Project]` | This project — `.logscouter/schemas`, or saved into `project.json` |
+| `[User]` | Your `~/.log-scouter/<kind>` |
+| `[Hub xxx]` | The hub named `xxx` |
+| `[Bundled]` | A third-party format shipped in the binary |
+| `[Built-in]` | `Generic line` / `Bracketed default` — structural, in every project |
+| *(none)* | You made it here, by hand |
+
+```text
+┌Filter Library  Enter add  Esc cancel─────────────────────────────────────┐
+│> [Project]      Hide TRACE      drop trace noise                         │
+│  [Hub official] Hide TRACE      Drop TRACE-level lines: the noisiest      │
+│  [Hub official] Errors only     Keep only ERROR lines.                   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+Picking a filter or a search **copies** it into the project, so it is yours from then on and
+survives the hub going away. Picking a schema references it by name — see
+[the hub notes](#names-across-hubs) for what that means when a hub is removed.
+
+The tiers are gathered fresh each time you press `L`, so a hub synced mid-session shows up
+without a restart. Filters and searches are not deduped across tiers: two offering the same
+name are two things you may want to choose between.
+
+For the bulk, folder-at-a-time route — export the whole filter set, import a whole pack —
+use the command palette's `Import / Export ... pack` commands, which still take a folder
+path (and accept `hub:<name>`).
 
 ```text
 name | expression | [timestamp strptime format] | [description] | [entry start regex] | [entry end regex]
@@ -1013,7 +1117,8 @@ of the grouped entries to win, because continuation lines and block records are 
 the score is evaluated. The status bar names the format that was chosen.
 
 Candidates are gathered from, in order: the **project's own schema library**
-(`<project>/.logscouter/schemas`), the **user library** (`~/.log-scouter/schemas`), and the
+(`<project>/.logscouter/schemas`), the **user library** (`~/.log-scouter/schemas`), each
+enabled **[hub](#hubs-shared-remote-libraries)** in configured order, and the
 **built-in** formats — so a schema you saved once is picked up automatically, without loading
 it by hand. A schema chosen from a library is referenced by name, not copied into
 `project.json`; it is re-resolved from the library each time the project opens (so editing the
@@ -1118,7 +1223,184 @@ parses. Rename the incoming schema if you mean to replace one. A schema whose `f
 does not compile is reported at import rather than failing on the first log line.
 
 Importing a schema does not assign it to anything; press `Enter` on a file in the sidebar,
-move to the schema row, then press `L` to apply one from the user library.
+move to the schema row, then press `L` to apply one from the library. You do not have to
+import a schema to apply it — `L` lists the whole library, hub and bundled schemas included.
+Importing copies one into `project.json`, which is how you keep it if the hub goes away.
+
+## Hubs: shared remote libraries
+
+A **hub** is an ordinary GitHub repo that publishes schemas, filters and saved searches for
+a team to share.
+
+Every install comes configured with the **official hub**,
+[`mangosteen-lab/log-scouter-hub`](https://github.com/mangosteen-lab/log-scouter-hub), and
+refreshes it in the background at most once a day. That is how a new or fixed schema reaches
+you without waiting for a release. It is the same JSON the binary already bundles, so the
+sync is an *update channel*, not a dependency: see
+[the official hub](#the-official-hub-and-the-bundled-schemas) for what that means offline,
+and [auto-sync](#auto-sync-and-turning-it-off) to turn it off.
+
+A hub is laid out exactly like the user-level library:
+
+```text
+log-scouter-hub/
+  schemas/*.json      # same shape as an exported schema
+  filters/*.json      # same shape as an exported filter pack
+  searches/*.json     # same shape as an exported saved-search library
+```
+
+Anything else in the repo — README, CI config — is ignored, so a hub can be a normal repo
+with docs. To publish one, export what you have (`X` on schemas, filters or searches) into
+those folders and push.
+
+Open the palette (`Ctrl+P`) and pick **Hubs** to manage them:
+
+| Prompt | Does |
+|---|---|
+| `add acme/log-scouter-hub` | Add a hub and sync it immediately |
+| `add acme/hub as ops` | Add it under a name you choose |
+| `sync` / `sync acme` | Refresh every hub, or one |
+| `remove acme` | Forget a hub and delete its cache |
+| `disable acme` / `enable acme` | Keep it configured but contribute nothing |
+| `auto-sync on` / `auto-sync off` | Refresh stale hubs on start, or never |
+| *(empty)* | List the configured hubs |
+
+The repo can be `owner/repo`, an HTTPS URL, an SSH URL, or a `/tree/<branch>` URL to pin a
+branch. Without a branch a hub tracks the repo's default branch. A private hub needs a token
+in `LOGSCOUT_HUB_TOKEN` or `GITHUB_TOKEN`.
+
+### From the command line
+
+The same operations, without opening the TUI — for scripts, dotfiles, and provisioning:
+
+```bash
+logscout hub                              # same as `hub list`
+logscout hub list                         # what you have, what it holds, when it synced
+logscout hub add acme/log-scouter-hub     # add and sync now
+logscout hub add acme/hub --name ops      # add under a name you choose
+logscout hub sync                         # refresh every hub
+logscout hub sync acme                    # refresh one
+logscout hub remove acme                  # forget it and delete its cache
+logscout hub disable acme                 # keep it, contribute nothing
+logscout hub enable acme
+logscout hub auto-sync off                # or `on`
+```
+
+`logscout hub list` prints one line per hub:
+
+```text
+official [mangosteen-lab/log-scouter-hub] — 5 schema(s), 4 filter(s), 5 search(es), synced 2026-07-17
+teamhub [acme/hub] — 3 schema(s), 0 filter(s), 2 search(es), disabled
+
+Auto-sync: stale hubs refresh on start, at most daily.
+Configured in /home/you/.log-scouter/hubs.json
+```
+
+Failures exit non-zero (an unknown hub, a repo that will not fetch), so a provisioning step
+notices instead of quietly reporting success.
+
+### Where hub content lives
+
+Configured hubs are listed in `~/.log-scouter/hubs.json`; syncing downloads the repo over
+HTTPS and unpacks those three folders into a cache of its own:
+
+```text
+~/.log-scouter/
+  schemas/     <- yours, never written to by a sync
+  filters/
+  searches/
+  hubs.json    <- the hub list
+  hubs/
+    acme/      <- a synced snapshot, replaced whole on each sync
+```
+
+Sync never writes into the folders you maintain by hand, so re-syncing or removing a hub
+cannot destroy your work. A sync replaces the snapshot whole: a schema deleted upstream
+stops being offered. A failed sync leaves the previous snapshot in place.
+
+### The official hub and the bundled schemas
+
+The five schemas in [`schemas/`](schemas/) are compiled into the binary **and** published in
+the official hub. The two copies play different roles:
+
+| | Role |
+|---|---|
+| Bundled in the binary | The **offline floor**. Works on a first run, with no network, forever. |
+| Official hub | The **update channel**. Once synced, its copies take precedence. |
+
+So an air-gapped install still parses Spring Boot and Tomcat logs on day one, and a schema
+fixed in the hub reaches everyone else within a day without a release.
+
+Unlike third-party hubs, the official hub's items are **not** namespaced: its `Spring Boot`
+*is* `Spring Boot`, shadowing the bundled copy from one tier up rather than appearing beside
+it as a second entry. That is what keeps a `project.json` that already references
+`Spring Boot` resolving to the fresher copy. Precedence is unchanged — your own schemas
+still win:
+
+```text
+.logscouter/schemas  →  ~/.log-scouter/schemas  →  official hub  →  bundled
+```
+
+Nothing about it is special-cased beyond that. `remove official` works and **sticks** — a
+later start will not add it back — and `add mangosteen-lab/log-scouter-hub` restores it.
+
+### Auto-sync and turning it off
+
+On start, log-scouter refreshes any enabled hub whose cache is over a day old, on a
+background thread. It never blocks the UI, and a failure is silent: the cache you already
+have keeps working, so a flaky network or a plane just means slightly older schemas. New
+schemas appear as soon as the refresh lands, without a restart.
+
+To stop log-scouter from reaching the network on start:
+
+```bash
+LOGSCOUT_NO_HUB_SYNC=1 logscout        # per run, or export it
+```
+
+or persistently, from the Hubs prompt:
+
+```text
+auto-sync off
+```
+
+Either way hubs still refresh when you ask for them with `sync`. The environment variable
+wins over the setting, and the prompt says so when both are in play. Turning auto-sync off
+does not un-configure the official hub — it stays listed, ready for a manual `sync`.
+
+### Names across hubs
+
+Every item a hub provides is namespaced `<hub>/<name>`. Two hubs shipping a
+`Gateway-Access` schema give you `acme/Gateway-Access` and `ops/Gateway-Access` — both
+visible, both usable, neither silently shadowing the other, and neither colliding with a
+local `Gateway-Access` of your own.
+
+Precedence decides which schema **detects** a log first, and hubs slot in between your
+schemas and the bundled ones:
+
+```text
+.logscouter/schemas  →  ~/.log-scouter/schemas  →  hubs, in configured order  →  bundled
+```
+
+So your own schemas always win, and reordering `hubs.json` reorders the hubs. Hub schemas
+join detection as soon as they sync — nothing to import.
+
+Filters and saved searches are copied into a project rather than detected, so you import
+them when you want them: use `hub:<name>` as the folder in any import prompt.
+
+```text
+Import filter pack   →  hub:acme
+Import saved-search  →  hub:acme
+```
+
+They arrive namespaced too, and import merges without overwriting what a project already
+has. Filters and searches already imported stay if the hub is later removed — they were
+copied in, and dropping a hub is not a reason to undo your work.
+
+Schemas are the exception, because a source references a library schema *by name* rather
+than copying it. A source parsed by `acme/Spring-Boot` falls back to the default schema if
+that hub is removed or disabled, exactly as it would for any library schema that disappears.
+To keep one for good, import it into the project (`I` on the schema library, or `hub:acme`)
+before removing the hub.
 
 ## Performance
 
@@ -1155,9 +1437,11 @@ stored with a first-class list of specific log source ids.
 
 ## Filter Export/Import
 
-Press `x` to export the project's filters and `L` to import a folder of exported
-filters (merged into the project, skipping duplicates). Both default to the
-user-level library, shared by every project:
+On a filter in the sidebar, `L` picks one out of the [library](#library-schemas-filters-and-searches)
+and `X` saves that filter into your user library. This section covers the **bulk** route
+instead: the palette's `Import filter pack` / `Export filter pack`, which move a whole
+folder's worth at once (imports merge, skipping duplicates). Both default to the user-level
+library, shared by every project:
 
 ```text
 ~/.log-scouter/filters
