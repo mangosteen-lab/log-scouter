@@ -1,6 +1,6 @@
 [package]
 name = "log-scouter"
-version = "0.0.17"
+version = "0.0.18"
 edition = "2021"
 description = "A keyboard-driven Rust TUI for browsing, filtering, extracting, and searching large server logs."
 license = "MIT"
