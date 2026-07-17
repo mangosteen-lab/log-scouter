@@ -85,7 +85,8 @@ enum HubCommand {
     /// List the configured hubs: what each holds and when it last synced.
     List,
     /// Add a hub and sync it now: `logscout hub add acme/log-scouter-hub`. Accepts
-    /// owner/repo, an HTTPS or SSH URL, or a /tree/<branch> URL to pin a branch.
+    /// owner/repo (GitHub), or an HTTP(S)/SSH URL to any GitHub, GitLab or Gitea host.
+    /// A /tree/<branch> URL pins a branch.
     Add {
         /// The repo to track.
         repo: String,

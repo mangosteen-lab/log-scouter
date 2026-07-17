@@ -38,10 +38,10 @@ together they explain what the app is built out of and how the pieces fit and ru
   A format that matches a sample but extracts the wrong value is rejected when it is
   defined or imported, rather than quietly mis-parsing your logs.
 - **Hubs.** Shared libraries of schemas, filters and saved searches, published as ordinary
-  GitHub repos. The official hub is configured out of the box and refreshes in the
-  background daily, so new schemas arrive without a release — and the bundled copies keep
-  working offline. Add your team's own; items are namespaced `<hub>/<name>`, so hubs never
-  collide, and your own schemas always win.
+  git repos — GitHub, or your own GitLab or Gitea. The official hub is configured out of the
+  box and refreshes in the background daily, so new schemas arrive without a release — and
+  the bundled copies keep working offline. Add your team's own; items are namespaced
+  `<hub>/<name>`, so hubs never collide, and your own schemas always win.
 - **Elapsed time.** Press `T` on a line to measure every other line from it: the
   timestamp column becomes `+1m56.531s`, `-28.812s`.
 - **One operation model.** `Space` selects or deselects whatever the cursor is on —
@@ -1272,8 +1272,9 @@ Importing copies one into `project.json`, which is how you keep it if the hub go
 
 ## Hubs: shared remote libraries
 
-A **hub** is an ordinary GitHub repo that publishes schemas, filters and saved searches for
-a team to share.
+A **hub** is an ordinary git repo that publishes schemas, filters and saved searches for a
+team to share — on GitHub, or on a self-hosted **GitLab** or **Gitea**, which is usually
+where a team's own logs knowledge lives.
 
 Every install comes configured with the **official hub**,
 [`mangosteen-lab/log-scouter-hub`](https://github.com/mangosteen-lab/log-scouter-hub), and
@@ -1308,9 +1309,39 @@ Open the palette (`Ctrl+P`) and pick **Hubs** to manage them:
 | `auto-sync on` / `auto-sync off` | Refresh stale hubs on start, or never |
 | *(empty)* | List the configured hubs |
 
-The repo can be `owner/repo`, an HTTPS URL, an SSH URL, or a `/tree/<branch>` URL to pin a
-branch. Without a branch a hub tracks the repo's default branch. A private hub needs a token
-in `LOGSCOUT_HUB_TOKEN` or `GITHUB_TOKEN`.
+The repo can be `owner/repo` (GitHub), an HTTP(S) URL, an SSH URL, or a `/tree/<branch>` URL
+to pin a branch. Without a branch a hub tracks the repo's default branch.
+
+### Self-hosted hubs, and tokens
+
+Any GitHub, GitLab or Gitea host works — a bare `owner/repo` still means GitHub:
+
+```bash
+logscout hub add acme/log-scouter-hub                          # GitHub
+logscout hub add https://gitlab.example.com/team/sub/hub       # GitLab, groups and all
+logscout hub add http://git.internal/qhu/logs-hub.git          # self-hosted, http is fine
+logscout hub add git@gitlab.example.com:team/hub.git           # an SSH remote, fetched over HTTPS
+```
+
+log-scouter recognises `github.com` by name. Any other host it identifies **by asking it** —
+trying each forge's archive URL and keeping the one that answers — then remembers the answer
+in `hubs.json`, so later syncs go straight there. (It cannot ask GitLab's API instead: a
+self-hosted GitLab returns 401 for an anonymous `/api/v4/version`, while happily serving a
+public repo's tarball.)
+
+A private hub needs a token, and **each token only ever goes to its own kind of host**:
+
+| Variable | Sent to | As |
+|---|---|---|
+| `GITHUB_TOKEN` | GitHub only | `Authorization: Bearer` |
+| `GITLAB_TOKEN` | GitLab only | `PRIVATE-TOKEN` |
+| `GITEA_TOKEN` | Gitea only | `Authorization: token` |
+| `LOGSCOUT_HUB_TOKEN` | whichever host the hub is on | that host's header |
+
+The scoping matters: `GITHUB_TOKEN` is set automatically all over CI, and a hub URL is
+something a user types — sending it to an arbitrary host would hand that host a GitHub
+credential. Use `LOGSCOUT_HUB_TOKEN` only when all your hubs are on one host; otherwise
+prefer the per-forge variables.
 
 ### From the command line
 

@@ -1,6 +1,7 @@
 //! Hubs: remote libraries of schemas, filters and saved searches.
 //!
-//! A hub is an ordinary GitHub repo laid out like the user-level library:
+//! A hub is an ordinary git repo -- on GitHub, or a self-hosted GitLab or Gitea -- laid out
+//! like the user-level library:
 //!
 //! ```text
 //! <repo>/
@@ -10,7 +11,9 @@
 //! ```
 //!
 //! Configured hubs live in `~/.log-scouter/hubs.json`; syncing one downloads the repo
-//! tarball over HTTPS and unpacks those three folders into `~/.log-scouter/hubs/<name>/`.
+//! tarball over HTTP(S) and unpacks those three folders into `~/.log-scouter/hubs/<name>/`.
+//! Each forge serves that tarball from its own URL and wants its token in its own header
+//! (`Forge`); a host we do not recognise is identified once, by asking it, and remembered.
 //! That cache is a *read-only tier of its own*, below the project and the user's own
 //! `~/.log-scouter/{schemas,filters,searches}` -- sync never writes into the folders the
 //! user hand-maintains, so re-syncing or removing a hub cannot destroy their work.
@@ -94,6 +97,10 @@ pub struct Hub {
     /// release. Third-party hubs stay namespaced, so they still cannot collide.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub official: bool,
+    /// The kind of host this hub is on, learned on the first successful sync and kept so
+    /// later syncs go straight to the right URL instead of probing again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<Forge>,
 }
 
 fn default_enabled() -> bool {
@@ -258,6 +265,7 @@ impl HubConfig {
             enabled: true,
             last_synced: None,
             official: true,
+            forge: Some(Forge::GitHub),
         });
         true
     }
@@ -336,6 +344,8 @@ pub fn add_and_sync(
         enabled: true,
         last_synced: None,
         official,
+        // Unknown for a host we do not recognise; the first sync settles it.
+        forge: parsed.forge,
     };
     config.add(hub.clone())?;
 
@@ -410,8 +420,8 @@ pub fn repo_is_official(url: &str) -> bool {
     let (Ok(parsed), Ok(official)) = (parse_repo(url), parse_repo(OFFICIAL_HUB_REPO)) else {
         return false;
     };
-    parsed.owner.eq_ignore_ascii_case(&official.owner)
-        && parsed.repo.eq_ignore_ascii_case(&official.repo)
+    parsed.host.eq_ignore_ascii_case(&official.host)
+        && parsed.path.eq_ignore_ascii_case(&official.path)
 }
 
 /// Whether the environment forbids the start-up sync.
@@ -448,94 +458,190 @@ pub fn spawn_sync(hubs: Vec<Hub>) -> std::sync::mpsc::Receiver<SyncOutcome> {
     rx
 }
 
-/// A GitHub repo reference parsed out of whatever the user typed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoRef {
-    pub owner: String,
-    pub repo: String,
-    /// Only set when the URL itself named one (`/tree/<branch>`).
-    pub branch: Option<String>,
+/// The kind of git host a hub lives on. Each one serves repo tarballs from a different URL
+/// and wants its token in a different header; nothing else about a hub depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Forge {
+    GitHub,
+    GitLab,
+    Gitea,
 }
 
-impl RepoRef {
-    /// The name a hub gets when the user does not choose one.
-    pub fn default_hub_name(&self) -> String {
-        sanitize_file_component(&self.repo)
-    }
+/// The forges to try, in order, for a host we have not identified yet. `GitHub` is not in
+/// the list: it is recognised by hostname, and its API is not something a self-hosted GitLab
+/// or Gitea will answer to.
+const PROBE_ORDER: &[Forge] = &[Forge::GitLab, Forge::Gitea];
 
-    /// GitHub's tarball endpoint. With no branch, `HEAD` gives the default branch, so a
-    /// hub tracking a repo that renames `master` to `main` keeps working.
-    pub fn tarball_url(&self, branch: Option<&str>) -> String {
-        match branch {
-            Some(branch) => format!(
-                "https://codeload.github.com/{}/{}/tar.gz/refs/heads/{branch}",
-                self.owner, self.repo
-            ),
-            None => format!(
-                "https://codeload.github.com/{}/{}/tar.gz/HEAD",
-                self.owner, self.repo
-            ),
+impl Forge {
+    pub fn label(self) -> &'static str {
+        match self {
+            Forge::GitHub => "github",
+            Forge::GitLab => "gitlab",
+            Forge::Gitea => "gitea",
         }
     }
 }
 
-/// Parse `owner/repo`, `https://github.com/owner/repo[.git][/tree/branch]`, or
-/// `git@github.com:owner/repo.git`.
+/// A repo on some git host, parsed out of whatever the user typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRef {
+    /// `https` unless the user explicitly asked for `http`.
+    pub scheme: String,
+    pub host: String,
+    /// Everything between the host and the branch, `.git` stripped: `owner/repo`, or a
+    /// GitLab group path like `team/sub/repo`.
+    pub path: String,
+    /// Only set when the URL itself named one (`/tree/<branch>`, or GitLab's `/-/tree/`).
+    pub branch: Option<String>,
+    /// The forge, when the URL settles it. `None` means "ask the host" -- see `sync_hub`.
+    pub forge: Option<Forge>,
+}
+
+impl RepoRef {
+    /// The repo's own name: the last path segment.
+    pub fn repo(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+
+    /// The name a hub gets when the user does not choose one.
+    pub fn default_hub_name(&self) -> String {
+        sanitize_file_component(self.repo())
+    }
+
+    /// Where `forge` serves this repo's tarball.
+    ///
+    /// With no branch every forge here resolves `HEAD` to the default branch, so a hub
+    /// tracking a repo that renames `master` to `main` keeps working.
+    pub fn tarball_url(&self, forge: Forge, branch: Option<&str>) -> String {
+        let reference = branch.unwrap_or("HEAD");
+        match forge {
+            // codeload wants a full ref for a branch, but takes a bare `HEAD`.
+            Forge::GitHub => {
+                let path = match branch {
+                    Some(branch) => format!("refs/heads/{branch}"),
+                    None => "HEAD".to_string(),
+                };
+                format!("https://codeload.github.com/{}/tar.gz/{path}", self.path)
+            }
+            // The file name at the end is cosmetic; GitLab serves the archive whatever it says.
+            Forge::GitLab => format!(
+                "{}://{}/{}/-/archive/{reference}/{}-{reference}.tar.gz",
+                self.scheme,
+                self.host,
+                self.path,
+                self.repo()
+            ),
+            Forge::Gitea => format!(
+                "{}://{}/{}/archive/{reference}.tar.gz",
+                self.scheme, self.host, self.path
+            ),
+        }
+    }
+
+    /// The forges worth trying for this repo, best first.
+    pub fn candidates(&self) -> Vec<Forge> {
+        match self.forge {
+            Some(forge) => vec![forge],
+            None => PROBE_ORDER.to_vec(),
+        }
+    }
+}
+
+const GITHUB_HOST: &str = "github.com";
+
+/// Parse `owner/repo`, an HTTP(S) URL, or an SSH URL, on GitHub or any self-hosted GitLab
+/// or Gitea.
+///
+/// A bare `owner/repo` means GitHub, which is what it has always meant. Anything with a host
+/// in it keeps that host: `github.com` is recognised by name, and any other host is left for
+/// `sync_hub` to identify by asking it for a tarball, since a self-hosted GitLab will not
+/// answer an unauthenticated `/api/v4/version` and so cannot be identified up front.
 pub fn parse_repo(input: &str) -> Result<RepoRef, String> {
     let text = input.trim();
     if text.is_empty() {
-        return Err("a hub needs a repo: owner/repo or a GitHub URL".to_string());
+        return Err("a hub needs a repo: owner/repo or a repo URL".to_string());
     }
 
-    let rest = if let Some(rest) = text.strip_prefix("git@github.com:") {
-        rest
-    } else if let Some(rest) = strip_https_host(text) {
-        rest
-    } else if text.contains("://") || text.contains('@') {
-        return Err(format!("only github.com hubs are supported, got '{text}'"));
-    } else {
-        text
-    };
+    let (scheme, host, rest) = split_location(text)?;
+    let forge = (host == GITHUB_HOST).then_some(Forge::GitHub);
 
     let rest = rest.trim_matches('/');
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     let parts: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
-    let (owner, repo) = match parts.as_slice() {
-        [owner, repo, ..] => (*owner, *repo),
-        _ => return Err(format!("not a repo: '{text}' (expected owner/repo)")),
-    };
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
 
-    // `/tree/<branch>` is how a browser URL names a branch. Anything deeper (a path into
-    // the tree) is not something a hub can be pinned to.
-    let branch = match parts.as_slice() {
-        [_, _, "tree", branch, ..] => Some((*branch).to_string()),
-        [_, _] => None,
-        _ => return Err(format!("not a repo: '{text}' (expected owner/repo)")),
+    // `/tree/<branch>` is how a browser names a branch; GitLab writes it `/-/tree/<branch>`.
+    // Anything after the branch is a path into the tree, which is not something to pin to.
+    let (path_parts, branch) = match parts
+        .iter()
+        .position(|part| *part == "-" || *part == "tree")
+    {
+        Some(index) => {
+            let branch = parts
+                .iter()
+                .skip(index)
+                .skip_while(|part| **part != "tree")
+                .nth(1)
+                .ok_or_else(|| format!("not a repo: '{text}' (expected owner/repo)"))?;
+            (&parts[..index], Some((*branch).to_string()))
+        }
+        None => (&parts[..], None),
     };
 
-    if owner.is_empty() || repo.is_empty() {
+    // Every forge here needs at least an owner and a repo; GitLab allows more in between.
+    if path_parts.len() < 2 {
         return Err(format!("not a repo: '{text}' (expected owner/repo)"));
     }
+    let path = path_parts.join("/");
+    let path = path.strip_suffix(".git").unwrap_or(&path).to_string();
+
     Ok(RepoRef {
-        owner: owner.to_string(),
-        repo: repo.to_string(),
+        scheme,
+        host,
+        path,
         branch,
+        forge,
     })
 }
 
-fn strip_https_host(text: &str) -> Option<&str> {
-    for prefix in [
-        "https://github.com/",
-        "http://github.com/",
-        "https://www.github.com/",
-        "github.com/",
-    ] {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            return Some(rest);
+/// Pull the scheme, host and remaining path out of the many ways a repo gets written down.
+fn split_location(text: &str) -> Result<(String, String, &str), String> {
+    // `git@host:path` and `ssh://git@host[:port]/path`: we cannot fetch over SSH, but the
+    // host and path are all we need to build an HTTPS archive URL.
+    if let Some(rest) = text.strip_prefix("ssh://") {
+        let rest = rest.split_once('@').map(|(_, rest)| rest).unwrap_or(rest);
+        let (authority, path) = rest
+            .split_once('/')
+            .ok_or_else(|| format!("not a repo: '{text}'"))?;
+        let host = authority.split(':').next().unwrap_or(authority);
+        return Ok(("https".to_string(), host.to_string(), path));
+    }
+    if let Some((authority, path)) = text.split_once(':') {
+        if !authority.contains('/') && !path.starts_with("//") {
+            let host = authority
+                .split_once('@')
+                .map(|(_, host)| host)
+                .unwrap_or(authority);
+            return Ok(("https".to_string(), host.to_string(), path));
         }
     }
-    None
+
+    for (prefix, scheme) in [("https://", "https"), ("http://", "http")] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = host.split_once('@').map(|(_, host)| host).unwrap_or(host);
+            return Ok((scheme.to_string(), host.to_string(), path));
+        }
+    }
+
+    // No scheme: either `host/owner/repo` or the bare `owner/repo` shorthand for GitHub.
+    // A first segment with a dot in it is a hostname; `owner.name/repo` is not a thing.
+    if let Some((maybe_host, path)) = text.split_once('/') {
+        if maybe_host.contains('.') && !maybe_host.ends_with(".git") {
+            return Ok(("https".to_string(), maybe_host.to_string(), path));
+        }
+    }
+    Ok(("https".to_string(), GITHUB_HOST.to_string(), text))
 }
 
 /// What a sync brought in, for the status line.
@@ -569,25 +675,77 @@ impl SyncReport {
 pub fn sync_hub(hub: &mut Hub) -> Result<SyncReport, String> {
     let repo = parse_repo(&hub.url)?;
     let branch = hub.branch.clone().or_else(|| repo.branch.clone());
-    let url = repo.tarball_url(branch.as_deref());
     let dest = hub_cache_dir(&hub.name)
         .ok_or_else(|| "no home directory: cannot cache a hub".to_string())?;
 
-    let tarball = fetch(&url, token().as_deref())?;
-    let report = unpack_hub(&tarball, &dest)?;
-    hub.last_synced = Some(chrono::Local::now().to_rfc3339());
-    Ok(report)
+    // Which forge is this? A hub that has synced before remembers. A new one on a host we
+    // do not recognise gets asked: try each candidate's archive URL and keep the one that
+    // answers with an archive. Identifying by probe rather than by an API version endpoint
+    // is what makes a self-hosted GitLab work -- it will not answer `/api/v4/version` to an
+    // anonymous request, but it will serve a public repo's tarball.
+    let candidates: Vec<Forge> = hub
+        .forge
+        .map(|forge| vec![forge])
+        .unwrap_or_else(|| repo.candidates());
+
+    let mut last_error = String::new();
+    for (index, forge) in candidates.iter().enumerate() {
+        let url = repo.tarball_url(*forge, branch.as_deref());
+        let token = token_for(*forge);
+        match fetch(&url, token.as_ref().map(|(k, v)| (*k, v.as_str()))) {
+            Ok(tarball) => {
+                let report = unpack_hub(&tarball, &dest)?;
+                hub.forge = Some(*forge);
+                hub.last_synced = Some(chrono::Local::now().to_rfc3339());
+                return Ok(report);
+            }
+            // Keep the first forge's error: it is the one the user most likely meant, and
+            // a later candidate's 404 is just "not that kind of host either".
+            Err(error) => {
+                if index == 0 {
+                    last_error = error;
+                }
+            }
+        }
+    }
+    Err(last_error)
 }
 
-/// The token to authenticate with, if the user has set one.
-fn token() -> Option<String> {
-    ["LOGSCOUT_HUB_TOKEN", "GITHUB_TOKEN"]
+/// The token to send to `forge`, if the user has set one, and the header it belongs in.
+///
+/// Scoped to the forge on purpose. `GITHUB_TOKEN` is set automatically all over CI, and a
+/// hub is a URL the user names: sending whatever `GITHUB_TOKEN` happens to be in the
+/// environment to an arbitrary host would hand that host a GitHub credential it has no
+/// business seeing. So each forge only ever reads its own variable.
+///
+/// `LOGSCOUT_HUB_TOKEN` is the exception: it is set by hand, for hubs, and goes to whichever
+/// host the hub is on. With hubs on more than one host, prefer the per-forge variables.
+fn token_for(forge: Forge) -> Option<(&'static str, String)> {
+    let specific = match forge {
+        Forge::GitHub => "GITHUB_TOKEN",
+        Forge::GitLab => "GITLAB_TOKEN",
+        Forge::Gitea => "GITEA_TOKEN",
+    };
+    let value = [specific, "LOGSCOUT_HUB_TOKEN"]
         .iter()
         .find_map(|key| std::env::var(key).ok())
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| !value.trim().is_empty())?;
+    // Each forge takes its token its own way; the wrong header is simply ignored, which
+    // looks exactly like a bad token.
+    let header = match forge {
+        Forge::GitHub => "Authorization",
+        Forge::GitLab => "PRIVATE-TOKEN",
+        Forge::Gitea => "Authorization",
+    };
+    let value = match forge {
+        Forge::GitHub => format!("Bearer {value}"),
+        Forge::GitLab => value,
+        Forge::Gitea => format!("token {value}"),
+    };
+    Some((header, value))
 }
 
-fn fetch(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
+fn fetch(url: &str, token: Option<(&str, &str)>) -> Result<Vec<u8>, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -600,8 +758,8 @@ fn fetch(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
             .map_err(|error| format!("could not build http client: {error}"))?;
 
         let mut request = client.get(url).header("User-Agent", "log-scouter");
-        if let Some(token) = token {
-            request = request.header("Authorization", format!("Bearer {token}"));
+        if let Some((header, value)) = token {
+            request = request.header(header, value);
         }
 
         let response = request
@@ -840,6 +998,17 @@ mod tests {
             enabled: true,
             last_synced: None,
             official: false,
+            forge: None,
+        }
+    }
+
+    fn github(path: &str) -> RepoRef {
+        RepoRef {
+            scheme: "https".into(),
+            host: "github.com".into(),
+            path: path.into(),
+            branch: None,
+            forge: Some(Forge::GitHub),
         }
     }
 
@@ -851,11 +1020,7 @@ mod tests {
 
     #[test]
     fn parses_the_shorthand_and_url_forms_of_a_repo() {
-        let expected = RepoRef {
-            owner: "acme".into(),
-            repo: "log-scouter-hub".into(),
-            branch: None,
-        };
+        let expected = github("acme/log-scouter-hub");
         for input in [
             "acme/log-scouter-hub",
             "https://github.com/acme/log-scouter-hub",
@@ -863,6 +1028,7 @@ mod tests {
             "https://github.com/acme/log-scouter-hub/",
             "github.com/acme/log-scouter-hub",
             "git@github.com:acme/log-scouter-hub.git",
+            "ssh://git@github.com/acme/log-scouter-hub.git",
         ] {
             assert_eq!(parse_repo(input).unwrap(), expected, "parsing {input}");
         }
@@ -873,30 +1039,130 @@ mod tests {
         let parsed = parse_repo("https://github.com/acme/hub/tree/stable").unwrap();
         assert_eq!(parsed.branch.as_deref(), Some("stable"));
         assert_eq!(
-            parsed.tarball_url(parsed.branch.as_deref()),
+            parsed.tarball_url(Forge::GitHub, parsed.branch.as_deref()),
             "https://codeload.github.com/acme/hub/tar.gz/refs/heads/stable"
         );
     }
 
-    /// No branch means HEAD, so a repo that renames its default branch keeps syncing.
+    /// No branch means HEAD, so a repo that renames its default branch keeps syncing. Every
+    /// forge here resolves HEAD the same way.
     #[test]
     fn no_branch_tracks_the_default_branch() {
         let parsed = parse_repo("acme/hub").unwrap();
         assert_eq!(
-            parsed.tarball_url(None),
+            parsed.tarball_url(Forge::GitHub, None),
             "https://codeload.github.com/acme/hub/tar.gz/HEAD"
+        );
+        let self_hosted = parse_repo("http://git.example.com/acme/hub").unwrap();
+        assert_eq!(
+            self_hosted.tarball_url(Forge::GitLab, None),
+            "http://git.example.com/acme/hub/-/archive/HEAD/hub-HEAD.tar.gz"
+        );
+        assert_eq!(
+            self_hosted.tarball_url(Forge::Gitea, None),
+            "http://git.example.com/acme/hub/archive/HEAD.tar.gz"
         );
     }
 
+    /// A hub on a self-hosted host: the host and scheme are kept, and the forge is left for
+    /// the first sync to settle by asking.
     #[test]
-    fn rejects_non_github_and_malformed_repos() {
-        for input in [
-            "",
-            "acme",
-            "https://gitlab.com/acme/hub",
-            "https://github.com/acme/hub/blob/main/schemas/a.json",
+    fn a_self_hosted_url_keeps_its_host_and_scheme() {
+        let parsed =
+            parse_repo("http://tec-l-1203160.labs.microstrategy.com/qhu/mstr-log-scouter-hub.git")
+                .unwrap();
+        assert_eq!(parsed.scheme, "http");
+        assert_eq!(parsed.host, "tec-l-1203160.labs.microstrategy.com");
+        assert_eq!(parsed.path, "qhu/mstr-log-scouter-hub");
+        assert_eq!(parsed.repo(), "mstr-log-scouter-hub");
+        assert_eq!(parsed.default_hub_name(), "mstr-log-scouter-hub");
+        assert_eq!(
+            parsed.forge, None,
+            "an unknown host is identified by asking it"
+        );
+        assert_eq!(parsed.candidates(), PROBE_ORDER.to_vec());
+        assert_eq!(
+            parsed.tarball_url(Forge::GitLab, None),
+            "http://tec-l-1203160.labs.microstrategy.com/qhu/mstr-log-scouter-hub\
+             /-/archive/HEAD/mstr-log-scouter-hub-HEAD.tar.gz"
+        );
+    }
+
+    /// GitLab nests groups, so a repo path can be deeper than `owner/repo`.
+    #[test]
+    fn a_gitlab_group_path_survives_intact() {
+        let parsed = parse_repo("https://gitlab.example.com/team/sub/hub").unwrap();
+        assert_eq!(parsed.path, "team/sub/hub");
+        assert_eq!(parsed.repo(), "hub");
+        assert_eq!(
+            parsed.tarball_url(Forge::GitLab, Some("main")),
+            "https://gitlab.example.com/team/sub/hub/-/archive/main/hub-main.tar.gz"
+        );
+    }
+
+    /// GitLab writes a browser branch URL `/-/tree/<branch>`.
+    #[test]
+    fn a_gitlab_tree_url_pins_its_branch() {
+        let parsed = parse_repo("https://gitlab.example.com/team/hub/-/tree/stable").unwrap();
+        assert_eq!(parsed.path, "team/hub");
+        assert_eq!(parsed.branch.as_deref(), Some("stable"));
+    }
+
+    /// An SSH remote names a host we can still fetch from over HTTPS.
+    #[test]
+    fn an_ssh_url_becomes_an_https_fetch() {
+        let parsed = parse_repo("ssh://git@git.example.com:22222/qhu/hub.git").unwrap();
+        assert_eq!(parsed.scheme, "https");
+        assert_eq!(
+            parsed.host, "git.example.com",
+            "the port is not part of the host"
+        );
+        assert_eq!(parsed.path, "qhu/hub");
+    }
+
+    /// A token belongs to the host it was issued for. `GITHUB_TOKEN` is set automatically
+    /// across CI, and a hub URL is user input: shipping it to whatever host a hub names
+    /// would hand out a GitHub credential.
+    #[test]
+    fn tokens_are_scoped_to_their_forge() {
+        // Not asserted against the environment -- these tests run in parallel and cannot own
+        // it -- but the mapping itself is the property that matters.
+        for (forge, expected_var, expected_header) in [
+            (Forge::GitHub, "GITHUB_TOKEN", "Authorization"),
+            (Forge::GitLab, "GITLAB_TOKEN", "PRIVATE-TOKEN"),
+            (Forge::Gitea, "GITEA_TOKEN", "Authorization"),
         ] {
+            if let Some((header, _)) = token_for(forge) {
+                assert_eq!(
+                    header, expected_header,
+                    "{expected_var} goes in {expected_header}"
+                );
+            }
+        }
+        // The forge picks its own variable, never another forge's.
+        assert_ne!(Forge::GitLab.label(), Forge::GitHub.label());
+    }
+
+    #[test]
+    fn rejects_malformed_repos() {
+        for input in ["", "acme", "https://github.com/", "https://gitlab.com/acme"] {
             assert!(parse_repo(input).is_err(), "should reject {input:?}");
+        }
+    }
+
+    /// A host other than github.com is a hub host now, not an error. This used to be
+    /// rejected outright, which is exactly what made a self-hosted GitLab unusable.
+    #[test]
+    fn any_git_host_is_accepted() {
+        for input in [
+            "https://gitlab.com/acme/hub",
+            "http://gitlab.internal/acme/hub",
+            "https://gitea.example.com/acme/hub",
+            "git@gitlab.example.com:acme/hub.git",
+        ] {
+            let parsed = parse_repo(input).unwrap_or_else(|error| panic!("{input}: {error}"));
+            assert_ne!(parsed.host, "github.com", "{input} keeps its own host");
+            assert_eq!(parsed.path, "acme/hub", "{input}");
         }
     }
 

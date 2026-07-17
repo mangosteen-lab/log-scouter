@@ -20428,6 +20428,7 @@ mod tests {
                 enabled: true,
                 last_synced: Some("2026-07-17T01:53:57-04:00".into()),
                 official: true,
+                forge: None,
             }),
             describe_hub(&Hub {
                 name: "acme".into(),
@@ -20436,6 +20437,7 @@ mod tests {
                 enabled: false,
                 last_synced: None,
                 official: false,
+                forge: None,
             }),
         ];
 
