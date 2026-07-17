@@ -1008,6 +1008,23 @@ fn add_file_detects_a_schema_from_the_disk_library() {
     assert_eq!(reloaded.get_file(&id).unwrap().extractor_name, "Nginx");
 }
 
+/// A library schema is referenced by name and never copied into the project, so a name check
+/// against `extractors` alone calls a perfectly good schema unknown.
+#[test]
+fn a_library_schema_name_resolves_as_a_known_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut project = Project::load(tmp.path());
+    project.library.clear();
+    project.library.push(nginx_schema());
+
+    assert!(!project.extractors.contains_key("Nginx"));
+    assert!(project.has_extractor("Nginx"));
+    assert_eq!(project.get_extractor("Nginx").name, "Nginx");
+
+    assert!(project.has_extractor(GENERIC_EXTRACTOR_NAME));
+    assert!(!project.has_extractor("Nothing named this"));
+}
+
 #[test]
 fn multi_schema_set_survives_a_project_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1751,7 +1768,7 @@ fn project_persists_live_sources() {
         ..LiveSourceConfig::default()
     };
     let file_id = project
-        .add_live_source(config.clone(), "docker api", None)
+        .add_live_source(config.clone(), "docker api", &[])
         .file_id
         .clone();
     {

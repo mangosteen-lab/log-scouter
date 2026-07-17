@@ -1006,9 +1006,15 @@ schemas are in the project (load them once with `L`; they persist).
 
 Edit the set from the source editor (`Enter` on a source): the schema set is listed one per
 row, numbered by priority. On a schema row, `L` adds another from the library, `d` removes the
-selected one (never the last), and `K`/`J` move it up or down to change the match priority.
-The set is saved with the project. A merged view still uses each contributing file's primary
+selected one, and `K`/`J` move it up or down to change the match priority. Removing the only
+schema leaves the source on the built-in `Generic line` fallback rather than on nothing. The
+set is saved with the project. A merged view still uses each contributing file's primary
 schema.
+
+This works the same for a piped or live source (`logscout -i`, `kubectl logs -f | logscout
+-i`): its editor lists the same schema rows and takes the same keys. Applying a set to a
+piped source re-groups the lines it has already captured — its stdin cannot be reopened, so
+the capture is never reloaded from the stream.
 
 The fastest way to add a schema for a format the set does not cover yet: **select the lines
 of that format in the pane (`Space`) and press `i`.** The LLM infers a schema from exactly

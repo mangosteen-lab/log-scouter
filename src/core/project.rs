@@ -251,6 +251,13 @@ impl Project {
         self.default_extractor_obj()
     }
 
+    /// Whether `get_extractor` resolves `name` to a real schema rather than falling back to the
+    /// default. Anything that validates a schema name typed or held by a source must ask this,
+    /// not `extractors` alone: a library schema is referenced by name and lives only on disk.
+    pub fn has_extractor(&self, name: &str) -> bool {
+        self.extractors.contains_key(name) || self.library.iter().any(|schema| schema.name == name)
+    }
+
     /// Every schema detection may pick from: the project's in-memory extractors (built-ins +
     /// saved) plus any library schema not shadowed by them. `detect`/`detect_all` rank by
     /// specificity, so a specific library schema still beats the generic built-ins.
@@ -362,11 +369,13 @@ impl Project {
         self.files.last_mut().expect("just pushed file")
     }
 
+    /// Register a live source parsed under an ordered schema set (each entry takes the first
+    /// schema that matches it). Empty names fall back to the default schema.
     pub fn add_live_source(
         &mut self,
         config: LiveSourceConfig,
         display_name: impl Into<String>,
-        extractor_name: Option<String>,
+        extractor_names: &[String],
     ) -> &mut LogFileModel {
         self.file_counter += 1;
         let file_id = format!("f{}", self.file_counter);
@@ -374,8 +383,12 @@ impl Project {
             .config_dir()
             .join(LIVE_DIR)
             .join(format!("{file_id}.log"));
-        let extractor_name = extractor_name.unwrap_or_else(|| GENERIC_EXTRACTOR_NAME.to_string());
-        let extractor = Some(self.get_extractor(&extractor_name));
+        let names: Vec<String> = if extractor_names.is_empty() {
+            vec![GENERIC_EXTRACTOR_NAME.to_string()]
+        } else {
+            extractor_names.to_vec()
+        };
+        let schemas: Vec<Extractor> = names.iter().map(|name| self.get_extractor(name)).collect();
         let display_name = {
             let name = display_name.into();
             if name.trim().is_empty() {
@@ -384,7 +397,14 @@ impl Project {
                 name
             }
         };
-        let mut model = LogFileModel::new(file_id, path, extractor_name, display_name, extractor);
+        let mut model = LogFileModel::new(
+            file_id,
+            path,
+            names[0].clone(),
+            display_name,
+            Some(schemas[0].clone()),
+        );
+        model.set_schemas(schemas);
         model.live = Some(config);
         self.files.push(model);
         self.files.last_mut().expect("just pushed live source")
@@ -397,7 +417,7 @@ impl Project {
             kind: crate::core::models::LiveSourceKind::Stdin,
             ..LiveSourceConfig::default()
         };
-        self.add_live_source(config, "stdin", None)
+        self.add_live_source(config, "stdin", &[])
     }
 
     pub fn remove_file(&mut self, file_id: &str) {

@@ -807,6 +807,43 @@ impl ThemePicker {
     }
 }
 
+/// Append `name` to an editor's schema set, ignoring a blank or already-present one. Returns
+/// whether it landed, so the caller can move the cursor onto the new row.
+fn add_schema_to(schemas: &mut Vec<String>, name: String) -> bool {
+    if name.trim().is_empty() || schemas.iter().any(|existing| existing == &name) {
+        return false;
+    }
+    schemas.push(name);
+    true
+}
+
+/// Drop the schema at `index` from an editor's schema set. A source always parses under
+/// something, so the last remaining schema is not dropped but reset to the out-of-the-box
+/// default. `None` when there is nothing to remove -- the set is already just the default.
+fn remove_schema_at(schemas: &mut Vec<String>, index: usize) -> Option<String> {
+    if schemas.len() > 1 {
+        return Some(schemas.remove(index));
+    }
+    let only = schemas.first()?;
+    if only == GENERIC_EXTRACTOR_NAME {
+        return None;
+    }
+    Some(std::mem::replace(
+        &mut schemas[0],
+        GENERIC_EXTRACTOR_NAME.to_string(),
+    ))
+}
+
+/// What to report after `remove_schema_at`: dropping the only schema is a fall back to the
+/// default rather than a plain removal, and is worth saying so.
+fn schema_removed_status(schemas: &[String], removed: &str) -> String {
+    if schemas == [GENERIC_EXTRACTOR_NAME] {
+        format!("removed schema: {removed} -- back to '{GENERIC_EXTRACTOR_NAME}'")
+    } else {
+        format!("removed schema: {removed}")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SourceEditor {
     file_id: String,
@@ -876,21 +913,18 @@ impl SourceEditor {
     }
 
     fn add_schema(&mut self, name: String) {
-        if !name.trim().is_empty() && !self.schemas.iter().any(|existing| existing == &name) {
-            self.schemas.push(name);
+        if add_schema_to(&mut self.schemas, name) {
             // Land on the row just added, so more can be added or it can be reordered.
             self.row = Self::SCHEMA + self.schemas.len() - 1;
         }
     }
 
-    /// Remove the selected schema, keeping at least one (a source always parses under
-    /// something). Returns the removed name.
+    /// Remove the selected schema. A source always parses under something, so removing the
+    /// only one leaves it on the out-of-the-box default instead of nothing. Returns the
+    /// removed name.
     fn remove_selected_schema(&mut self) -> Option<String> {
         let index = self.schema_index()?;
-        if self.schemas.len() <= 1 {
-            return None;
-        }
-        let removed = self.schemas.remove(index);
+        let removed = remove_schema_at(&mut self.schemas, index)?;
         self.row = self.row.min(self.total_rows().saturating_sub(1));
         Some(removed)
     }
@@ -944,7 +978,9 @@ struct LiveSourceEditor {
     unit: String,
     since: String,
     tail: String,
-    schema: String,
+    /// The source's ordered schema set (priority = match order), exactly as in `SourceEditor`:
+    /// a live source is as free as a file to be parsed under several formats.
+    schemas: Vec<String>,
 }
 
 impl LiveSourceEditor {
@@ -964,12 +1000,20 @@ impl LiveSourceEditor {
             unit: String::new(),
             since: String::new(),
             tail: String::new(),
-            schema: GENERIC_EXTRACTOR_NAME.to_string(),
+            schemas: vec![GENERIC_EXTRACTOR_NAME.to_string()],
         }
     }
 
     fn from_file(file: &LogFileModel) -> Self {
         let config = file.live.clone().unwrap_or_default();
+        let mut schemas: Vec<String> = file
+            .schema_set()
+            .iter()
+            .map(|schema| schema.name.clone())
+            .collect();
+        if schemas.is_empty() {
+            schemas.push(file.extractor_name.clone());
+        }
         Self {
             file_id: Some(file.file_id.clone()),
             row: 0,
@@ -985,7 +1029,7 @@ impl LiveSourceEditor {
             unit: config.unit,
             since: config.since,
             tail: config.tail,
-            schema: file.extractor_name.clone(),
+            schemas,
         }
     }
 
@@ -1033,9 +1077,62 @@ impl LiveSourceEditor {
         rows.extend([
             (LiveSourceField::Since, "Since", self.since.clone()),
             (LiveSourceField::Tail, "Tail lines", self.tail.clone()),
-            (LiveSourceField::Schema, "Schema", self.schema.clone()),
         ]);
+        // The schema set closes the form, one row each, so any of them can be selected,
+        // reordered, or removed.
+        for (index, name) in self.schemas.iter().enumerate() {
+            let label = if index == 0 { "Schema" } else { "" };
+            let value = if self.schemas.len() > 1 {
+                format!("{}. {name}", index + 1)
+            } else {
+                name.clone()
+            };
+            rows.push((LiveSourceField::Schema, label, value));
+        }
         rows
+    }
+
+    /// Row index of the first schema; the set always occupies the trailing rows.
+    fn schema_row_start(&self) -> usize {
+        self.rows().len() - self.schemas.len()
+    }
+
+    /// Index into `schemas` of the selected schema row, if the cursor is on one.
+    fn schema_index(&self) -> Option<usize> {
+        (self.field_for_row() == LiveSourceField::Schema)
+            .then(|| self.row - self.schema_row_start())
+            .filter(|index| *index < self.schemas.len())
+    }
+
+    fn add_schema(&mut self, name: String) {
+        if add_schema_to(&mut self.schemas, name) {
+            // Land on the row just added, so more can be added or it can be reordered.
+            self.row = self.rows().len() - 1;
+        }
+    }
+
+    /// Remove the selected schema; removing the only one falls back to the out-of-the-box
+    /// default. Returns the removed name.
+    fn remove_selected_schema(&mut self) -> Option<String> {
+        let index = self.schema_index()?;
+        let removed = remove_schema_at(&mut self.schemas, index)?;
+        self.row = self.row.min(self.rows().len().saturating_sub(1));
+        Some(removed)
+    }
+
+    /// Move the selected schema up (`delta < 0`) or down, changing its match priority.
+    fn move_schema(&mut self, delta: isize) -> bool {
+        let Some(index) = self.schema_index() else {
+            return false;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target as usize >= self.schemas.len() {
+            return false;
+        }
+        let target = target as usize;
+        self.schemas.swap(index, target);
+        self.row = self.schema_row_start() + target;
+        true
     }
 
     fn pick(&mut self, delta: isize) {
@@ -1098,7 +1195,9 @@ impl LiveSourceEditor {
             LiveSourceField::Unit => Some(&mut self.unit),
             LiveSourceField::Since => Some(&mut self.since),
             LiveSourceField::Tail => Some(&mut self.tail),
-            LiveSourceField::Schema => Some(&mut self.schema),
+            // Schema rows are edited with `e`/`L`/`i` and the reorder keys, not by typing --
+            // a numbered set of rows has no single field to type into.
+            LiveSourceField::Schema => None,
         }
     }
 
@@ -2716,26 +2815,9 @@ impl AppState {
         }
 
         let names: Vec<String> = set.iter().map(|schema| schema.name.clone()).collect();
-        let regroup = set.clone();
-        if let Some(file) = self.project.get_file_mut(file_id) {
-            file.set_schemas(set);
-        }
-        // Rebuild the live grouping under the new set from the captured lines (the spool is the
-        // source of truth), and continue streaming into it.
-        let refs: Vec<&Extractor> = regroup.iter().collect();
-        let snapshot = self.live_sources.get_mut(file_id).map(|runtime| {
-            runtime.builder = EntryBuilder::new();
-            for line in &lines {
-                runtime.builder.push_line(line, &refs);
-            }
-            runtime.base_entries = 0;
-            runtime.auto_detected = true;
-            runtime.builder.snapshot()
-        });
-        if let (Some(snapshot), Some(file)) = (snapshot, self.project.get_file_mut(file_id)) {
-            file.entries = snapshot;
-            file.assign_schema_indices();
-        }
+        // Rebuild the grouping under the detected set from the captured lines, and continue
+        // streaming into it.
+        self.regroup_live_source(file_id, set);
         self.status = format!("detected schema: {}", names.join(" + "));
     }
 
@@ -5033,7 +5115,7 @@ impl AppState {
             LiveSourceField::Since => "Since is optional: examples 10m, 2026-07-15 09:00:00",
             LiveSourceField::Tail => "Tail lines is optional; leave empty for the command default",
             LiveSourceField::Schema => {
-                "Schema: i detect with LLM  e edit manually  L load library  X save to library"
+                "Schema: L add  d remove  K/J reorder  i detect(LLM)  e edit  X save to library"
             }
             _ => "Use Up/Down or Tab to move; type to edit the focused field",
         };
@@ -6881,7 +6963,10 @@ impl AppState {
                 self.submit_save_source_schema(file_id, text)
             }
             Mode::LiveSchemaEditor { mut editor, text } => {
-                editor.schema = text.trim().to_string();
+                // `e` edits the selected schema row in place, leaving the rest of the set alone.
+                if let Some(index) = editor.schema_index() {
+                    editor.schemas[index] = text.trim().to_string();
+                }
                 self.mode = Mode::LiveSourceEditor(editor);
             }
             Mode::EditFilter { index, text } => self.submit_edit_filter(index, text),
@@ -7013,7 +7098,7 @@ impl AppState {
             tokens.remove(0);
         }
         if let Some(log_schema) = log_schema.as_ref() {
-            if !self.project.extractors.contains_key(log_schema) {
+            if !self.project.has_extractor(log_schema) {
                 return Err(format!("unknown log schema: {log_schema}"));
             }
         }
@@ -8339,7 +8424,7 @@ impl AppState {
                 }
                 self.mode = Mode::LiveSourceEditor(editor);
             }
-            KeyCode::Char('i') if editor.field_for_row() == LiveSourceField::Schema && !ctrl => {
+            KeyCode::Char('i') if editor.schema_index().is_some() && !ctrl => {
                 if let Some(file_id) = editor.file_id.clone() {
                     self.save_live_source_editor_fields(&editor);
                     self.mode = Mode::Normal;
@@ -8352,24 +8437,46 @@ impl AppState {
                     self.mode = Mode::LiveSourceEditor(editor);
                 }
             }
-            KeyCode::Char('e') if editor.field_for_row() == LiveSourceField::Schema && !ctrl => {
+            KeyCode::Char('e') if editor.schema_index().is_some() && !ctrl => {
                 if let Some(file_id) = editor.file_id.clone() {
                     self.save_live_source_editor_fields(&editor);
                     self.open_schema_input_for(&file_id);
                 } else {
-                    let text = editor.schema.clone();
+                    let text = editor
+                        .schema_index()
+                        .and_then(|index| editor.schemas.get(index).cloned())
+                        .unwrap_or_default();
                     self.open_input(Mode::LiveSchemaEditor { editor, text });
                 }
             }
-            KeyCode::Char('L') if editor.field_for_row() == LiveSourceField::Schema && !ctrl => {
-                if let Some(file_id) = editor.file_id.clone() {
-                    self.save_live_source_editor_fields(&editor);
-                    self.open_schema_library_picker(file_id);
-                } else {
-                    self.open_schema_library_picker_for_live_editor(editor);
-                }
+            // On a schema row, `L` adds a library schema to the set (repeat to add more).
+            KeyCode::Char('L') if editor.schema_index().is_some() && !ctrl => {
+                self.save_live_source_editor_fields(&editor);
+                self.open_schema_library_picker_for_live_editor(editor);
             }
-            KeyCode::Char('X') if editor.field_for_row() == LiveSourceField::Schema && !ctrl => {
+            // `d`/Delete removes the selected schema; the last one falls back to the default.
+            KeyCode::Char('d') | KeyCode::Delete if editor.schema_index().is_some() && !ctrl => {
+                match editor.remove_selected_schema() {
+                    Some(removed) => {
+                        self.status = schema_removed_status(&editor.schemas, &removed);
+                    }
+                    None => {
+                        self.status =
+                            format!("already on the default schema '{GENERIC_EXTRACTOR_NAME}'");
+                    }
+                }
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            // `K`/`J` move the selected schema up/down, changing its match priority.
+            KeyCode::Char('K') if editor.schema_index().is_some() && !ctrl => {
+                editor.move_schema(-1);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Char('J') if editor.schema_index().is_some() && !ctrl => {
+                editor.move_schema(1);
+                self.mode = Mode::LiveSourceEditor(editor);
+            }
+            KeyCode::Char('X') if editor.schema_index().is_some() && !ctrl => {
                 if let Some(file_id) = editor.file_id.clone() {
                     self.save_live_source_editor_fields(&editor);
                     self.open_save_source_schema(file_id);
@@ -8489,14 +8596,18 @@ impl AppState {
 
     fn submit_live_source_editor(&mut self, editor: LiveSourceEditor) {
         let config = editor.config();
+        // A rejected save keeps the editor open: closing it on the way out would drop
+        // everything the user just typed or picked, leaving only a status line to explain it.
         if let Err(error) = config.validate() {
             self.status = format!("live source not added: {error}");
+            self.mode = Mode::LiveSourceEditor(editor);
             return;
         }
-        let schema = match self.schema_name_for_new_live_source(&editor.schema) {
-            Ok(schema) => schema,
+        let schemas = match self.schema_names_for_live_source(&editor.schemas) {
+            Ok(schemas) => schemas,
             Err(error) => {
                 self.status = error;
+                self.mode = Mode::LiveSourceEditor(editor);
                 return;
             }
         };
@@ -8506,13 +8617,13 @@ impl AppState {
             editor.short_name.trim().to_string()
         };
         if let Some(file_id) = editor.file_id.clone() {
-            self.update_live_source(file_id, config, display_name, editor, schema);
+            self.update_live_source(file_id, config, display_name, editor, schemas);
             return;
         }
         let file_id = {
             let file = self
                 .project
-                .add_live_source(config, display_name.clone(), Some(schema));
+                .add_live_source(config, display_name.clone(), &schemas);
             file.label = display_name;
             file.description = editor.description.trim().to_string();
             file.tag = editor.tag.trim().to_string();
@@ -8530,13 +8641,22 @@ impl AppState {
         config: LiveSourceConfig,
         display_name: String,
         editor: LiveSourceEditor,
-        schema: String,
+        schemas: Vec<String>,
     ) {
         let Some(file) = self.project.get_file(&file_id) else {
             self.status = "live source is gone".to_string();
             return;
         };
-        let reset_stream = file.live.as_ref() != Some(&config) || file.extractor_name != schema;
+        let old_schemas: Vec<String> = file
+            .schema_set()
+            .iter()
+            .map(|schema| schema.name.clone())
+            .collect();
+        let schemas_changed = old_schemas != schemas;
+        // A stdin source's pipe is gone once read, so its stream is never reset: a new schema
+        // set is applied to what it already captured.
+        let is_stdin = file.is_stdin_source();
+        let reset_stream = !is_stdin && (file.live.as_ref() != Some(&config) || schemas_changed);
         let spool_path = file.path.clone();
 
         if reset_stream {
@@ -8544,7 +8664,7 @@ impl AppState {
             if file.live.as_ref() != Some(&config) {
                 let _ = fs::remove_file(&spool_path);
             }
-            if let Err(error) = self.project.set_file_extractor(&file_id, &schema) {
+            if let Err(error) = self.project.set_file_schemas(&file_id, &schemas) {
                 self.status = error;
                 return;
             }
@@ -8561,6 +8681,12 @@ impl AppState {
             }
         }
 
+        if is_stdin && schemas_changed {
+            self.apply_schema_set_to_file(&file_id, &schemas);
+            self.open_file_in_focused(&file_id);
+            return;
+        }
+
         self.open_file_in_focused(&file_id);
         self.autosave_project();
         if reset_stream {
@@ -8571,13 +8697,30 @@ impl AppState {
         }
     }
 
+    /// Resolve an editor's schema rows to library schema names, in order. A row may also carry
+    /// a schema definition (a pattern or JSON), which is added to the library and referenced by
+    /// its name. An empty set falls back to the out-of-the-box default.
+    fn schema_names_for_live_source(&mut self, texts: &[String]) -> Result<Vec<String>, String> {
+        let mut names: Vec<String> = Vec::new();
+        for text in texts {
+            let name = self.schema_name_for_new_live_source(text)?;
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        if names.is_empty() {
+            names.push(GENERIC_EXTRACTOR_NAME.to_string());
+        }
+        Ok(names)
+    }
+
     fn schema_name_for_new_live_source(&mut self, text: &str) -> Result<String, String> {
         let text = text.trim();
         if text.is_empty() {
             return Ok(GENERIC_EXTRACTOR_NAME.to_string());
         }
         if !text.contains('|') && !looks_like_schema_json_input(text) {
-            if self.project.extractors.contains_key(text) {
+            if self.project.has_extractor(text) {
                 return Ok(text.to_string());
             }
             return Err(format!("unknown log schema: {text}"));
@@ -8640,11 +8783,16 @@ impl AppState {
                     editor,
                 ));
             }
-            // `d`/Delete removes the *selected* schema (never the only one).
+            // `d`/Delete removes the selected schema; the last one falls back to the default.
             KeyCode::Char('d') | KeyCode::Delete if editor.schema_index().is_some() && !ctrl => {
                 match editor.remove_selected_schema() {
-                    Some(removed) => self.status = format!("removed schema: {removed}"),
-                    None => self.status = "a source needs at least one schema".to_string(),
+                    Some(removed) => {
+                        self.status = schema_removed_status(&editor.schemas, &removed);
+                    }
+                    None => {
+                        self.status =
+                            format!("already on the default schema '{GENERIC_EXTRACTOR_NAME}'");
+                    }
                 }
                 self.mode = Mode::SourceEditor(editor);
             }
@@ -9570,6 +9718,9 @@ impl AppState {
         self.mode = Mode::SourceEditor(editor);
     }
 
+    /// Append a picked library schema to a live source editor's set, then return to the editor
+    /// so more can be added. A set of just the default collapses onto it: a live source starts
+    /// on `Generic line` as a placeholder, not as a deliberate choice.
     fn apply_library_schema_to_live_editor(
         &mut self,
         mut editor: LiveSourceEditor,
@@ -9584,8 +9735,12 @@ impl AppState {
                 return;
             }
         }
-        editor.schema = name;
-        editor.focus_field(LiveSourceField::Schema);
+        if editor.schemas == [GENERIC_EXTRACTOR_NAME] {
+            editor.schemas = vec![name];
+            editor.focus_field(LiveSourceField::Schema);
+        } else {
+            editor.add_schema(name);
+        }
         self.mode = Mode::LiveSourceEditor(editor);
         self.status = "schema selected".to_string();
     }
@@ -9639,7 +9794,7 @@ impl AppState {
             self.status = "schema name cannot be empty".to_string();
             return;
         }
-        if !self.project.extractors.contains_key(name) {
+        if !self.project.has_extractor(name) {
             self.status = format!("unknown log schema: {name}");
             return;
         }
@@ -9651,24 +9806,7 @@ impl AppState {
     }
 
     fn apply_schema_to_file(&mut self, file_id: &str, name: &str) {
-        let display = self
-            .project
-            .get_file(file_id)
-            .map(|file| file.display_name.clone())
-            .unwrap_or_default();
-        self.live_sources.remove(file_id);
-        if let Err(error) = self.project.set_file_extractor(file_id, name) {
-            self.autosave_project();
-            self.status = error;
-            return;
-        }
-
-        // Multi-line grouping depends on the schema, so the file must be re-read.
-        self.repoint_panes(file_id);
-        self.queue_load(file_id);
-        self.requeue_all_panes();
-        self.autosave_project();
-        self.status = format!("schema '{name}' applied to {display}");
+        self.apply_schema_set_to_file(file_id, &[name.to_string()]);
     }
 
     fn hide_like(&mut self, dimension: &str, keyword: &str, exclude: bool) {
@@ -10005,16 +10143,35 @@ impl AppState {
             .get_file(file_id)
             .map(|file| file.display_name.clone())
             .unwrap_or_default();
-        self.live_sources.remove(file_id);
-        if let Err(error) = self.project.set_file_schemas(file_id, names) {
+        let is_stdin = self
+            .project
+            .get_file(file_id)
+            .map(|file| file.is_stdin_source())
+            .unwrap_or(false);
+        // A stdin source's pipe cannot be reopened, so it never goes through the re-read path:
+        // that would drop its runtime and its spool, leaving the source empty. Re-group what it
+        // has captured in place instead, and keep streaming into the new set.
+        if is_stdin {
+            let schemas: Vec<Extractor> = names
+                .iter()
+                .map(|name| self.project.get_extractor(name))
+                .collect();
+            self.regroup_live_source(file_id, schemas);
+            self.repoint_panes(file_id);
+            self.requeue_all_panes();
             self.autosave_project();
-            self.status = error;
-            return;
+        } else {
+            self.live_sources.remove(file_id);
+            if let Err(error) = self.project.set_file_schemas(file_id, names) {
+                self.autosave_project();
+                self.status = error;
+                return;
+            }
+            self.repoint_panes(file_id);
+            self.queue_load(file_id);
+            self.requeue_all_panes();
+            self.autosave_project();
         }
-        self.repoint_panes(file_id);
-        self.queue_load(file_id);
-        self.requeue_all_panes();
-        self.autosave_project();
         self.status = if names.len() > 1 {
             format!("{} schemas applied to {display}", names.len())
         } else {
@@ -10023,6 +10180,38 @@ impl AppState {
                 names.first().cloned().unwrap_or_default()
             )
         };
+    }
+
+    /// Re-parse a live source's captured lines under a new schema set, in place: the spool is
+    /// the source of truth, so the set is swapped and the grouping rebuilt from the lines
+    /// already captured, with the stream (if still open) continuing into the new grouping.
+    fn regroup_live_source(&mut self, file_id: &str, schemas: Vec<Extractor>) {
+        let lines: Vec<String> = match self.project.get_file(file_id) {
+            Some(file) => file
+                .entries
+                .iter()
+                .flat_map(|entry| entry.raw.lines().map(str::to_string))
+                .collect(),
+            None => return,
+        };
+        let refs: Vec<&Extractor> = schemas.iter().collect();
+        let mut builder = EntryBuilder::new();
+        for line in &lines {
+            builder.push_line(line, &refs);
+        }
+        let entries = builder.snapshot();
+        if let Some(runtime) = self.live_sources.get_mut(file_id) {
+            runtime.builder = builder;
+            runtime.base_entries = 0;
+            // The set was chosen deliberately; the one-shot auto-detection must not undo it.
+            runtime.auto_detected = true;
+        }
+        if let Some(file) = self.project.get_file_mut(file_id) {
+            file.set_schemas(schemas);
+            file.entries = entries;
+            file.loaded = true;
+            file.assign_schema_indices();
+        }
     }
 
     /// `i` on a log source: ask the configured LLM to infer a schema from its first lines.
@@ -16094,7 +16283,7 @@ mod tests {
             panic!("expected live source editor, got {:?}", app.mode);
         };
         assert_eq!(editor.kind, LiveSourceKind::Kubernetes);
-        assert_eq!(editor.schema, GENERIC_EXTRACTOR_NAME);
+        assert_eq!(editor.schemas, vec![GENERIC_EXTRACTOR_NAME.to_string()]);
         assert!(editor
             .rows()
             .iter()
@@ -16134,7 +16323,8 @@ mod tests {
         let Mode::LiveSourceEditor(editor) = &app.mode else {
             panic!("expected live source editor, got {:?}", app.mode);
         };
-        assert_eq!(editor.schema, "picked");
+        // The placeholder default collapses: the pick becomes the source's only schema.
+        assert_eq!(editor.schemas, vec!["picked".to_string()]);
         assert!(app.project.extractors.contains_key("picked"));
     }
 
@@ -17515,7 +17705,7 @@ mod tests {
                 ..LiveSourceConfig::default()
             },
             "nginx journal",
-            None,
+            &[],
         );
         let mut app = AppState::new(project);
         app.focus = Focus::Sidebar;
@@ -17571,7 +17761,7 @@ mod tests {
                 ..LiveSourceConfig::default()
             },
             "nginx journal",
-            None,
+            &[],
         );
         let mut app = AppState::new(project);
         app.focus = Focus::Sidebar;
@@ -17766,12 +17956,19 @@ mod tests {
         assert_eq!(editor.remove_selected_schema().as_deref(), Some("B"));
         assert_eq!(editor.schemas, ["A", "C"]);
 
-        // Down to one, then the last cannot be removed.
+        // Down to one, and removing that one falls back to the out-of-the-box default rather
+        // than leaving the source with no schema at all.
         editor.row = SourceEditor::SCHEMA;
         assert_eq!(editor.remove_selected_schema().as_deref(), Some("A"));
+        assert_eq!(editor.schemas, ["C"]);
+        editor.row = SourceEditor::SCHEMA;
+        assert_eq!(editor.remove_selected_schema().as_deref(), Some("C"));
+        assert_eq!(editor.schemas, [GENERIC_EXTRACTOR_NAME]);
+
+        // The default is the floor: there is nothing left to remove.
         editor.row = SourceEditor::SCHEMA;
         assert_eq!(editor.remove_selected_schema(), None);
-        assert_eq!(editor.schemas, ["C"]);
+        assert_eq!(editor.schemas, [GENERIC_EXTRACTOR_NAME]);
     }
 
     #[test]
@@ -17916,6 +18113,218 @@ mod tests {
             "old spool content must not reappear, got {} entries",
             file.entries.len()
         );
+    }
+
+    /// A stdin source parses under a set, like any other source: `docker logs ID | logscout -i`
+    /// carries as many formats as the container printed. Applying the set must not send the
+    /// source through a reload -- its pipe is spent, so a reload would leave it empty.
+    #[test]
+    fn stdin_source_takes_a_schema_set_and_keeps_what_it_captured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::load(tmp.path());
+        project.library.clear();
+        let mut uvi = Extractor::new("Uvi", "<level>:<pad><message>").unwrap();
+        uvi.field_patterns
+            .insert("level".to_string(), "INFO|ERROR".to_string());
+        uvi.field_patterns
+            .insert("pad".to_string(), " +".to_string());
+        uvi.entry_start = "^(?:INFO|ERROR):".to_string();
+        uvi.compile().unwrap();
+        project.add_extractor(uvi).unwrap();
+        let file_id = project.add_stdin_source().file_id.clone();
+
+        let lines = [
+            "2026-06-16 10:00:00.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][a.cpp:1] bracketed".to_string(),
+            "INFO:     uvicorn".to_string(),
+        ];
+        project
+            .get_file_mut(&file_id)
+            .unwrap()
+            .load_from_lines(lines.iter());
+
+        // The stream has ended (`docker logs` dumps and closes), so there is no runtime left:
+        // the captured entries are all that remains of the pipe.
+        let mut app = AppState::new(project);
+        app.apply_schema_set_to_file(
+            &file_id,
+            &["Bracketed default".to_string(), "Uvi".to_string()],
+        );
+
+        let file = app.project.get_file(&file_id).unwrap();
+        assert!(file.is_multi_schema(), "expected both schemas to be kept");
+        assert_eq!(file.entries.len(), 2, "captured lines must survive");
+        let brack = file
+            .entries
+            .iter()
+            .find(|entry| entry.raw.contains("bracketed"))
+            .unwrap();
+        assert_eq!(file.level(brack), "Info");
+        let uvi_row = file
+            .entries
+            .iter()
+            .find(|entry| entry.raw.contains("uvicorn"))
+            .unwrap();
+        assert_eq!(file.log_schema_name_for(uvi_row), "Uvi");
+    }
+
+    /// The reported flow, end to end: `docker logs ID | logscout -i`, then pick a second
+    /// schema from the library for the stdin source and save the editor.
+    #[test]
+    fn stdin_source_editor_picks_two_library_schemas_and_saves_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::load(tmp.path());
+        project.library.clear();
+        let file_id = project.add_stdin_source().file_id.clone();
+        let lines = [
+            "2026-06-16 10:00:00.000 [HOST:h][SERVER:S][PID:1][THR:2][Net][Info][UID:0][SID:0][OID:0][a.cpp:1] bracketed".to_string(),
+            "INFO:     uvicorn".to_string(),
+        ];
+        project
+            .get_file_mut(&file_id)
+            .unwrap()
+            .load_from_lines(lines.iter());
+        let mut app = AppState::new(project);
+
+        let mut editor = LiveSourceEditor::from_file(app.project.get_file(&file_id).unwrap());
+        editor.focus_field(LiveSourceField::Schema);
+
+        // Pick the first schema from the library (`L`, Enter), then repeat for the second --
+        // the second pick used to replace the first instead of joining it.
+        for name in ["Bracketed default", "Uvi"] {
+            let mut schema = Extractor::new(name, "<message>").unwrap();
+            if name == "Uvi" {
+                schema.entry_start = "^(?:INFO|ERROR):".to_string();
+            }
+            schema.compile().unwrap();
+            app.mode = Mode::SchemaLibraryPicker(SchemaLibraryPicker {
+                target: SchemaPickerTarget::LiveEditor(editor),
+                options: vec![schema],
+                selected: 0,
+            });
+            press(&mut app, KeyCode::Enter);
+            let Mode::LiveSourceEditor(next) = app.mode.clone() else {
+                panic!("expected the live source editor, got {:?}", app.mode);
+            };
+            editor = next;
+        }
+        assert_eq!(editor.schemas, ["Bracketed default", "Uvi"]);
+
+        // Save the editor: the set reaches the source, and its captured lines are still there.
+        app.mode = Mode::LiveSourceEditor(editor);
+        press(&mut app, KeyCode::Enter);
+        let file = app.project.get_file(&file_id).unwrap();
+        let names: Vec<&str> = file.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Bracketed default", "Uvi"]);
+        assert_eq!(
+            file.entries.len(),
+            2,
+            "captured lines must survive the save"
+        );
+    }
+
+    /// A source's schema often comes from a disk library (auto-detection picks from there, and
+    /// a library schema is referenced by name, never copied into the project). Saving the live
+    /// editor must resolve those names against the library too -- rejecting them as "unknown"
+    /// aborted the whole save, so a schema added next to one silently never landed.
+    #[test]
+    fn live_editor_saves_a_schema_added_next_to_a_library_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::load(tmp.path());
+        project.library.clear();
+        // A library schema: resolvable by name, but not among the project's own extractors.
+        let mut uvi = Extractor::new("Uvi", "<level>:<pad><message>").unwrap();
+        uvi.field_patterns
+            .insert("level".to_string(), "INFO|ERROR".to_string());
+        uvi.field_patterns
+            .insert("pad".to_string(), " +".to_string());
+        uvi.entry_start = "^(?:INFO|ERROR):".to_string();
+        uvi.compile().unwrap();
+        project.library.push(uvi);
+        assert!(!project.extractors.contains_key("Uvi"));
+
+        let file_id = project.add_stdin_source().file_id.clone();
+        project
+            .set_file_schemas(&file_id, &["Uvi".to_string()])
+            .unwrap();
+        project
+            .get_file_mut(&file_id)
+            .unwrap()
+            .load_from_lines(["INFO:     uvicorn".to_string()].iter());
+
+        let mut app = AppState::new(project);
+        app.open_source_editor_for(&file_id);
+        let Mode::LiveSourceEditor(mut editor) = app.mode.clone() else {
+            panic!("expected the live source editor, got {:?}", app.mode);
+        };
+        assert_eq!(editor.schemas, ["Uvi"]);
+
+        // Add a second schema and save.
+        editor.focus_field(LiveSourceField::Schema);
+        editor.add_schema("Bracketed default".to_string());
+        app.mode = Mode::LiveSourceEditor(editor);
+        press(&mut app, KeyCode::Enter);
+
+        // Both survive the save, and reopening the editor still shows both.
+        let file = app.project.get_file(&file_id).unwrap();
+        let names: Vec<&str> = file.schemas.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Uvi", "Bracketed default"],
+            "status: {}",
+            app.status
+        );
+        app.open_source_editor_for(&file_id);
+        let Mode::LiveSourceEditor(reopened) = &app.mode else {
+            panic!("expected the live source editor, got {:?}", app.mode);
+        };
+        assert_eq!(reopened.schemas, ["Uvi", "Bracketed default"]);
+    }
+
+    /// The live/stdin editor drives a schema set with the same keys as the file editor.
+    #[test]
+    fn live_source_editor_adds_reorders_and_removes_schemas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut project = Project::load(tmp.path());
+        let file_id = project.add_stdin_source().file_id.clone();
+        let mut editor = LiveSourceEditor::from_file(project.get_file(&file_id).unwrap());
+        assert_eq!(editor.schemas, vec![GENERIC_EXTRACTOR_NAME.to_string()]);
+
+        editor.focus_field(LiveSourceField::Schema);
+        assert_eq!(editor.schema_index(), Some(0));
+
+        // More than one schema can be added -- the reported bug.
+        editor.add_schema("Bracketed default".to_string());
+        editor.add_schema("Uvi".to_string());
+        editor.add_schema("Uvi".to_string()); // a repeat is ignored
+        assert_eq!(
+            editor.schemas,
+            [GENERIC_EXTRACTOR_NAME, "Bracketed default", "Uvi"]
+        );
+        assert_eq!(editor.schema_index(), Some(2)); // the cursor lands on the new row
+
+        // Reorder and remove work on any row, not just the last.
+        assert!(editor.move_schema(-1));
+        assert_eq!(
+            editor.schemas,
+            [GENERIC_EXTRACTOR_NAME, "Uvi", "Bracketed default"]
+        );
+        editor.row = editor.schema_row_start();
+        assert_eq!(
+            editor.remove_selected_schema().as_deref(),
+            Some(GENERIC_EXTRACTOR_NAME)
+        );
+        assert_eq!(editor.schemas, ["Uvi", "Bracketed default"]);
+
+        // The only schema is removable too: it falls back to the default.
+        editor.row = editor.schema_row_start();
+        assert_eq!(editor.remove_selected_schema().as_deref(), Some("Uvi"));
+        editor.row = editor.schema_row_start();
+        assert_eq!(
+            editor.remove_selected_schema().as_deref(),
+            Some("Bracketed default")
+        );
+        assert_eq!(editor.schemas, [GENERIC_EXTRACTOR_NAME]);
+        assert_eq!(editor.remove_selected_schema(), None);
     }
 
     #[test]
