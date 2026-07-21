@@ -431,7 +431,7 @@ and AI skills (`skills/`).
 | `Ctrl+←/→`, `Ctrl+↑/↓` | resize the focused pane (or drag the border between panes) |
 | `z` | focus mode — show only the active pane |
 | `b` | timeline histogram: cycle off / level / module / source (drag its bars to filter) |
-| `A` | open the AI chat panel (Enter to send, Esc to cancel/leave) |
+| `A` | open the AI chat panel, with the selected lines (or the cursor line) copied into its input (Enter to send, Esc to cancel/leave) |
 | `Tab` / `Shift+Tab` | cycle sidebar, panes, and search results |
 | `Enter` (pane) | open a larger detail popup for the selected log row |
 | `Enter` (results) | jump to selected search result |
@@ -813,6 +813,25 @@ you would:
 The panel title always shows the active provider and model, and ` · no key` until one is
 configured, so you can see the assistant is ready without sending a message.
 
+**Asking about specific lines.** Press `A` and the lines you are working on are copied into
+the chat input with the caret at the end, so you type your question around them and send one
+message. That is the selection if you made one (`Space` to mark, `Shift+↑`/`Shift+↓` for a
+range), and otherwise just the line under the cursor — the line you are looking at is
+usually the line you meant to ask about. Newlines in the input show as `⏎`; a very large
+selection is trimmed to the first 50 lines, with a note saying how many were left out. A
+half-typed question is never overwritten — the lines land after it.
+
+**Starting over.** Send `/clear` (or `/reset`) to empty the panel: the transcript goes, the
+model forgets the exchange, and a reply still on its way is abandoned rather than landing in
+the fresh transcript. Your provider, model, key, and any skills you switched on all stay as
+they were — only the conversation is dropped.
+
+**Editing the input.** `Ctrl+A` selects the whole input; `Ctrl+C` then copies it to the
+system clipboard and `Ctrl+X` cuts it. With the input selected, `Backspace` or `Delete`
+clears it and typing replaces it, as a selection does anywhere else. `Esc` gives up the
+selection before it gives up the panel, so a mistaken `Ctrl+A` costs one keystroke rather
+than the whole draft. `Ctrl+U` still clears the input outright.
+
 The assistant is given the project's context (folder, sources with their schemas, counts,
 and any label/note you added, the current filters, and the focused view) and a set of tools
 that map onto log-scouter's own operations:
@@ -850,8 +869,8 @@ format; Anthropic uses the Messages API).
    can also edit the file by hand).
 
 You can also change provider and model from inside the chat with `/provider
-openai|anthropic|deepseek` and `/model <name>` (saved to the same file); `/clear` resets the
-conversation. `LOGSCOUT_AI_BASE_URL` overrides the endpoint for a corporate gateway, a
+openai|anthropic|deepseek` and `/model <name>` (saved to the same file).
+`LOGSCOUT_AI_BASE_URL` overrides the endpoint for a corporate gateway, a
 compatible self-hosted model, or a test double.
 
 **Skills.** Drop a markdown file in `~/.log-scouter/skills/<name>.md` and switch it on with
@@ -908,8 +927,45 @@ The folder picker (`o`) lists subfolders and how many files sit directly in each
 | `Enter` | do what the selected row says: open `./`, go up on `../`, otherwise enter the subfolder |
 | `→` / `l` | enter the selected subfolder |
 | `←` / `h` / `Backspace` | go up one folder |
+| `/` | search by name — see below |
 | `.` | show or hide dot-folders |
 | `Esc` | cancel without changing the project |
+
+### Finding a folder or file by name
+
+A long listing is faster to type at than to scroll. Press `/` and then type the start of the
+name; the cursor jumps to the first entry that matches as you go.
+
+```text
+┌Open Folder──────────────────────────────────┐
+│…/var/log                                    │
+│/jen                                         │
+│                                             │
+│  ./     open this folder                    │
+│  ../    go up                               │
+│  archive/                                   │
+│> jenkins/                                   │
+│  jetty/                                     │
+│                                             │
+│type to find  Up/Down next match  Enter open │
+└─────────────────────────────────────────────┘
+```
+
+While the search is running **every letter is text**, so a folder called `jenkins` types as
+itself instead of moving the cursor down. Names that start with what you typed win; if none
+do, a name that merely contains it is used, so a distinctive word in the middle also finds
+its folder. A query nothing matches turns red and leaves the cursor where it was.
+
+| Key | Action |
+| --- | --- |
+| `/` | start searching (again to start the query over) |
+| `↑` / `↓` | previous / next match, wrapping |
+| `Enter` | act on the row it found — add the file, or enter the folder |
+| `Backspace` | delete a character; on an empty query, stop searching |
+| `Esc` | stop searching, keeping the browser open |
+
+The search also ends on its own after about a second and a half without a keystroke, so a
+forgotten query never swallows the next `j`.
 
 `Enter` only ever does the one thing its row names, so the `./` row is where opening
 happens. Opening a folder adds every direct text file in it, exactly as `logscout <folder>`

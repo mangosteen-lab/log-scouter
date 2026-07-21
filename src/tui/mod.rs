@@ -562,6 +562,9 @@ struct AiChat {
     conversation: Vec<ChatMsg>,
     transcript: Vec<ChatLine>,
     input: String,
+    /// Ctrl+A selected the whole input. The next Ctrl+C copies it, and anything that edits
+    /// replaces it -- the one selection an input this size needs.
+    input_selected: bool,
     /// Bumped on every question and on Esc, so a stale reply is ignored.
     generation: u64,
     /// A turn is in flight (waiting on the model or running its tools).
@@ -584,6 +587,7 @@ impl AiChat {
             conversation: Vec::new(),
             transcript: Vec::new(),
             input: String::new(),
+            input_selected: false,
             generation: 0,
             pending: false,
             scroll: 0,
@@ -1830,6 +1834,21 @@ enum BrowserPurpose {
     File,
 }
 
+/// A `/` type-ahead in the browser: what has been typed so far, and when the last key
+/// landed. Letters are already navigation keys here, so searching has to be entered
+/// deliberately -- once it is, every letter is text and `jenkins` types as itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserSearch {
+    query: String,
+    /// A pause abandons the search, so a forgotten buffer never eats the next `j`.
+    last_key: Instant,
+    /// Whether `query` still names a row. A miss is shown rather than silently ignored.
+    matched: bool,
+}
+
+/// How long a type-ahead survives without a keystroke.
+const BROWSER_SEARCH_IDLE: Duration = Duration::from_millis(1500);
+
 /// The `o`/`a` popup: the folder being browsed, plus its subfolders (and, when picking a
 /// file, the text files in it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1845,6 +1864,8 @@ struct FolderBrowser {
     show_hidden: bool,
     /// Files directly inside `current`, the pool `o` would draw its logs from.
     file_count: usize,
+    /// The `/` type-ahead, while one is running.
+    search: Option<BrowserSearch>,
 }
 
 impl FolderBrowser {
@@ -1867,6 +1888,7 @@ impl FolderBrowser {
             scroll: 0,
             show_hidden: false,
             file_count: 0,
+            search: None,
         };
         browser.reload()?;
         Ok(browser)
@@ -1913,6 +1935,8 @@ impl FolderBrowser {
         self.file_count = file_count;
         self.selected = 0;
         self.scroll = 0;
+        // A query typed against the old listing means nothing here.
+        self.search = None;
         Ok(())
     }
 
@@ -1959,6 +1983,129 @@ impl FolderBrowser {
             BrowserRow::Child(path) => format!("{}/", folder_name(path)),
             BrowserRow::File(path) => folder_name(path),
         }
+    }
+
+    /// The name a search matches against. `./` and `../` are commands, not entries, so
+    /// typing never lands on them.
+    fn search_name(row: &BrowserRow) -> Option<String> {
+        match row {
+            BrowserRow::OpenCurrent | BrowserRow::Parent => None,
+            BrowserRow::Child(path) | BrowserRow::File(path) => {
+                Some(folder_name(path).to_lowercase())
+            }
+        }
+    }
+
+    /// Start a `/` search. Re-pressing `/` mid-search starts over rather than typing a `/`,
+    /// which is what a second press means everywhere else.
+    fn begin_search(&mut self) {
+        self.search = Some(BrowserSearch {
+            query: String::new(),
+            last_key: Instant::now(),
+            matched: true,
+        });
+    }
+
+    fn end_search(&mut self) {
+        self.search = None;
+    }
+
+    /// Drop a search nobody has touched for `BROWSER_SEARCH_IDLE`. Called from the drawer as
+    /// well as the key handler, so the buffer disappears on its own, not on the next key.
+    fn expire_search(&mut self) {
+        if let Some(search) = &self.search {
+            if search.last_key.elapsed() >= BROWSER_SEARCH_IDLE {
+                self.search = None;
+            }
+        }
+    }
+
+    fn push_search(&mut self, ch: char) {
+        if let Some(search) = &mut self.search {
+            search.query.push(ch);
+        }
+        self.apply_search();
+    }
+
+    /// Backspace. Emptying the buffer leaves search mode, so Backspace still goes up a
+    /// folder on the next press.
+    fn pop_search(&mut self) {
+        match &mut self.search {
+            Some(search) if !search.query.is_empty() => {
+                search.query.pop();
+                self.apply_search();
+            }
+            _ => self.search = None,
+        }
+    }
+
+    /// Move the cursor to the first row the query names: a prefix match if there is one,
+    /// else a substring match, so a distinctive middle word also finds its folder. A miss
+    /// leaves the cursor where it is.
+    fn apply_search(&mut self) {
+        search_touch(&mut self.search);
+        let Some(search) = &self.search else { return };
+        let query = search.query.to_lowercase();
+        if query.is_empty() {
+            if let Some(search) = &mut self.search {
+                search.matched = true;
+            }
+            return;
+        }
+
+        let named: Vec<(usize, String)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| Self::search_name(row).map(|name| (index, name)))
+            .collect();
+        let hit = named
+            .iter()
+            .find(|(_, name)| name.starts_with(&query))
+            .or_else(|| named.iter().find(|(_, name)| name.contains(&query)))
+            .map(|(index, _)| *index);
+
+        if let Some(index) = hit {
+            self.selected = index;
+        }
+        if let Some(search) = &mut self.search {
+            search.matched = hit.is_some();
+        }
+    }
+
+    /// The next row matching the live query, wrapping at the end. Lets a repeated name be
+    /// stepped through without retyping it.
+    fn search_next(&mut self, forward: bool) {
+        search_touch(&mut self.search);
+        let Some(search) = &self.search else { return };
+        let query = search.query.to_lowercase();
+        if query.is_empty() || self.rows.is_empty() {
+            self.move_selection(if forward { 1 } else { -1 });
+            return;
+        }
+
+        let count = self.rows.len();
+        for step in 1..=count {
+            let index = if forward {
+                (self.selected + step) % count
+            } else {
+                (self.selected + count - (step % count)) % count
+            };
+            let matches = Self::search_name(&self.rows[index])
+                .map(|name| name.starts_with(&query) || name.contains(&query))
+                .unwrap_or(false);
+            if matches {
+                self.selected = index;
+                return;
+            }
+        }
+    }
+}
+
+/// Keep a live search alive for another idle window.
+fn search_touch(search: &mut Option<BrowserSearch>) {
+    if let Some(search) = search {
+        search.last_key = Instant::now();
     }
 }
 
@@ -4337,10 +4484,21 @@ impl AppState {
                     | ChatLine::Error(text)
                     | ChatLine::Info(text) => text,
                 };
-                for (index, chunk) in chunk_chars(&format!("{prefix}{body}"), width)
-                    .into_iter()
+                // A message can be several lines (pasted log lines, a model's list), so
+                // break on its own newlines before wrapping to the panel width.
+                let wrapped: Vec<String> = body
+                    .split('\n')
                     .enumerate()
-                {
+                    .flat_map(|(row, line)| {
+                        let text = if row == 0 {
+                            format!("{prefix}{line}")
+                        } else {
+                            format!("    {line}")
+                        };
+                        chunk_chars(&text, width)
+                    })
+                    .collect();
+                for (index, chunk) in wrapped.into_iter().enumerate() {
                     // Continuation rows line up under the message, not the tag.
                     let text = if index == 0 {
                         chunk
@@ -4379,9 +4537,26 @@ impl AppState {
         let field_width = width.saturating_sub(2).max(1);
         let caret = self.input_cursor;
         let offset = caret.saturating_sub(field_width.saturating_sub(1));
-        let shown: String = input.chars().skip(offset).take(field_width).collect();
+        // The field is one row, but the text may hold newlines (lines pasted in with `A`).
+        // Show each as a glyph -- one char for one char, so the caret maths still holds.
+        let shown: String = input
+            .chars()
+            .skip(offset)
+            .take(field_width)
+            .map(|ch| if ch == '\n' { '⏎' } else { ch })
+            .collect();
+        // Ctrl+A selects all of it, so the whole visible field is highlighted -- there is no
+        // partial selection to render.
+        let input_style = if self.chat_input_selected() {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::raw(format!("> {shown}")))),
+            Paragraph::new(Line::from(vec![
+                Span::raw("> "),
+                Span::styled(shown, input_style),
+            ])),
             input_area,
         );
         if focused {
@@ -5074,13 +5249,32 @@ impl AppState {
             browser.scroll = browser.selected + 1 - listed;
         }
 
-        let files = if picking_file {
-            "pick a file to add, or enter a folder".to_string()
-        } else {
-            match browser.file_count {
-                0 => "no files here".to_string(),
-                1 => "1 file here".to_string(),
-                n => format!("{n} files here"),
+        // A search that has gone quiet is over; drop it here too so the buffer vanishes on
+        // its own rather than waiting for a key that may never come.
+        browser.expire_search();
+
+        // While searching, the second line is the query -- that is what the user is looking
+        // at, and the file count can wait until they are done.
+        let (status_line, status_style) = match &browser.search {
+            Some(search) => (
+                format!("/{}", search.query),
+                Style::default().fg(if search.matched {
+                    Color::Yellow
+                } else {
+                    Color::Red
+                }),
+            ),
+            None => {
+                let files = if picking_file {
+                    "pick a file to add, or enter a folder".to_string()
+                } else {
+                    match browser.file_count {
+                        0 => "no files here".to_string(),
+                        1 => "1 file here".to_string(),
+                        n => format!("{n} files here"),
+                    }
+                };
+                (files, Style::default().fg(Color::DarkGray))
             }
         };
         let mut lines = vec![
@@ -5088,7 +5282,10 @@ impl AppState {
                 truncate_head(&browser.current.display().to_string(), text_width),
                 Style::default().fg(Color::Cyan),
             )),
-            Line::from(Span::styled(files, Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                crop(&status_line, 0, text_width),
+                status_style,
+            )),
             Line::from(""),
         ];
 
@@ -5114,10 +5311,12 @@ impl AppState {
             )));
         }
 
-        let footer = if picking_file {
-            "j/k move   Enter add file / enter folder   Left up   p type path   . hidden   Esc"
+        let footer = if browser.search.is_some() {
+            "type to find   Up/Down next match   Enter open   Backspace   Esc stop searching"
+        } else if picking_file {
+            "j/k move   Enter add   Left up   / find   p type path   . hidden   Esc"
         } else {
-            "j/k move   Enter select   Right in   Left up   . hidden   Esc cancel"
+            "j/k move   Enter select   Right in   Left up   / find   . hidden   Esc cancel"
         };
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -6810,7 +7009,12 @@ impl AppState {
         }
         if key.code == KeyCode::Char('A') && !key.modifiers.contains(KeyModifiers::CONTROL) {
             self.open_ai_chat();
-            self.input_cursor = 0;
+            self.input_cursor = self
+                .ai
+                .as_ref()
+                .map(|ai| ai.input.chars().count())
+                .unwrap_or(0);
+            self.prefill_chat_with_selection();
             return Ok(false);
         }
 
@@ -7687,6 +7891,68 @@ impl AppState {
 
     // ---- AI assistant ----------------------------------------------------------------
 
+    /// How much of a selection is worth pasting into the chat input. A whole screenful is
+    /// useful context; a thousand-line selection is a token bill and an unusable input line.
+    const CHAT_SELECTION_MAX_LINES: usize = 50;
+    const CHAT_SELECTION_MAX_CHARS: usize = 8_000;
+
+    /// The raw text `A` hands to the model: the selected lines, or the line under the cursor
+    /// when nothing is selected. Asking about the line you are looking at is the common case,
+    /// and it should not need a `Space` first.
+    fn chat_selection_text(&self) -> Option<String> {
+        let globals = self.target_globals();
+        if globals.is_empty() {
+            return None;
+        }
+        let view = self.active_view()?;
+        let file = self.project.get_file(&view.file_id)?;
+
+        let total = globals.len();
+        let mut out = String::new();
+        let mut taken = 0;
+        for global in globals.iter().take(Self::CHAT_SELECTION_MAX_LINES) {
+            let Some(entry) = file.entries.get(*global) else {
+                continue;
+            };
+            if taken > 0 && out.len() + entry.raw.len() > Self::CHAT_SELECTION_MAX_CHARS {
+                break;
+            }
+            if taken > 0 {
+                out.push('\n');
+            }
+            out.push_str(&entry.raw);
+            taken += 1;
+        }
+        if out.is_empty() {
+            return None;
+        }
+        if taken < total {
+            out.push_str(&format!(
+                "\n… ({} more selected line(s) omitted)",
+                total - taken
+            ));
+        }
+        Some(out)
+    }
+
+    /// `A` hands the lines straight to the model: they land in the chat input, so the user
+    /// types their question around them and sends one message.
+    fn prefill_chat_with_selection(&mut self) {
+        let Some(text) = self.chat_selection_text() else {
+            return;
+        };
+        let lines = text.lines().count();
+        if let Some(ai) = &mut self.ai {
+            // Never clobber a half-typed question; append after it instead.
+            if !ai.input.is_empty() && !ai.input.ends_with('\n') {
+                ai.input.push('\n');
+            }
+            ai.input.push_str(&text);
+            self.input_cursor = ai.input.chars().count();
+        }
+        self.status = format!("{lines} line(s) copied into the chat");
+    }
+
     /// Open the chat panel and focus it, creating it (and its worker) on first use.
     fn open_ai_chat(&mut self) {
         if self.ai.is_none() {
@@ -7706,7 +7972,7 @@ impl AppState {
                     )));
                 } else {
                     ai.transcript.push(ChatLine::Info(format!(
-                        "Ask me to troubleshoot these logs. Using {} ({}).",
+                        "Ask me to troubleshoot these logs. Using {} ({}). /clear starts over.",
                         provider.label(),
                         ai.config.model()
                     )));
@@ -8179,9 +8445,17 @@ impl AppState {
                     }
                 }
             }
-            "clear" => {
+            // Start over: the model forgets the exchange and the panel shows nothing of it.
+            "clear" | "reset" => {
+                // A turn still in flight would otherwise drop its reply into the fresh
+                // transcript, so retire its generation and stop waiting on it.
+                ai.generation += 1;
+                ai.pending = false;
+                ai.turns = 0;
                 ai.conversation.clear();
                 ai.transcript.clear();
+                // Scrolled back over history that no longer exists is a blank panel.
+                ai.scroll = 0;
                 ai.transcript
                     .push(ChatLine::Info("conversation cleared".to_string()));
             }
@@ -8350,7 +8624,103 @@ impl AppState {
     }
 
     /// Keystrokes while the chat panel has focus.
+    /// Whether Ctrl+A has the whole input selected.
+    fn chat_input_selected(&self) -> bool {
+        self.ai
+            .as_ref()
+            .map(|ai| ai.input_selected && !ai.input.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn clear_chat_input_selection(&mut self) {
+        if let Some(ai) = &mut self.ai {
+            ai.input_selected = false;
+        }
+    }
+
+    /// Throw away a selected input. Used by Backspace/Delete and by typing over it, which
+    /// is what selecting all of something is usually for.
+    fn delete_chat_input_selection(&mut self) {
+        if let Some(ai) = &mut self.ai {
+            ai.input.clear();
+            ai.input_selected = false;
+        }
+        self.input_cursor = 0;
+    }
+
     fn handle_chat_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        // Ctrl+A selects the whole input, and Ctrl+C copies what it selected. Everything
+        // below that edits the text replaces the selection instead of adding to it.
+        let selected = self.chat_input_selected();
+        match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let len = self
+                    .ai
+                    .as_ref()
+                    .map(|ai| ai.input.chars().count())
+                    .unwrap_or(0);
+                let empty = len == 0;
+                if let Some(ai) = &mut self.ai {
+                    ai.input_selected = !empty;
+                }
+                self.input_cursor = len;
+                self.status = if empty {
+                    "nothing to select".to_string()
+                } else {
+                    "input selected — Ctrl+C copy, Backspace delete".to_string()
+                };
+                return Ok(false);
+            }
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && selected =>
+            {
+                let text = self
+                    .ai
+                    .as_ref()
+                    .map(|ai| ai.input.clone())
+                    .unwrap_or_default();
+                self.status = match copy_to_clipboard(&text) {
+                    Ok(()) => format!("copied {} char(s)", text.chars().count()),
+                    Err(error) => format!("copy failed: {error}"),
+                };
+                return Ok(false);
+            }
+            // Cut: copy, then take it out of the input.
+            KeyCode::Char('x') | KeyCode::Char('X')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && selected =>
+            {
+                let text = self
+                    .ai
+                    .as_ref()
+                    .map(|ai| ai.input.clone())
+                    .unwrap_or_default();
+                self.status = match copy_to_clipboard(&text) {
+                    Ok(()) => format!("cut {} char(s)", text.chars().count()),
+                    Err(error) => format!("copy failed: {error}"),
+                };
+                self.delete_chat_input_selection();
+                return Ok(false);
+            }
+            // Delete or type over the selection, the way a selection behaves anywhere else.
+            KeyCode::Backspace | KeyCode::Delete if selected => {
+                self.delete_chat_input_selection();
+                self.status = "input cleared".to_string();
+                return Ok(false);
+            }
+            KeyCode::Char(_) if selected && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_chat_input_selection();
+            }
+            // Esc gives the selection up before it gives up the panel, so a mistaken
+            // Ctrl+A costs one keystroke rather than the whole draft.
+            KeyCode::Esc if selected => {
+                self.clear_chat_input_selection();
+                return Ok(false);
+            }
+            _ => self.clear_chat_input_selection(),
+        }
+
         match key.code {
             KeyCode::Esc => {
                 // Cancel an in-flight turn (drop its reply), else leave the panel.
@@ -9784,11 +10154,58 @@ impl AppState {
                 .map(|error| format!("could not read {}: {error}", target.display()))
         };
 
+        // A live `/` search owns every printable key -- that is the point of entering it, and
+        // it is the only way a folder called `jenkins` can be typed at all. Esc, Enter, and
+        // the arrows still mean what they always do.
+        browser.expire_search();
+        if browser.search.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    browser.end_search();
+                    self.mode = Mode::OpenFolder(browser);
+                    return Ok(false);
+                }
+                KeyCode::Backspace => {
+                    browser.pop_search();
+                    self.mode = Mode::OpenFolder(browser);
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    browser.search_next(true);
+                    self.mode = Mode::OpenFolder(browser);
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    browser.search_next(false);
+                    self.mode = Mode::OpenFolder(browser);
+                    return Ok(false);
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    // `/` again restarts the search rather than typing a slash.
+                    if ch == '/' {
+                        browser.begin_search();
+                    } else {
+                        browser.push_search(ch);
+                    }
+                    self.mode = Mode::OpenFolder(browser);
+                    return Ok(false);
+                }
+                // Enter acts on the row the search found; anything else (Left/Right, Ctrl
+                // keys) is navigation again, and taking it ends the search.
+                _ => browser.end_search(),
+            }
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 return Ok(false);
             }
+            KeyCode::Char('/') => browser.begin_search(),
             KeyCode::Down | KeyCode::Char('j') => browser.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => browser.move_selection(-1),
             KeyCode::PageDown => browser.move_selection(HALF_PAGE),
@@ -14629,6 +15046,8 @@ Project/files
   In the browser: j/k or arrows move, Enter opens './' or a folder (or adds the file),
                   Right enters, Left/Backspace goes up, '.' shows hidden, Esc cancels
                   a's file picker also lists files; Enter adds one, or 'p' types a path
+                  '/' then type a name to jump to it: every letter is text while
+                  searching, Up/Down step the matches, Esc stops searching
   Enter on a log source edits its short name, description, tag, and schema
   In source/live schema rows: i infer with LLM, e edit, L load library, X save library
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
@@ -14709,6 +15128,9 @@ Layout
 
 AI assistant
   A open the AI chat panel (bottom left); type a question and Enter to ask
+  A copies the selected lines (or the cursor line) into the chat input to ask about
+  In the input: Ctrl+A selects it all, then Ctrl+C copies, Ctrl+X cuts, Backspace
+  clears, and typing replaces it; Esc drops the selection; Ctrl+U clears outright
   It can inspect the logs and apply filters, searches, and time ranges for you;
   the panels update as it works, and each action is noted in the transcript
   Esc cancels a reply in flight, then leaves the panel; Up/Down scroll the transcript
@@ -14717,7 +15139,8 @@ AI assistant
   api_key field in ~/.log-scouter/ai.json, or from /key <api-key> (this session only)
   /provider openai|anthropic|deepseek and /model <name> pick the model (saved to ai.json)
   /skills lists skills in ~/.log-scouter/skills/*.md; /skill <name> toggles one on/off
-  /clear resets the conversation
+  /clear (or /reset) empties the panel: transcript, the model's memory of it, and any
+  reply still in flight; the provider, model, key, and active skills are kept
 
 Log schema
   <field> is required, <field?> is optional and may be missing from a line
@@ -15106,6 +15529,136 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("invalid regex"), "{err}");
         assert_eq!(app.project.filters.rules.len(), 1);
+    }
+
+    #[test]
+    fn shift_a_hands_the_selected_lines_to_the_chat_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+
+        // Nothing selected: `A` still takes the line under the cursor, which is the line
+        // you are looking at and the one you meant to ask about.
+        press(&mut app, KeyCode::Char('A'));
+        assert_eq!(app.focus, Focus::Chat);
+        let file = app.project.files.iter().find(|f| !f.is_merged()).unwrap();
+        assert_eq!(app.ai.as_ref().unwrap().input, file.entries[0].raw);
+        press_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Esc);
+
+        // Select two lines, then `A` pastes them in, caret at the end and ready to send.
+        press(&mut app, KeyCode::Char(' '));
+        press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(selected_line_numbers(&app), vec![1, 2]);
+
+        press(&mut app, KeyCode::Char('A'));
+        let input = app.ai.as_ref().unwrap().input.clone();
+        let pasted: Vec<&str> = input.lines().collect();
+        assert_eq!(pasted.len(), 2, "{input}");
+        let file = app.project.files.iter().find(|f| !f.is_merged()).unwrap();
+        assert_eq!(pasted[0], file.entries[0].raw);
+        assert_eq!(pasted[1], file.entries[1].raw);
+        assert_eq!(app.input_cursor, input.chars().count());
+        assert!(app.status.contains("2 line(s) copied"), "{}", app.status);
+
+        // Typing continues after the pasted text rather than overwriting it.
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.ai.as_ref().unwrap().input, format!("{input}?"));
+    }
+
+    #[test]
+    fn slash_clear_empties_the_chat_and_abandons_a_turn_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.open_ai_chat();
+        {
+            let ai = app.ai.as_mut().unwrap();
+            ai.transcript.push(ChatLine::User("why?".to_string()));
+            ai.conversation.push(ChatMsg::user("why?"));
+            ai.generation = 3;
+            ai.turns = 2;
+            ai.pending = true;
+            ai.scroll = 5;
+        }
+
+        type_str(&mut app, "/clear");
+        press(&mut app, KeyCode::Enter);
+
+        let ai = app.ai.as_ref().unwrap();
+        assert!(ai.conversation.is_empty(), "the model forgets the exchange");
+        // Only the acknowledgement is left, so the panel reads as empty rather than blank.
+        assert_eq!(ai.transcript.len(), 1);
+        assert!(matches!(&ai.transcript[0], ChatLine::Info(text) if text.contains("cleared")));
+        assert_eq!(ai.input, "");
+        assert_eq!(app.input_cursor, 0);
+        assert_eq!(ai.scroll, 0, "no scrolling back into history that is gone");
+        assert_eq!(ai.turns, 0);
+        // The reply still on its way is disowned: not pending, and its generation is stale.
+        assert!(!ai.pending);
+        assert_eq!(ai.generation, 4);
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_whole_chat_input_and_the_next_edit_replaces_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 10);
+        app.open_ai_chat();
+
+        // Nothing typed yet: Ctrl+A has nothing to select and says so.
+        press_mod(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(!app.chat_input_selected());
+        assert_eq!(app.status, "nothing to select");
+
+        type_str(&mut app, "why");
+        press_mod(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(app.chat_input_selected());
+        assert_eq!(app.input_cursor, 3, "caret parks at the end");
+
+        // Esc drops the selection rather than the panel, so a mistaken Ctrl+A is cheap.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.chat_input_selected());
+        assert_eq!(app.focus, Focus::Chat);
+        assert_eq!(app.ai.as_ref().unwrap().input, "why");
+
+        // Backspace on a selection takes the whole input, not one character.
+        press_mod(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.ai.as_ref().unwrap().input, "");
+        assert_eq!(app.input_cursor, 0);
+        assert!(!app.chat_input_selected());
+
+        // Typing over a selection replaces it.
+        type_str(&mut app, "abc");
+        press_mod(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.ai.as_ref().unwrap().input, "z");
+        assert_eq!(app.input_cursor, 1);
+
+        // A plain motion just deselects; the text stays put.
+        press_mod(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Left);
+        assert!(!app.chat_input_selected());
+        assert_eq!(app.ai.as_ref().unwrap().input, "z");
+    }
+
+    #[test]
+    fn a_huge_selection_is_capped_before_it_reaches_the_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_lines(tmp.path(), 200);
+
+        press(&mut app, KeyCode::Char(' '));
+        for _ in 0..199 {
+            press_mod(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        }
+        assert_eq!(selected_line_numbers(&app).len(), 200);
+
+        press(&mut app, KeyCode::Char('A'));
+        let input = app.ai.as_ref().unwrap().input.clone();
+        assert!(
+            input.lines().count() <= AppState::CHAT_SELECTION_MAX_LINES + 1,
+            "{} lines",
+            input.lines().count()
+        );
+        assert!(input.contains("more selected line(s) omitted"), "{input}");
     }
 
     /// The whole agentic cycle, driven with scripted replies instead of a live model:
@@ -18112,6 +18665,103 @@ mod tests {
             1
         );
         assert_eq!(app.active_view().unwrap().visible.len(), 1);
+    }
+
+    fn type_str(app: &mut AppState, text: &str) {
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    #[test]
+    fn slash_in_the_browser_jumps_to_the_folder_you_type() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["archive", "jenkins", "jetty", "nginx"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+
+        let mut app = AppState::new(Project::new(root.path()));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(browser(&app).selected, 0);
+
+        // `j` would move the cursor; after `/` it is the first letter of a name.
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "je");
+        assert_eq!(browser_rows(&app)[browser(&app).selected], "jenkins/");
+        assert!(browser(&app).search.as_ref().unwrap().matched);
+
+        // Up/Down step through the other matches instead of the whole list.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(browser_rows(&app)[browser(&app).selected], "jetty/");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(browser_rows(&app)[browser(&app).selected], "jenkins/");
+
+        // Backspace narrows back out, and a name nothing starts with is flagged, not obeyed.
+        press(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "zzz");
+        assert!(!browser(&app).search.as_ref().unwrap().matched);
+        assert_eq!(browser_rows(&app)[browser(&app).selected], "jenkins/");
+
+        // Esc ends the search without closing the browser; `j` navigates again.
+        press(&mut app, KeyCode::Esc);
+        assert!(browser(&app).search.is_none());
+        assert!(matches!(app.mode, Mode::OpenFolder(_)));
+        let before = browser(&app).selected;
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(browser(&app).selected, before + 1);
+    }
+
+    #[test]
+    fn a_browser_search_survives_only_while_it_is_being_typed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nginx")).unwrap();
+
+        let mut app = AppState::new(Project::new(root.path()));
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('/'));
+        type_str(&mut app, "ng");
+        assert_eq!(browser_rows(&app)[browser(&app).selected], "nginx/");
+
+        // Backdate the last keystroke past the idle window: the buffer is gone, and the
+        // next letter is a navigation key once more.
+        if let Mode::OpenFolder(browser) = &mut app.mode {
+            browser.search.as_mut().unwrap().last_key =
+                Instant::now() - BROWSER_SEARCH_IDLE - Duration::from_millis(1);
+        }
+        press(&mut app, KeyCode::Char('g'));
+        assert!(browser(&app).search.is_none());
+        assert_eq!(browser(&app).selected, 0, "g went to the top");
+    }
+
+    #[test]
+    fn the_file_browser_finds_a_file_by_name_and_enter_adds_it() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["alpha.log", "kernel.log"] {
+            std::fs::write(
+                root.path().join(name),
+                "2026-06-16 10:00:01.000 INFO alpha\n",
+            )
+            .unwrap();
+        }
+
+        let mut app = AppState::new(Project::new(root.path()));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('/'));
+        // `k` would move up; here it starts the file name.
+        type_str(&mut app, "kern");
+        assert_eq!(browser_rows(&app)[browser(&app).selected], "kernel.log");
+
+        press(&mut app, KeyCode::Enter);
+        app.finish_work();
+        assert!(matches!(app.mode, Mode::Normal));
+        let added: Vec<&str> = app
+            .project
+            .files
+            .iter()
+            .filter(|file| !file.is_merged())
+            .map(|file| file.display_name.as_str())
+            .collect();
+        assert_eq!(added, ["kernel.log"]);
     }
 
     #[test]
