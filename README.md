@@ -22,10 +22,12 @@ together they explain what the app is built out of and how the pieces fit and ru
 
 ## Features
 
-- **Folder = project.** State persists to `<folder>/.logscouter/project.json`.
+- **Folder = project.** State persists to `<folder>/.logscouter/project.json`, created by
+  your first `Ctrl+s` — opening a folder writes nothing into it. An existing `.logscouter`
+  is always loaded, and from then on the project autosaves as you work.
 - **Session restore.** Quitting records the panes, the logs open in each, the split, the
   search, and the workspace layout (sidebar width, pane sizes, panel visibility, focus mode).
-  Reopening the folder resumes exactly there.
+  Reopening the folder resumes exactly there — for a project you have saved at least once.
 - **Structured extraction.** Log format expressions use `<field>` placeholders, and
   `<field?>` for a field that is only present on some lines. A bracketed-field
   server log format is built in.
@@ -1550,9 +1552,10 @@ On a 152 MB / 116k-line bracketed server log:
 ## Filter Persistence
 
 Filters belong to the project, not to a single pane. Adding, hiding, importing,
-or clearing a filter rewrites `<project>/.logscouter/project.json` right away — no
-`Ctrl+s` needed — and the filters are reapplied the next time you open the
-folder. The sidebar `Filters` section always shows the active set.
+or clearing a filter rewrites `<project>/.logscouter/project.json` right away —
+once the project exists, that is: the first `Ctrl+s` creates `.logscouter`, and after
+it every such edit autosaves without a further `Ctrl+s`. The filters are reapplied the
+next time you open the folder. The sidebar `Filters` section always shows the active set.
 
 Filters can optionally be scoped to a log format. A scoped filter applies only to
 entries using that format; in a merged pane it applies per source entry. The

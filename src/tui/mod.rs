@@ -2467,7 +2467,7 @@ pub fn run(project: Project) -> anyhow::Result<()> {
     // Record the panes, their files and their searches, so reopening this folder
     // resumes where it left off.
     app.capture_session();
-    app.project.save().ok();
+    app.project.save_if_established().ok();
     Ok(())
 }
 
@@ -7733,7 +7733,7 @@ impl AppState {
         }
 
         self.capture_session();
-        self.project.save().ok();
+        self.project.save_if_established().ok();
 
         let mut project = Project::load(&folder);
         let added = match project.add_text_files_from_dir(&folder) {
@@ -12700,10 +12700,11 @@ impl AppState {
         self.autosave_project();
     }
 
-    /// Persist without overwriting the caller's status message on success.
+    /// Persist without overwriting the caller's status message on success. A no-op until the
+    /// user has saved once: opening a folder must not create `.logscouter` behind their back.
     fn autosave_project(&mut self) {
         self.capture_session();
-        if let Err(exc) = self.project.save() {
+        if let Err(exc) = self.project.save_if_established() {
             self.status = format!("save failed: {exc}");
         }
     }
@@ -15323,6 +15324,12 @@ mod tests {
     const LONG_MESSAGE: &str =
         "UserSession::TimeOut() failed to resolve inbox message for session 4A2F99BC";
 
+    /// Stand in for the user's first Ctrl+s: autosaves are no-ops until `.logscouter` exists,
+    /// so a test that asserts on the saved project has to establish it first.
+    fn establish_project(app: &mut AppState) {
+        app.project.save().unwrap();
+    }
+
     fn app_with_log(root: &std::path::Path) -> AppState {
         let log = root.join("a.log");
         std::fs::write(
@@ -16026,6 +16033,7 @@ mod tests {
     fn hide_with_a_multi_line_selection_prefills_a_derived_pattern() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_lines(tmp.path(), 10);
+        establish_project(&mut app);
         let total = app.active_view().unwrap().visible.len();
         assert_eq!(total, 10);
 
@@ -17057,9 +17065,41 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_folder_leaves_no_trace_until_the_user_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_log(tmp.path());
+        let config = tmp.path().join(".logscouter");
+
+        // Work that would normally autosave: the folder is still untouched, because the
+        // user has not asked for anything to be written here.
+        add_filter_text(&mut app, "level equals exclude Trace");
+        assert_eq!(app.project.filters.rules.len(), 1);
+        assert!(
+            !config.exists(),
+            "opening a folder created {}",
+            config.display()
+        );
+
+        // Ctrl+s is what creates it -- with the work done so far.
+        press_mod(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(app.status, "saved");
+        let saved = std::fs::read_to_string(config.join("project.json")).unwrap();
+        assert!(saved.contains("Trace"), "{saved}");
+
+        // And from then on autosaves land, so a later edit needs no second Ctrl+s.
+        app.dispatch_command(Command::ClearFilters).unwrap();
+        app.finish_work();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config.join("project.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["filters"]["rules"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
     fn adding_a_filter_autosaves_it_and_it_returns_on_the_next_run() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_log(tmp.path());
+        establish_project(&mut app);
         let before = app.active_view().unwrap().visible.len();
         assert_eq!(before, 2);
 
@@ -17069,7 +17109,7 @@ mod tests {
         assert_eq!(app.active_view().unwrap().visible.len(), 1);
         assert_eq!(app.project.filters.rules.len(), 1);
 
-        // Autosaved without any explicit Ctrl+s.
+        // Autosaved without a further Ctrl+s, the project folder already existing.
         let saved = std::fs::read_to_string(tmp.path().join(".logscouter/project.json")).unwrap();
         assert!(
             saved.contains("\"filters\""),
@@ -18189,6 +18229,7 @@ mod tests {
     fn filters_are_global_across_panes_and_survive_clearing() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_log(tmp.path());
+        establish_project(&mut app);
 
         press(&mut app, KeyCode::Char('|')); // split
         assert_eq!(app.panes.len(), 2);
@@ -19272,6 +19313,7 @@ mod tests {
     fn source_editor_saves_name_description_tag_and_schema() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut app, _) = app_with_two_logs(tmp.path());
+        establish_project(&mut app);
         app.focus = Focus::Sidebar;
         app.sidebar_selected = 1; // a.log
         let file_id = app.file_id_at(app.sidebar_selected).unwrap();
@@ -19938,6 +19980,7 @@ mod tests {
         let simple_log = tmp.path().join("simple.log");
         std::fs::write(&simple_log, "10:00:01 WARN: disk almost full\n").unwrap();
         let (mut app, _) = app_with_two_logs(tmp.path());
+        establish_project(&mut app);
         app.submit_add_file(simple_log.to_string_lossy().to_string())
             .unwrap();
         app.finish_work();
@@ -19986,6 +20029,7 @@ mod tests {
         let simple_log = tmp.path().join("simple.log");
         std::fs::write(&simple_log, "10:00:01 WARN: disk almost full\n").unwrap();
         let (mut app, _) = app_with_two_logs(tmp.path());
+        establish_project(&mut app);
         app.submit_add_file(simple_log.to_string_lossy().to_string())
             .unwrap();
         app.finish_work();
@@ -20534,6 +20578,7 @@ mod tests {
     fn x_exports_schemas_and_i_imports_them_into_another_project() {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_log(tmp.path());
+        establish_project(&mut app);
 
         // Define a second schema so the export is not just the built-in default.
         app.project
@@ -20564,6 +20609,7 @@ mod tests {
         // A fresh project starts with only the built-in schemas.
         let other = tempfile::tempdir().unwrap();
         let mut app2 = app_with_log(other.path());
+        establish_project(&mut app2);
         assert_eq!(app2.project.extractors.len(), 2);
 
         app2.dispatch_command(Command::ImportSchemas).unwrap();

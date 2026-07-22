@@ -673,6 +673,24 @@ impl Project {
             .to_string()
     }
 
+    /// Whether this folder already has a `.logscouter` on disk, i.e. the user has saved here
+    /// before. Only an explicit save (ctrl+s) may create one; everything else asks this first.
+    pub fn is_established(&self) -> bool {
+        self.config_dir().is_dir()
+    }
+
+    /// Persist, but only into a `.logscouter` that already exists.
+    ///
+    /// Autosaves must never be what creates the folder: merely opening a log should leave no
+    /// trace in the user's directory. Once they have saved once, the same autosaves keep the
+    /// project up to date as before.
+    pub fn save_if_established(&self) -> std::io::Result<()> {
+        if !self.is_established() {
+            return Ok(());
+        }
+        self.save()
+    }
+
     pub fn save(&self) -> std::io::Result<()> {
         fs::create_dir_all(self.config_dir())?;
         let tmp = self.config_path().with_extension("json.tmp");

@@ -415,7 +415,9 @@ fn run_tui(
     let Some(folder_arg) = folder else {
         // No folder: `logscout -f app.log` (and/or `-i`) opens just what was named, rooted at
         // the current directory. Auto-detection still picks a schema from the libraries.
-        let mut project = Project::new(cwd.clone());
+        // A `.logscouter` already saved here is still honoured -- it is the user's own project
+        // for this folder, and ignoring it would lose their filters, searches and bookmarks.
+        let mut project = Project::load(cwd.clone());
         add_files(&mut project, &cwd, &file_flags);
         if stdin {
             project.add_stdin_source();
