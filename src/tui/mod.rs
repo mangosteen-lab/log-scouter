@@ -23,6 +23,7 @@ use crate::core::models::{
 };
 use crate::core::parser::{self, EntryBuilder};
 use crate::core::project::{Bookmark, PaneSession, Project, Session, CONFIG_DIR};
+use crate::core::release::{self, UpgradeEvent, Upgraded, CURRENT_VERSION, RELEASE_REPO};
 use crate::core::search::{
     compile_query, export_searches_to_folder, install_default_search_library,
     load_searches_from_folder, parse_datetime, save_search_file, user_search_dir, Predicate, Query,
@@ -140,6 +141,10 @@ struct UiConfig {
     /// to come back to the log directory you were digging in, whichever project you open next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_browse_dir: Option<PathBuf>,
+    /// The release the user last said "not now" to. Kept so the offer is made once per
+    /// release rather than once per launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    update_prompt_declined: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -147,6 +152,7 @@ impl Default for UiConfig {
         Self {
             theme: ThemeName::Classic,
             last_browse_dir: None,
+            update_prompt_declined: None,
         }
     }
 }
@@ -1372,9 +1378,14 @@ struct LivePickResult {
 enum Mode {
     Normal,
     Search(String),
+    /// A second query typed at the results panel, narrowing the matches already found
+    /// rather than searching the log again.
+    ResultsFilter(String),
     AddFile(String),
     /// The `o` popup: walk the filesystem and pick a folder, rather than typing its path.
     OpenFolder(FolderBrowser),
+    /// The start-up "a newer release exists -- install it?" popup.
+    Upgrade(UpgradePrompt),
     Filter(String),
     TimePicker(TimePicker),
     ExportFilters(String),
@@ -1817,6 +1828,32 @@ impl TimePicker {
             }
         }
         Ok(format!("{start}..{end}"))
+    }
+}
+
+/// The start-up offer to install a newer release, and how it is going once accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpgradePrompt {
+    /// The version on offer.
+    latest: String,
+    /// `None` until the user says yes; then the last thing the worker reported.
+    progress: Option<String>,
+    /// The outcome once the worker has finished, `Ok` naming the installed version.
+    outcome: Option<Result<String, String>>,
+}
+
+impl UpgradePrompt {
+    fn new(latest: String) -> Self {
+        Self {
+            latest,
+            progress: None,
+            outcome: None,
+        }
+    }
+
+    /// Whether the question is still open, i.e. `y`/`n` still mean something.
+    fn asking(&self) -> bool {
+        self.progress.is_none() && self.outcome.is_none()
     }
 }
 
@@ -2419,6 +2456,7 @@ pub fn run(project: Project) -> anyhow::Result<()> {
     let mut app = AppState::new(project);
     app.queue_initial_loads();
     app.start_hub_sync();
+    app.start_update_check();
 
     loop {
         // A reply from the AI worker may have arrived; run any tools it asked for. Wrap it
@@ -2436,6 +2474,9 @@ pub fn run(project: Project) -> anyhow::Result<()> {
         app.drain_live_pick_events();
         // A start-up hub refresh may have landed; pick up any new schemas.
         app.drain_hub_events();
+        // The release check, and then the upgrade it may have led to.
+        app.drain_update_check();
+        app.drain_upgrade_events();
         app.check_source_modifications();
 
         // Long work runs in slices between frames, so the progress bar animates and
@@ -2459,6 +2500,7 @@ pub fn run(project: Project) -> anyhow::Result<()> {
         let poll = if app.ai_busy()
             || app.schema_pending()
             || app.live_active()
+            || app.upgrade_rx.is_some()
             || app.live_pick_rx.is_some()
         {
             Duration::from_millis(30)
@@ -2558,6 +2600,11 @@ struct AppState {
     bookmark_nav_pending: Option<BookmarkNavPending>,
     results_selected: usize,
     results_scroll: usize,
+    /// The refine query typed at the results panel: the text as shown, and its compiled
+    /// form when it parses. Narrows the match list only -- the pane's own search, and so
+    /// which lines are highlighted in it, is untouched.
+    results_filter_text: String,
+    results_filter: Option<Query>,
     results_area: Rect,
     /// Inner rect of the sidebar list, for click hit-testing.
     sidebar_area: Rect,
@@ -2588,6 +2635,13 @@ struct AppState {
     live_pick_rx: Option<Receiver<LivePickResult>>,
     /// A start-up hub refresh in flight. `None` once every outcome has been drained.
     hub_sync_rx: Option<Receiver<SyncOutcome>>,
+    /// The start-up release check, until it answers.
+    update_check_rx: Option<Receiver<String>>,
+    /// An accepted upgrade, while it downloads and installs.
+    upgrade_rx: Option<Receiver<UpgradeEvent>>,
+    /// How an accepted upgrade is started. A field so tests can drive the popup through
+    /// its whole life without touching the network.
+    upgrade_spawner: fn(&str, &str) -> Receiver<UpgradeEvent>,
     /// Char index of the edit caret within the active input popup.
     input_cursor: usize,
     /// Panes of the restored session that want a merge. A merge interleaves entries by
@@ -2648,6 +2702,8 @@ impl AppState {
             bookmark_nav_pending: None,
             results_selected: 0,
             results_scroll: 0,
+            results_filter_text: String::new(),
+            results_filter: None,
             results_area: Rect::default(),
             sidebar_area: Rect::default(),
             pane_areas: Vec::new(),
@@ -2668,6 +2724,9 @@ impl AppState {
             last_source_check: Instant::now(),
             live_pick_rx: None,
             hub_sync_rx: None,
+            update_check_rx: None,
+            upgrade_rx: None,
+            upgrade_spawner: release::spawn_upgrade,
             input_cursor: 0,
             pending_merges: Vec::new(),
             ai: None,
@@ -2969,6 +3028,114 @@ impl AppState {
             return;
         }
         self.hub_sync_rx = Some(spawn_sync(due));
+    }
+
+    /// Ask in the background whether a newer release exists. Off the main thread on
+    /// purpose: the logs must be on screen before GitHub has answered, if it ever does.
+    fn start_update_check(&mut self) {
+        self.update_check_rx = Some(release::spawn_update_check(CURRENT_VERSION));
+    }
+
+    /// Take the release check's answer and offer the upgrade.
+    ///
+    /// The offer waits for a quiet moment -- no popup open, no work running -- so it can
+    /// never land on top of something the user is in the middle of. A version already
+    /// declined is not offered again; the next release is.
+    fn drain_update_check(&mut self) {
+        let Some(rx) = &self.update_check_rx else {
+            return;
+        };
+        let latest = match rx.try_recv() {
+            Ok(latest) => {
+                self.update_check_rx = None;
+                latest
+            }
+            // One-shot: disconnected means it finished with nothing to say.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.update_check_rx = None;
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+        };
+        if self.ui_config.update_prompt_declined.as_deref() == Some(latest.as_str()) {
+            return;
+        }
+        if !matches!(self.mode, Mode::Normal) || self.work_pending() {
+            // Rare -- the check takes a moment and the user is usually still reading --
+            // but a popup stealing the keyboard mid-task is not acceptable. Say it in the
+            // status bar instead, where `logscout upgrade` is one command away.
+            self.status =
+                format!("logscout {CURRENT_VERSION} -> {latest} available; run `logscout upgrade`");
+            return;
+        }
+        self.mode = Mode::Upgrade(UpgradePrompt::new(latest));
+    }
+
+    /// Follow an accepted upgrade: progress into the popup, the outcome into both.
+    fn drain_upgrade_events(&mut self) {
+        let Some(rx) = &self.upgrade_rx else {
+            return;
+        };
+        let mut events = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.upgrade_rx = None;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            }
+        }
+        for event in events {
+            match event {
+                UpgradeEvent::Progress(step) => {
+                    if let Mode::Upgrade(prompt) = &mut self.mode {
+                        prompt.progress = Some(step.clone());
+                    }
+                    self.status = format!("upgrading: {step}");
+                }
+                UpgradeEvent::Done(result) => {
+                    self.upgrade_rx = None;
+                    let outcome = match result {
+                        Ok(Upgraded::Replaced { version, .. }) => {
+                            self.status =
+                                format!("upgraded to logscout {version}; restart to use it");
+                            Ok(version)
+                        }
+                        Ok(Upgraded::AlreadyCurrent(version)) => {
+                            self.status = format!("logscout {version} is already the latest");
+                            Ok(version)
+                        }
+                        Err(error) => {
+                            self.status = format!("upgrade failed: {error}");
+                            Err(error)
+                        }
+                    };
+                    if let Mode::Upgrade(prompt) = &mut self.mode {
+                        prompt.outcome = Some(outcome);
+                        prompt.progress = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Say yes to the offer: install it in the background, keeping the app usable.
+    fn accept_upgrade(&mut self, prompt: &mut UpgradePrompt) {
+        self.upgrade_rx = Some((self.upgrade_spawner)(CURRENT_VERSION, &prompt.latest));
+        prompt.progress = Some("starting".to_string());
+        self.status = format!("upgrading to logscout {}", prompt.latest);
+    }
+
+    /// Say no: remember which version was turned down, so this run and every later one
+    /// stay quiet until there is a newer release than the one refused.
+    fn decline_upgrade(&mut self, latest: &str) {
+        self.ui_config.update_prompt_declined = Some(latest.to_string());
+        let _ = self.save_ui_config();
+        self.mode = Mode::Normal;
+        self.status =
+            format!("staying on logscout {CURRENT_VERSION}; run `logscout upgrade` later");
     }
 
     /// Take any finished background sync. Called every loop, so a refresh that lands while
@@ -5026,8 +5193,13 @@ impl AppState {
                 } else {
                     self.results_selected + 1
                 };
+                let refine = if self.results_filter_text.is_empty() {
+                    String::new()
+                } else {
+                    format!(" + /{}/", self.results_filter_text)
+                };
                 format!(
-                    "Matches {selected}/{count}  /{}/  click or Enter to jump",
+                    "Matches {selected}/{count}  /{}/{refine}  click or Enter to jump",
                     view.query_text
                 )
             })
@@ -5090,13 +5262,21 @@ impl AppState {
                 level,
                 message
             );
+            // Every row here is a match, so the match colour would say nothing. Colour by
+            // level instead, exactly as the pane does, and an error stands out in the list.
             let style = if selected {
                 theme.selected()
             } else {
-                theme.matched()
+                level_style(&file.get_field(entry, "level"))
             };
             let line = crop(&raw_line, 0, inner.width as usize);
-            let search_ranges = query_highlight_ranges(view.query.as_ref(), &raw_line);
+            let mut search_ranges = query_highlight_ranges(view.query.as_ref(), &raw_line);
+            // The refine is what the eye is hunting for now, so highlight it too.
+            search_ranges.extend(query_highlight_ranges(
+                self.results_filter.as_ref(),
+                &raw_line,
+            ));
+            normalize_ranges(&mut search_ranges);
             rows.push(ListItem::new(if search_ranges.is_empty() {
                 Line::from(Span::styled(line, style))
             } else {
@@ -5114,10 +5294,18 @@ impl AppState {
         match self.mode.clone() {
             Mode::Normal => {}
             Mode::Search(_) => {}
+            Mode::ResultsFilter(text) => self.draw_input_popup(
+                frame,
+                root,
+                "Refine Matches",
+                "Narrow the matches already found -- same syntax as search",
+                &text,
+            ),
             Mode::AddFile(text) => {
                 self.draw_input_popup(frame, root, "Add File", "Type a path and press Enter", &text)
             }
             Mode::OpenFolder(browser) => self.draw_folder_browser(frame, root, browser),
+            Mode::Upgrade(prompt) => self.draw_upgrade_prompt(frame, root, &prompt),
             Mode::Filter(text) => self.draw_input_popup(
                 frame,
                 root,
@@ -5377,6 +5565,81 @@ impl AppState {
             area,
         );
         self.mode = Mode::OpenFolder(browser);
+    }
+
+    /// The start-up upgrade offer, and afterwards the install it is running.
+    fn draw_upgrade_prompt(&self, frame: &mut Frame, root: Rect, prompt: &UpgradePrompt) {
+        let theme = self.theme();
+        let mut lines = vec![
+            Line::from(Span::styled(
+                format!("  logscout {CURRENT_VERSION}  ->  {}", prompt.latest),
+                Style::default()
+                    .fg(theme.accent())
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "  https://github.com/{RELEASE_REPO}/releases/tag/v{}",
+                    prompt.latest
+                ),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+        ];
+
+        let footer = match (&prompt.outcome, &prompt.progress) {
+            (Some(Ok(version)), _) => {
+                lines.push(Line::from(Span::styled(
+                    format!("  Installed logscout {version}."),
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(
+                    "  This session keeps running the old binary; the new one starts next time.",
+                ));
+                "  any key closes"
+            }
+            (Some(Err(error)), _) => {
+                lines.push(Line::from(Span::styled(
+                    format!("  Upgrade failed: {error}"),
+                    Style::default().fg(Color::Red),
+                )));
+                lines.push(Line::from(
+                    "  Nothing was changed. `logscout upgrade` retries it.",
+                ));
+                "  any key closes"
+            }
+            (None, Some(step)) => {
+                lines.push(Line::from(format!("  {step}...")));
+                lines.push(Line::from(
+                    "  Carry on working -- this runs in the background.",
+                ));
+                "  Esc hides this; the result lands in the status bar"
+            }
+            (None, None) => {
+                lines.push(Line::from(
+                    "  Install it now? It replaces the binary you are",
+                ));
+                lines.push(Line::from(
+                    "  running; this session carries on unchanged, and the",
+                ));
+                lines.push(Line::from("  new version starts with your next logscout."));
+                "  y  upgrade now      n / Esc  not now (asked again next release)"
+            }
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let width = 74.min(root.width);
+        let height = (lines.len() as u16 + 2).min(root.height.max(7));
+        let area = centered_rect(width, height, root);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .title("A new logscout is available")
+            .borders(Borders::ALL);
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
     }
 
     fn draw_palette(&self, frame: &mut Frame, root: Rect, palette: Palette) {
@@ -6416,6 +6679,7 @@ impl AppState {
         let mode_kind = match &self.mode {
             Mode::Normal => 0,
             Mode::Search(_)
+            | Mode::ResultsFilter(_)
             | Mode::AddFile(_)
             | Mode::Filter(_)
             | Mode::ExportFilters(_)
@@ -6450,6 +6714,7 @@ impl AppState {
             Mode::LiveQuickPick(_) => 14,
             Mode::FilterLibraryPicker(_) => 15,
             Mode::SearchLibraryPicker(_) => 16,
+            Mode::Upgrade(_) => 17,
         };
 
         match mode_kind {
@@ -6473,6 +6738,7 @@ impl AppState {
             14 => self.handle_live_quick_pick_key(key),
             15 => self.handle_filter_library_picker_key(key),
             16 => self.handle_search_library_picker_key(key),
+            17 => self.handle_upgrade_key(key),
             _ => Ok(false),
         }
     }
@@ -7158,9 +7424,13 @@ impl AppState {
             self.g_pending = false;
             self.count = 0;
             if key.code == KeyCode::Char('g') {
-                self.clear_active_selection();
-                if let Some(view) = self.active_view_mut() {
-                    view.move_cursor_to(0);
+                if self.focus == Focus::Results {
+                    self.jump_result_to(0);
+                } else {
+                    self.clear_active_selection();
+                    if let Some(view) = self.active_view_mut() {
+                        view.move_cursor_to(0);
+                    }
                 }
             }
             return Ok(false);
@@ -7195,6 +7465,12 @@ impl AppState {
                 self.g_pending = true;
                 self.count = 0;
             }
+            // `G` last, `<n>G` the nth -- of the matches when the results panel has focus,
+            // of the pane's lines otherwise.
+            KeyCode::Char('G') if self.focus == Focus::Results => {
+                let target = if count > 1 { count - 1 } else { usize::MAX };
+                self.jump_result_to(target);
+            }
             KeyCode::Char('G') => {
                 self.clear_active_selection();
                 if let Some(view) = self.active_view_mut() {
@@ -7205,6 +7481,14 @@ impl AppState {
                     };
                     view.move_cursor_to(target);
                 }
+            }
+            KeyCode::PageDown | KeyCode::PageUp if self.focus == Focus::Results => {
+                let rows = (self.results_area.height as isize).max(1);
+                self.move_result_selection(if key.code == KeyCode::PageDown {
+                    rows
+                } else {
+                    -rows
+                });
             }
             KeyCode::PageDown => {
                 self.clear_active_selection();
@@ -7224,6 +7508,8 @@ impl AppState {
                     view.scroll_x += 8 * count;
                 }
             }
+            KeyCode::Home if self.focus == Focus::Results => self.jump_result_to(0),
+            KeyCode::End if self.focus == Focus::Results => self.jump_result_to(usize::MAX),
             KeyCode::Char('0') | KeyCode::Home => {
                 if let Some(view) = self.active_view_mut() {
                     view.scroll_x = 0;
@@ -7240,6 +7526,11 @@ impl AppState {
                 } else if let Some(view) = self.active_view_mut() {
                     view.scroll_x += 200;
                 }
+            }
+            // At the results panel `/` searches within what was found, rather than starting
+            // the pane's search over.
+            KeyCode::Char('/') if self.focus == Focus::Results => {
+                self.open_input(Mode::ResultsFilter(self.results_filter_text.clone()));
             }
             KeyCode::Char('/') => {
                 let existing = self
@@ -7261,6 +7552,9 @@ impl AppState {
                 if selected {
                     self.clear_active_selection();
                     self.status = "selection cleared".to_string();
+                } else if self.clear_results_filter() {
+                    // One layer at a time: the refine goes before the search it narrowed.
+                    self.status = "refine cleared".to_string();
                 } else {
                     self.clear_search();
                 }
@@ -7310,7 +7604,8 @@ impl AppState {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
-        if matches!(self.mode, Mode::Search(_)) {
+        // Both searches apply as they are typed, so they share the incremental handler.
+        if matches!(self.mode, Mode::Search(_) | Mode::ResultsFilter(_)) {
             return self.handle_search_key(key);
         }
 
@@ -7451,8 +7746,18 @@ impl AppState {
         }
 
         if changed {
-            if let Mode::Search(text) = &self.mode {
-                self.apply_search_text(text.clone(), After::GotoFirstMatch);
+            match &self.mode {
+                Mode::Search(text) => {
+                    let text = text.clone();
+                    self.apply_search_text(text, After::GotoFirstMatch);
+                }
+                // The refine runs over matches already in hand, so it can be applied on
+                // every keystroke without rescanning the file.
+                Mode::ResultsFilter(text) => {
+                    let text = text.clone();
+                    self.apply_results_filter(text);
+                }
+                _ => {}
             }
         }
         Ok(false)
@@ -7463,6 +7768,7 @@ impl AppState {
     fn open_input(&mut self, mode: Mode) {
         self.input_cursor = match &mode {
             Mode::Search(text)
+            | Mode::ResultsFilter(text)
             | Mode::AddFile(text)
             | Mode::Filter(text)
             | Mode::ExportFilters(text)
@@ -7639,6 +7945,7 @@ impl AppState {
     fn input_mut(&mut self) -> Option<&mut String> {
         match &mut self.mode {
             Mode::Search(input)
+            | Mode::ResultsFilter(input)
             | Mode::AddFile(input)
             | Mode::Filter(input)
             | Mode::ExportFilters(input)
@@ -7666,6 +7973,7 @@ impl AppState {
         let mode = std::mem::replace(&mut self.mode, Mode::Normal);
         match mode {
             Mode::Search(text) => self.submit_search(text),
+            Mode::ResultsFilter(text) => self.apply_results_filter(text),
             Mode::AddFile(path) => self.submit_add_file(path)?,
             Mode::Filter(text) => self.submit_filter(text),
             Mode::ExportFilters(folder) => self.submit_export_filters(folder),
@@ -7714,7 +8022,40 @@ impl AppState {
         self.save_project();
     }
 
+    /// Narrow the results panel to the matches this second query also matches. An empty
+    /// query is no refine at all, which is how it is cleared.
+    fn apply_results_filter(&mut self, text: String) {
+        self.results_filter_text = text.trim().to_string();
+        self.results_filter = if self.results_filter_text.is_empty() {
+            None
+        } else {
+            Some(compile_query(&self.results_filter_text))
+        };
+        self.results_selected = 0;
+        self.results_scroll = 0;
+        match self.results_filter.as_ref() {
+            Some(query) if !query.error.is_empty() => {
+                self.status = format!("refine: {}", query.error);
+            }
+            Some(_) | None => self.status.clear(),
+        }
+    }
+
+    /// Drop the refine, leaving the pane's search alone. Returns whether there was one.
+    fn clear_results_filter(&mut self) -> bool {
+        if self.results_filter.is_none() && self.results_filter_text.is_empty() {
+            return false;
+        }
+        self.results_filter = None;
+        self.results_filter_text.clear();
+        self.results_selected = 0;
+        self.results_scroll = 0;
+        true
+    }
+
     fn apply_search_text(&mut self, query_text: String, after: After) {
+        // The refine narrowed the old matches; against a new search it means nothing.
+        self.clear_results_filter();
         if let Some(view) = self.active_view_mut() {
             view.query_text = query_text.trim().to_string();
             view.query = if view.query_text.is_empty() {
@@ -10211,6 +10552,31 @@ impl AppState {
         }
     }
 
+    /// The upgrade popup. While it is asking, only `y` and `n`/`Esc` mean anything --
+    /// installing a binary is not something a stray keystroke should start. Once it is
+    /// running or finished, any key dismisses it.
+    fn handle_upgrade_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Mode::Upgrade(mut prompt) = self.mode.clone() else {
+            return Ok(false);
+        };
+        if !prompt.asking() {
+            self.mode = Mode::Normal;
+            return Ok(false);
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.accept_upgrade(&mut prompt);
+                self.mode = Mode::Upgrade(prompt);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                let latest = prompt.latest.clone();
+                self.decline_upgrade(&latest);
+            }
+            _ => self.mode = Mode::Upgrade(prompt),
+        }
+        Ok(false)
+    }
+
     fn handle_folder_browser_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
         let Mode::OpenFolder(mut browser) = self.mode.clone() else {
             return Ok(false);
@@ -12469,6 +12835,7 @@ impl AppState {
     }
 
     fn clear_search(&mut self) {
+        self.clear_results_filter();
         if let Some(view) = self.active_view_mut() {
             view.query = None;
             view.query_text.clear();
@@ -12830,9 +13197,36 @@ impl AppState {
     }
 
     fn active_result_positions(&self) -> Vec<usize> {
-        self.active_view()
-            .map(|view| view.match_positions())
-            .unwrap_or_default()
+        let Some(view) = self.active_view() else {
+            return Vec::new();
+        };
+        let positions = view.match_positions();
+        let (Some(filter), Some(file_index)) = (&self.results_filter, self.active_file_index())
+        else {
+            return positions;
+        };
+        let file = &self.project.files[file_index];
+        positions
+            .into_iter()
+            .filter(|position| {
+                view.visible
+                    .get(*position)
+                    .and_then(|global| file.entries.get(global))
+                    .map(|entry| filter.matches(file, entry))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Put the results cursor on `index`, or the last match when there are fewer.
+    fn jump_result_to(&mut self, index: usize) {
+        let count = self.active_result_positions().len();
+        if count == 0 {
+            self.results_selected = 0;
+            self.results_scroll = 0;
+            return;
+        }
+        self.results_selected = index.min(count - 1);
     }
 
     fn jump_to_selected_result(&mut self) {
@@ -15139,11 +15533,11 @@ Project/files
   a browse for a file  o browse for a folder      d delete selected item      Ctrl+s save
   Ctrl+P Add live source; Right quick-picks Docker/Kubernetes names; r refreshes sources
   d/Delete delete what the cursor is on: a log source, filter, or saved search
-  In the browser: j/k or arrows move, Enter opens './' or a folder (or adds the file),
-                  Right enters, Left/Backspace goes up, '.' shows hidden, Esc cancels
-                  a's file picker also lists files; Enter adds one, or 'p' types a path
-                  '/' then type a name to jump to it: every letter is text while
-                  searching, Up/Down step the matches, Esc stops searching
+  In the browser: arrows move, Enter opens './' or a folder (or adds the file), Right
+                  enters, Left/Backspace goes up, '.' shows hidden, Ctrl+p types a path
+                  type a name to find it -- every letter is text, no key navigates;
+                  Up/Down step the matches, Esc stops searching, again cancels
+  A newer release is offered at start-up: y installs it in the background, n defers it
   Enter on a log source edits its short name, description, tag, and schema
   In source/live schema rows: i infer with LLM, e edit, L load library, X save library
   Space selects/deselects whatever the cursor is on; Enter opens its detail view.
@@ -15180,17 +15574,17 @@ Select/copy
 Filter/search
   / inline search   Enter opens matches panel    n/N next/previous match
                     c context 0/3/10
+  In the matches panel: / refines what was found (live; Esc drops it, keeping the search),
+    gg/G/[count]G/j/k/PgUp/PgDn/Home/End move, Enter jumps there, rows colour by level
   f guided filter builder   t time range picker
   In the builder: ↑↓ pick a row, ←→ change a dropdown or step suggestions, type to edit
                   the field/value, Tab switches to the raw grammar, Enter applies
-  Filters split into Text (as many as you like) and Time (at most one, replaced
-  by each new range rather than intersected with the old)
+  Filters split into Text (any number) and Time (at most one, replaced by each new range)
   T elapsed time from this line (again to restore absolute timestamps)
   H hide like current row
   b timeline histogram: cycle off / by level / by module / by source; drag across its
     bars to build a time-range filter (a click zooms to one bucket)
-  L loads the selected source schema, filter pack, bookmark pack, or saved-search library
-  X saves the selected source schema, filter pack, bookmark pack, or saved-search library
+  L/X load or save the selected source schema, filter pack, bookmark pack, or search library
   Schema pack import/export is still available from the command palette (Ctrl+P or :)
   E export selected lines, bookmarks, filters, and latest AI summary as Markdown
   Time range picker presets count back from the newest entry, not from now
@@ -15477,6 +15871,305 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Hand the app a release check that has already answered, without any network.
+    fn offer_upgrade(app: &mut AppState, latest: &str) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(latest.to_string()).unwrap();
+        drop(tx);
+        app.update_check_rx = Some(rx);
+        app.drain_update_check();
+    }
+
+    /// A scripted upgrade worker: the events it should report, in order.
+    fn scripted_upgrade(events: Vec<UpgradeEvent>) -> Receiver<UpgradeEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for event in events {
+            tx.send(event).unwrap();
+        }
+        rx
+    }
+
+    #[test]
+    fn a_newer_release_is_offered_and_installs_when_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_log(tmp.path());
+        // Stand in for the download, so the test needs no network.
+        app.upgrade_spawner = |_, _| {
+            scripted_upgrade(vec![
+                UpgradeEvent::Progress("downloading".to_string()),
+                UpgradeEvent::Done(Ok(Upgraded::Replaced {
+                    path: PathBuf::from("/usr/local/bin/logscout"),
+                    version: "9.9.9".to_string(),
+                })),
+            ])
+        };
+
+        offer_upgrade(&mut app, "9.9.9");
+        let Mode::Upgrade(prompt) = app.mode.clone() else {
+            panic!("expected the upgrade popup, got {:?}", app.mode);
+        };
+        assert_eq!(prompt.latest, "9.9.9");
+        assert!(prompt.asking());
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("A new logscout is available"), "{screen}");
+        assert!(screen.contains("y  upgrade now"), "{screen}");
+
+        // A key that is neither yes nor no leaves the question standing: installing a
+        // binary is not something a stray keystroke starts.
+        press(&mut app, KeyCode::Char('j'));
+        assert!(matches!(app.mode, Mode::Upgrade(_)), "{:?}", app.mode);
+
+        press(&mut app, KeyCode::Char('y'));
+        app.drain_upgrade_events();
+        let Mode::Upgrade(prompt) = app.mode.clone() else {
+            panic!("expected the popup to stay open, got {:?}", app.mode);
+        };
+        assert_eq!(prompt.outcome, Some(Ok("9.9.9".to_string())));
+        assert_eq!(app.status, "upgraded to logscout 9.9.9; restart to use it");
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("Installed logscout 9.9.9"), "{screen}");
+
+        // Finished: any key closes, and nothing was declined.
+        press(&mut app, KeyCode::Char(' '));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.ui_config.update_prompt_declined, None);
+    }
+
+    #[test]
+    fn a_declined_release_is_not_offered_again_but_a_later_one_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_log(tmp.path());
+
+        offer_upgrade(&mut app, "9.9.9");
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.status.contains("logscout upgrade"), "{}", app.status);
+
+        // Remembered at user level, so later runs stay quiet about this one.
+        assert_eq!(
+            app.ui_config.update_prompt_declined.as_deref(),
+            Some("9.9.9")
+        );
+        let saved = UiConfig::load_from(app.ui_config_path.as_deref().unwrap()).unwrap();
+        assert_eq!(saved.update_prompt_declined.as_deref(), Some("9.9.9"));
+
+        offer_upgrade(&mut app, "9.9.9");
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "re-offered {:?}",
+            app.mode
+        );
+
+        // A newer release than the one refused is a fresh question.
+        offer_upgrade(&mut app, "9.9.10");
+        assert!(matches!(app.mode, Mode::Upgrade(_)), "{:?}", app.mode);
+    }
+
+    /// The check answers whenever it answers -- it must never take the keyboard from
+    /// someone mid-task.
+    #[test]
+    fn an_upgrade_offer_never_interrupts_a_popup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_log(tmp.path());
+        press(&mut app, KeyCode::Char('o'));
+        assert!(matches!(app.mode, Mode::OpenFolder(_)));
+
+        offer_upgrade(&mut app, "9.9.9");
+
+        assert!(matches!(app.mode, Mode::OpenFolder(_)), "{:?}", app.mode);
+        assert!(
+            app.status.contains("9.9.9") && app.status.contains("logscout upgrade"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_failed_upgrade_says_so_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_log(tmp.path());
+        app.upgrade_spawner = |_, _| {
+            scripted_upgrade(vec![UpgradeEvent::Done(Err(
+                "could not download v9.9.9: timed out".to_string(),
+            ))])
+        };
+
+        offer_upgrade(&mut app, "9.9.9");
+        press(&mut app, KeyCode::Char('y'));
+        app.drain_upgrade_events();
+
+        assert_eq!(
+            app.status,
+            "upgrade failed: could not download v9.9.9: timed out"
+        );
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("Upgrade failed"), "{screen}");
+        assert!(screen.contains("Nothing was changed"), "{screen}");
+    }
+
+    /// `render`, but keeping the styles: colour is the point of some assertions.
+    fn render_buffer(app: &mut AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// A log whose lines differ in level and in wording, so the results panel has both
+    /// something to colour and something to refine.
+    fn app_with_mixed_levels(root: &std::path::Path) -> AppState {
+        let log = root.join("mixed.log");
+        let rows = [
+            ("Error", "disk failed on node 1"),
+            ("Trace", "disk probe on node 2"),
+            ("Error", "socket timeout on node 3"),
+            ("Info", "disk mounted on node 4"),
+        ];
+        let body: String = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (level, message))| {
+                format!(
+                    "2026-06-16 10:09:0{index}.000 [HOST:h][SERVER:S][PID:5][THR:9][Kernel][{level}][UID:0][SID:0][OID:0][D.cpp:{index}] {message}\n"
+                )
+            })
+            .collect();
+        std::fs::write(&log, body).unwrap();
+        boot(Project::load(root), &log)
+    }
+
+    /// Search for `query`, then move the focus onto the matches panel.
+    fn search_and_focus_results(app: &mut AppState, query: &str) {
+        press(app, KeyCode::Char('/'));
+        type_text(app, query);
+        press(app, KeyCode::Enter);
+        assert!(app.search_results_visible(), "no results panel to focus");
+        press(app, KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Results, "Tab did not reach the matches");
+    }
+
+    #[test]
+    fn the_results_panel_takes_vim_motions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_mixed_levels(tmp.path());
+        search_and_focus_results(&mut app, "node");
+        assert_eq!(app.active_result_positions().len(), 4);
+
+        // G lands on the last match, gg back on the first, <n>G on the nth.
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.results_selected, 3);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.results_selected, 0);
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.results_selected, 2);
+        // A count past the end stops at the last match rather than falling off it.
+        press(&mut app, KeyCode::Char('9'));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.results_selected, 3);
+
+        // End/Home are the same two ends, and j/k still step.
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.results_selected, 0);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.results_selected, 1);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.results_selected, 3);
+
+        // The pane is left alone until Enter, which jumps it to the selected match.
+        assert_eq!(app.active_view().unwrap().cursor, 0);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_view().unwrap().cursor, 3);
+    }
+
+    #[test]
+    fn the_results_panel_refines_the_matches_it_already_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_mixed_levels(tmp.path());
+        search_and_focus_results(&mut app, "node");
+        let visible = app.active_view().unwrap().visible.len();
+
+        // `/` here narrows the matches instead of starting the pane's search over.
+        press(&mut app, KeyCode::Char('/'));
+        assert!(matches!(app.mode, Mode::ResultsFilter(_)), "{:?}", app.mode);
+        type_text(&mut app, "disk");
+
+        // Applied as it is typed, and only to the matches: the search and the pane's own
+        // rows are untouched.
+        assert_eq!(app.active_result_positions().len(), 3);
+        assert_eq!(app.active_view().unwrap().query_text, "node");
+        assert_eq!(app.active_view().unwrap().visible.len(), visible);
+
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, Mode::Normal));
+        let screen = render(&mut app, 140, 30);
+        assert!(screen.contains("Matches 1/3  /node/ + /disk/"), "{screen}");
+
+        // Refining again narrows further, and both queries are highlighted.
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, " mounted");
+        assert_eq!(app.active_result_positions().len(), 1);
+        press(&mut app, KeyCode::Esc);
+
+        // Esc backs out of the refine first, keeping the search that found the matches.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.status, "refine cleared");
+        assert_eq!(app.active_result_positions().len(), 4);
+        assert_eq!(app.active_view().unwrap().query_text, "node");
+
+        // A second Esc is the search itself, as it always was.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.active_view().unwrap().query_text.is_empty());
+    }
+
+    #[test]
+    fn a_new_search_drops_the_refine_it_no_longer_describes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_mixed_levels(tmp.path());
+        search_and_focus_results(&mut app, "node");
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "disk");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.active_result_positions().len(), 3);
+
+        app.focus = Focus::Pane;
+        press(&mut app, KeyCode::Char('/'));
+        clear_input(&mut app); // `/` prefills with the search it is replacing
+        type_text(&mut app, "socket");
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            app.results_filter.is_none(),
+            "the refine outlived its search"
+        );
+        assert_eq!(app.active_result_positions().len(), 1);
+    }
+
+    #[test]
+    fn results_rows_are_coloured_by_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_mixed_levels(tmp.path());
+        search_and_focus_results(&mut app, "node");
+        let buffer = render_buffer(&mut app, 140, 40);
+        let area = app.results_area;
+        let row_text = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        // Column 3 is inside the match counter, so no search highlight covers it.
+        let colour_of = |needle: &str| {
+            let y = (area.y..area.y + area.height)
+                .find(|y| row_text(*y).contains(needle))
+                .unwrap_or_else(|| panic!("no results row for {needle}"));
+            buffer[(area.x + 3, y)].style().fg
+        };
+
+        assert_eq!(colour_of("socket timeout"), Some(Color::Red), "Error row");
+        assert_eq!(colour_of("disk mounted"), Some(Color::Green), "Info row");
+        assert_eq!(colour_of("disk probe"), Some(Color::DarkGray), "Trace row");
     }
 
     fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
@@ -17860,6 +18553,7 @@ mod tests {
         let config = UiConfig {
             theme: ThemeName::Amber,
             last_browse_dir: Some(PathBuf::from("/var/log/app")),
+            update_prompt_declined: Some("9.9.9".to_string()),
         };
 
         config.save_to(&path).unwrap();
@@ -17869,9 +18563,11 @@ mod tests {
         assert!(body.contains("/var/log/app"), "{body}");
         assert_eq!(UiConfig::load_from(&path).unwrap(), config);
 
-        // An older config, written before the browser remembered anything, still loads.
+        // An older config, written before either was remembered, still loads.
         std::fs::write(&path, r#"{"theme": "amber"}"#).unwrap();
-        assert_eq!(UiConfig::load_from(&path).unwrap().last_browse_dir, None);
+        let older = UiConfig::load_from(&path).unwrap();
+        assert_eq!(older.last_browse_dir, None);
+        assert_eq!(older.update_prompt_declined, None);
     }
 
     #[test]

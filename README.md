@@ -53,8 +53,9 @@ together they explain what the app is built out of and how the pieces fit and ru
   log entry.
 - **Log-aware search.** Supports bare text, quoted phrases, `/regex/`,
   `field=value`, `field~contains`, `after:`, `before:`, and `date:[a..b]`.
-- **Search results panel.** Searches open a bottom panel of matched lines. Click
-  a result or focus it and press Enter to jump to the source line.
+- **Search results panel.** Searches open a bottom panel of matched lines, coloured by
+  level like the pane. Click a result or focus it and press Enter to jump to the source
+  line — and `/` there refines the matches with a second query.
 - **Filters.** Include/exclude by field equality, substring, regex, or range. The sidebar
   splits them into **Text** (as many as you like) and **Time** (at most one, replaced by
   each new range). Filters apply to the whole project and are saved automatically, so they
@@ -203,7 +204,33 @@ irm https://raw.githubusercontent.com/mangosteen-lab/log-scouter/master/scripts/
 
 ### Knowing when a release is out
 
-`logscout --version` says so:
+The app offers it. A launch asks GitHub in the background — never on the way to the logs —
+and when a newer release exists a popup asks whether to install it:
+
+```text
+┌A new logscout is available────────────────────────────────────────────┐
+│  logscout 0.0.21  ->  0.0.22                                          │
+│  https://github.com/mangosteen-lab/log-scouter/releases/tag/v0.0.22   │
+│                                                                       │
+│  Install it now? It replaces the binary you are                       │
+│  running; this session carries on unchanged, and the                  │
+│  new version starts with your next logscout.                          │
+│                                                                       │
+│  y  upgrade now      n / Esc  not now (asked again next release)      │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+`y` downloads and installs in the background, so the app stays usable while it runs and the
+outcome lands in the status bar. Nothing about the running session changes: `self_replace`
+leaves the binary you started valid, and the new version starts with your next `logscout`.
+
+`n` records that release in `~/.log-scouter/ui.json` and stays quiet about it — the next
+*newer* release asks again. Only `y` and `n`/`Esc` do anything while the question is up:
+installing a binary is not something a stray keystroke should start. And the offer waits for
+a quiet moment — if a popup is open or a load is running when the answer arrives, it goes to
+the status bar instead of stealing the keyboard.
+
+`logscout --version` says so too:
 
 ```text
 $ logscout --version
@@ -220,7 +247,7 @@ nothing and cannot be rate-limited into failing. Failures are silent: no network
 directory, GitHub down, all mean you get the plain version and exit 0. A version banner is
 never worth an error.
 
-To turn the check off entirely:
+To turn the check off entirely — the startup prompt included:
 
 ```bash
 LOGSCOUT_NO_UPDATE_CHECK=1 logscout --version   # per run, or export it
@@ -406,6 +433,7 @@ and AI skills (`skills/`).
 | `Ctrl+f` / `Ctrl+b` | full page down/up |
 | `h l` or arrows | horizontal scroll |
 | `/` / `n` / `N` / `c` | search / next match / previous match / cycle context |
+| `/` (matches panel) | refine the matches with a second query — see below |
 | `Shift+Up/Down` | extend the selection (`Shift+PgUp/PgDn` by page) |
 | `Ctrl+Up/Down` | move the cursor without changing the selection |
 | `Space` (pane) | add/remove the current line from the selection |
@@ -1652,6 +1680,44 @@ or define and apply a log format in one step:
 ```text
 name | expression | [timestamp strptime format] | [description]
 ```
+
+## Search Results Panel
+
+A search opens a panel of every matching line under the pane. `Tab` moves the focus to it
+(the border lights up), and it takes the same motions as the pane:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` or arrows | move the selection |
+| `gg` / `G` | first / last match |
+| `[count]G` | the nth match (past the end stops at the last) |
+| `PgUp` / `PgDn`, `Home` / `End` | move by a panel-full, or to either end |
+| `Enter` or click | jump the pane to the selected match |
+| `/` | refine the matches — below |
+| `Esc` | drop the refine, then the search |
+
+Rows are coloured by **level**, exactly as in the pane, so an `Error` among the matches is
+visible without reading it. The query is highlighted in each row.
+
+### Refining: a second search over what was found
+
+Press `/` with the panel focused and type a second query. It narrows the matches already
+found rather than searching the log again, so it is applied live as you type, and both
+queries are highlighted in the rows that survive. The title names them in order:
+
+```text
+┌Matches 2/3  /node/ + /disk/  click or Enter to jump──────────────────────────┐
+│     1/3    row     1 line      1  2026-06-16 10:09:00.000 Kernel  Error  …   │
+│>    2/3    row     2 line      2  2026-06-16 10:09:01.000 Kernel  Trace  …   │
+│     3/3    row     4 line      4  2026-06-16 10:09:03.000 Kernel  Info   …   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+The refine takes the [full query language](#search-query-language) — `level=Error`,
+`/regex/`, `after:` and the rest — and it only ever narrows the panel: the pane's own
+search, its highlighting, and which lines are visible are all untouched. `Esc` backs out
+one layer at a time (the refine first, then the search), and starting a new search drops
+it, since it described matches that no longer exist.
 
 ## Search Query Language
 

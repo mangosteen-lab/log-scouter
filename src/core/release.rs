@@ -14,6 +14,7 @@
 use crate::core::filters::{home_dir, USER_DIR};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 /// The repo releases are published from.
@@ -158,6 +159,64 @@ pub fn update_notice(current: &str) -> Option<String> {
          https://github.com/{RELEASE_REPO}/releases/tag/v{latest}\n\
          Run `logscout upgrade` to update.",
     ))
+}
+
+/// Ask, off the main thread, whether a newer release exists.
+///
+/// Sends the newer version and nothing else: up to date, offline, rate-limited and
+/// `LOGSCOUT_NO_UPDATE_CHECK` all look the same to the caller -- an empty channel. The TUI
+/// starts this at launch, so a slow or unreachable api.github.com never delays the logs
+/// appearing.
+pub fn spawn_update_check(current: &str) -> Receiver<String> {
+    let current = current.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("logscout-update-check".to_string())
+        .spawn(move || {
+            if let Some(latest) = available_update(&current) {
+                let _ = tx.send(latest);
+            }
+        })
+        // A thread that will not spawn just means no notice this run.
+        .ok();
+    rx
+}
+
+/// How a background upgrade reports itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpgradeEvent {
+    /// A step being started, in the same words `logscout upgrade` prints.
+    Progress(String),
+    /// The outcome. Always sent, exactly once, whatever happened.
+    Done(Result<Upgraded, String>),
+}
+
+/// Download and install `version` off the main thread, reporting progress as it goes.
+///
+/// The caller keeps working while this runs: `self_replace` leaves the running binary
+/// valid, so the swap is felt only by the next launch.
+pub fn spawn_upgrade(current: &str, version: &str) -> Receiver<UpgradeEvent> {
+    let (current, version) = (current.to_string(), version.to_string());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("logscout-upgrade".to_string())
+        .spawn({
+            let tx = tx.clone();
+            move || {
+                let mut progress = |step: &str| {
+                    let _ = tx.send(UpgradeEvent::Progress(step.to_string()));
+                };
+                let result = upgrade(&current, Some(&version), &mut progress);
+                let _ = tx.send(UpgradeEvent::Done(result));
+            }
+        })
+        .is_ok();
+    if !spawned {
+        let _ = tx.send(UpgradeEvent::Done(Err(
+            "could not start the upgrade thread".to_string(),
+        )));
+    }
+    rx
 }
 
 /// What an upgrade did, for the caller to report.
