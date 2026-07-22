@@ -136,37 +136,26 @@ impl ThemeName {
 struct UiConfig {
     #[serde(default)]
     theme: ThemeName,
+    /// The folder the `o`/`a` browser was last left in. User-level on purpose: the point is
+    /// to come back to the log directory you were digging in, whichever project you open next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_browse_dir: Option<PathBuf>,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: ThemeName::Classic,
+            last_browse_dir: None,
         }
     }
 }
 
 impl UiConfig {
-    fn load() -> Self {
-        ui_config_path()
-            .and_then(|path| Self::load_from(&path).ok())
-            .unwrap_or_default()
-    }
-
     fn load_from(path: &Path) -> std::io::Result<Self> {
         let body = fs::read_to_string(path)?;
         let config = serde_json::from_str(&body).map_err(std::io::Error::other)?;
         Ok(config)
-    }
-
-    fn save(&self) -> std::io::Result<()> {
-        let path = ui_config_path().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "could not find your home directory (set HOME or USERPROFILE)",
-            )
-        })?;
-        self.save_to(&path)
     }
 
     fn save_to(&self, path: &Path) -> std::io::Result<()> {
@@ -178,8 +167,24 @@ impl UiConfig {
     }
 }
 
+#[cfg(not(test))]
 fn ui_config_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(USER_DIR).join("ui.json"))
+}
+
+/// Under test the UI config is per-`AppState` and throwaway. It now decides where the file
+/// browser opens, so reading the dev machine's real `~/.log-scouter/ui.json` would make
+/// browser tests depend on wherever that developer last browsed -- and writing it would
+/// leak one test's navigation into the next.
+#[cfg(test)]
+fn ui_config_path() -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = DIR.get_or_init(|| tempfile::tempdir().expect("temp dir for the test ui config"));
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    Some(dir.path().join(format!("ui-{id}.json")))
 }
 
 /// What the hub prompt was asked to do.
@@ -1824,6 +1829,9 @@ enum BrowserRow {
     Child(PathBuf),
     /// A file that can be added as a log source. Only listed in `File` purpose.
     File(PathBuf),
+    /// Another drive root (`Z:\\`). Windows only, and only offered at a root, where there
+    /// is no parent to walk up into.
+    Drive(PathBuf),
 }
 
 /// What the browser is picking: a folder to open (`o`, add every text file in it) or a
@@ -1928,6 +1936,15 @@ impl FolderBrowser {
         };
         if self.current.parent().is_some() {
             self.rows.push(BrowserRow::Parent);
+        } else {
+            // At a root there is nothing above -- but on Windows the other drives are not
+            // above `C:\`, they are beside it, and walking up can never reach them.
+            self.rows.extend(
+                drive_roots()
+                    .into_iter()
+                    .filter(|root| root != &self.current)
+                    .map(BrowserRow::Drive),
+            );
         }
         self.rows
             .extend(children.into_iter().map(BrowserRow::Child));
@@ -1982,6 +1999,7 @@ impl FolderBrowser {
             BrowserRow::Parent => "../    go up".to_string(),
             BrowserRow::Child(path) => format!("{}/", folder_name(path)),
             BrowserRow::File(path) => folder_name(path),
+            BrowserRow::Drive(path) => format!("{:<6} drive", path.display().to_string()),
         }
     }
 
@@ -1993,6 +2011,8 @@ impl FolderBrowser {
             BrowserRow::Child(path) | BrowserRow::File(path) => {
                 Some(folder_name(path).to_lowercase())
             }
+            // `z` finds `Z:\`, so a drive is reached the same way as anything else.
+            BrowserRow::Drive(path) => Some(path.display().to_string().to_lowercase()),
         }
     }
 
@@ -2117,6 +2137,24 @@ fn is_hidden(path: &Path) -> bool {
 }
 
 /// The last component of `path`, or the whole path for a root like `/`.
+/// The drive roots the browser can jump to.
+///
+/// Windows has no folder above `C:\`, so every other drive -- including a mapped share like
+/// `Z:\` -- is unreachable by walking up. List them at a root instead. Elsewhere there is
+/// nothing to do: `/` already reaches the whole filesystem.
+#[cfg(windows)]
+fn drive_roots() -> Vec<PathBuf> {
+    ('A'..='Z')
+        .map(|letter| PathBuf::from(format!("{letter}:\\")))
+        .filter(|root| root.is_dir())
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn drive_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 fn folder_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -2584,11 +2622,18 @@ struct AppState {
     did_undo_redo: bool,
     action_log: Vec<ActionEntry>,
     ui_config: UiConfig,
+    /// Where `ui_config` came from, held so every save goes back to the file it was read
+    /// from. `None` when there is no home directory to put it in.
+    ui_config_path: Option<PathBuf>,
 }
 
 impl AppState {
     fn new(project: Project) -> Self {
-        let ui_config = UiConfig::load();
+        let ui_config_path = ui_config_path();
+        let ui_config = ui_config_path
+            .as_deref()
+            .and_then(|path| UiConfig::load_from(path).ok())
+            .unwrap_or_default();
         let mut app = Self {
             project,
             panes: Vec::new(),
@@ -2639,6 +2684,7 @@ impl AppState {
             did_undo_redo: false,
             action_log: Vec::new(),
             ui_config,
+            ui_config_path,
         };
         app.restore_session();
         app
@@ -5314,9 +5360,9 @@ impl AppState {
         let footer = if browser.search.is_some() {
             "type to find   Up/Down next match   Enter open   Backspace   Esc stop searching"
         } else if picking_file {
-            "j/k move   Enter add   Left up   / find   p type path   . hidden   Esc"
+            "type to find   Up/Down move   Enter add   Left up   Ctrl+p path   . hidden   Esc"
         } else {
-            "j/k move   Enter select   Right in   Left up   / find   . hidden   Esc cancel"
+            "type to find   Up/Down move   Enter select   Right in   Left up   . hidden   Esc"
         };
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -8933,7 +8979,7 @@ impl AppState {
         Ok(false)
     }
 
-    /// `o`: browse for a folder, starting where the project already is.
+    /// `o`: browse for a folder, starting where the browser was last left.
     fn open_folder_browser(&mut self) {
         match FolderBrowser::open(self.browser_start_dir()) {
             Ok(browser) => self.mode = Mode::OpenFolder(browser),
@@ -8949,13 +8995,30 @@ impl AppState {
         }
     }
 
-    /// Where a browser opens: the project folder if it exists, else the current directory.
+    /// Where a browser opens: the folder it was last left in, else the project folder, else
+    /// the current directory. A remembered folder that has since gone (an unmounted share,
+    /// a deleted directory) falls through rather than failing the popup.
     fn browser_start_dir(&self) -> PathBuf {
+        if let Some(last) = &self.ui_config.last_browse_dir {
+            if last.is_dir() {
+                return last.clone();
+            }
+        }
         if self.project.root.is_dir() {
             self.project.root.clone()
         } else {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         }
+    }
+
+    /// Remember where the browser ended up, so the next `o`/`a` starts there. Written to the
+    /// user config only when it actually changed -- this runs on every browser close.
+    fn remember_browse_dir(&mut self, folder: &Path) {
+        if self.ui_config.last_browse_dir.as_deref() == Some(folder) {
+            return;
+        }
+        self.ui_config.last_browse_dir = Some(folder.to_path_buf());
+        let _ = self.save_ui_config();
     }
 
     // ---- Command palette --------------------------------------------------------------
@@ -9208,9 +9271,20 @@ impl AppState {
         Ok(false)
     }
 
+    /// Write the user-level UI config back to the file it was loaded from.
+    fn save_ui_config(&self) -> std::io::Result<()> {
+        let path = self.ui_config_path.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not find your home directory (set HOME or USERPROFILE)",
+            )
+        })?;
+        self.ui_config.save_to(path)
+    }
+
     fn apply_theme(&mut self, theme: ThemeName) {
         self.ui_config.theme = theme;
-        match self.ui_config.save() {
+        match self.save_ui_config() {
             Ok(()) => self.status = format!("theme: {}", theme.label()),
             Err(error) => self.status = format!("theme not saved: {error}"),
         }
@@ -10202,12 +10276,12 @@ impl AppState {
 
         match key.code {
             KeyCode::Esc => {
+                self.remember_browse_dir(&browser.current);
                 self.mode = Mode::Normal;
                 return Ok(false);
             }
-            KeyCode::Char('/') => browser.begin_search(),
-            KeyCode::Down | KeyCode::Char('j') => browser.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => browser.move_selection(-1),
+            KeyCode::Down => browser.move_selection(1),
+            KeyCode::Up => browser.move_selection(-1),
             KeyCode::PageDown => browser.move_selection(HALF_PAGE),
             KeyCode::PageUp => browser.move_selection(-HALF_PAGE),
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -10216,30 +10290,47 @@ impl AppState {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 browser.move_selection(-HALF_PAGE)
             }
-            KeyCode::Home | KeyCode::Char('g') => browser.selected = 0,
-            KeyCode::End | KeyCode::Char('G') => {
-                browser.selected = browser.rows.len().saturating_sub(1)
-            }
+            KeyCode::Home => browser.selected = 0,
+            KeyCode::End => browser.selected = browser.rows.len().saturating_sub(1),
             // Going up is always available, even from a folder listing no subfolders.
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+            KeyCode::Left | KeyCode::Backspace => {
                 let parent = browser.parent_path();
                 failure = walk(&mut browser, parent);
             }
+            // Dot-folders are a display choice, not a name to search for, so `.` keeps its
+            // toggle when nothing is being typed. Mid-search it is just a character.
             KeyCode::Char('.') => {
                 if let Err(error) = browser.toggle_hidden() {
                     failure = Some(format!("could not read folder: {error}"));
                 }
             }
             // In the file picker, fall back to typing a path (e.g. to paste an absolute one).
-            KeyCode::Char('p') if matches!(browser.purpose, BrowserPurpose::File) => {
+            KeyCode::Char('p')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(browser.purpose, BrowserPurpose::File) =>
+            {
+                self.remember_browse_dir(&browser.current);
                 self.open_input(Mode::AddFile(String::new()));
                 return Ok(false);
             }
+            // A letter is a name being typed, not a command: `/` still starts a search, but
+            // so does typing, because reaching for a folder by name is what people do here
+            // and a stray `h` or `g` silently jumping the listing is never what they meant.
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                browser.begin_search();
+                if ch != '/' {
+                    browser.push_search(ch);
+                }
+            }
             // Descend only. Enter does that too, but also opens and goes up, depending on
-            // the row; these keys keep their one meaning whatever is selected.
-            KeyCode::Right | KeyCode::Char('l') => {
+            // the row; this key keeps its one meaning whatever is selected.
+            KeyCode::Right => {
                 let child = match browser.selected_row() {
-                    Some(BrowserRow::Child(path)) => Some(path.clone()),
+                    Some(BrowserRow::Child(path) | BrowserRow::Drive(path)) => Some(path.clone()),
                     _ => None,
                 };
                 failure = walk(&mut browser, child);
@@ -10247,6 +10338,7 @@ impl AppState {
             KeyCode::Enter => match browser.selected_row().cloned() {
                 Some(BrowserRow::OpenCurrent) => {
                     let folder = browser.current.to_string_lossy().to_string();
+                    self.remember_browse_dir(&browser.current);
                     self.mode = Mode::Normal;
                     self.submit_open_folder(folder)?;
                     return Ok(false);
@@ -10255,9 +10347,12 @@ impl AppState {
                     let parent = browser.parent_path();
                     failure = walk(&mut browser, parent);
                 }
-                Some(BrowserRow::Child(path)) => failure = walk(&mut browser, Some(path)),
+                Some(BrowserRow::Child(path) | BrowserRow::Drive(path)) => {
+                    failure = walk(&mut browser, Some(path))
+                }
                 // Picking a file: add it and close.
                 Some(BrowserRow::File(path)) => {
+                    self.remember_browse_dir(&browser.current);
                     self.mode = Mode::Normal;
                     self.submit_add_file(path.to_string_lossy().to_string())?;
                     return Ok(false);
@@ -17759,18 +17854,24 @@ mod tests {
     }
 
     #[test]
-    fn ui_config_saves_and_loads_the_selected_theme() {
+    fn ui_config_saves_and_loads_the_theme_and_last_browse_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config/ui.json");
         let config = UiConfig {
             theme: ThemeName::Amber,
+            last_browse_dir: Some(PathBuf::from("/var/log/app")),
         };
 
         config.save_to(&path).unwrap();
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains(r#""theme": "amber""#), "{body}");
+        assert!(body.contains("/var/log/app"), "{body}");
         assert_eq!(UiConfig::load_from(&path).unwrap(), config);
+
+        // An older config, written before the browser remembered anything, still loads.
+        std::fs::write(&path, r#"{"theme": "amber"}"#).unwrap();
+        assert_eq!(UiConfig::load_from(&path).unwrap().last_browse_dir, None);
     }
 
     #[test]
@@ -18617,8 +18718,8 @@ mod tests {
         press(&mut app, KeyCode::Char('o'));
 
         // Down to `archive/`, then Enter descends rather than opening.
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
         assert_eq!(browser(&app).selected, 2);
         press(&mut app, KeyCode::Enter);
         assert!(
@@ -18630,8 +18731,8 @@ mod tests {
         assert_eq!(browser_rows(&app)[2], "2026-06/");
 
         // Right descends too; Left comes back.
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Right);
         assert_eq!(browser(&app).current, archive.join("2026-06"));
         assert!(deep.is_dir());
@@ -18639,7 +18740,7 @@ mod tests {
         assert_eq!(browser(&app).current, archive);
 
         // `..` goes up as well, and the browser is still open.
-        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
         assert_eq!(browser(&app).current, base);
     }
@@ -18659,8 +18760,8 @@ mod tests {
         assert_eq!(browser(&app).current, app.project.root);
         app.mode = Mode::OpenFolder(FolderBrowser::open(root.path().to_path_buf()).unwrap());
 
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('j')); // logs/
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // logs/
         press(&mut app, KeyCode::Enter); // descend
         press(&mut app, KeyCode::Enter); // ./ -> open it
         app.finish_work();
@@ -18695,7 +18796,7 @@ mod tests {
         // Select the file and add it.
         let index = rows.iter().position(|row| row == "app.log").unwrap();
         for _ in 0..index {
-            press(&mut app, KeyCode::Char('j'));
+            press(&mut app, KeyCode::Down);
         }
         press(&mut app, KeyCode::Enter);
         app.finish_work();
@@ -18725,7 +18826,7 @@ mod tests {
         press(&mut app, KeyCode::Char('o'));
         assert_eq!(browser(&app).selected, 0);
 
-        // `j` would move the cursor; after `/` it is the first letter of a name.
+        // `/` starts a search explicitly; typing a letter starts one too.
         press(&mut app, KeyCode::Char('/'));
         type_str(&mut app, "je");
         assert_eq!(browser_rows(&app)[browser(&app).selected], "jenkins/");
@@ -18743,13 +18844,18 @@ mod tests {
         assert!(!browser(&app).search.as_ref().unwrap().matched);
         assert_eq!(browser_rows(&app)[browser(&app).selected], "jenkins/");
 
-        // Esc ends the search without closing the browser; `j` navigates again.
+        // Esc ends the search without closing the browser; Down navigates again.
         press(&mut app, KeyCode::Esc);
         assert!(browser(&app).search.is_none());
         assert!(matches!(app.mode, Mode::OpenFolder(_)));
         let before = browser(&app).selected;
-        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
         assert_eq!(browser(&app).selected, before + 1);
+
+        // And typing without `/` searches just the same: no letter is a navigation key.
+        type_str(&mut app, "ngi");
+        assert_eq!(browser(&app).search.as_ref().unwrap().query, "ngi");
+        assert_eq!(browser_rows(&app)[browser(&app).selected], "nginx/");
     }
 
     #[test]
@@ -18763,15 +18869,14 @@ mod tests {
         type_str(&mut app, "ng");
         assert_eq!(browser_rows(&app)[browser(&app).selected], "nginx/");
 
-        // Backdate the last keystroke past the idle window: the buffer is gone, and the
-        // next letter is a navigation key once more.
+        // Backdate the last keystroke past the idle window: the buffer is gone, so the
+        // next letter starts a new query rather than extending a stale one.
         if let Mode::OpenFolder(browser) = &mut app.mode {
             browser.search.as_mut().unwrap().last_key =
                 Instant::now() - BROWSER_SEARCH_IDLE - Duration::from_millis(1);
         }
-        press(&mut app, KeyCode::Char('g'));
-        assert!(browser(&app).search.is_none());
-        assert_eq!(browser(&app).selected, 0, "g went to the top");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(browser(&app).search.as_ref().unwrap().query, "n");
     }
 
     #[test]
@@ -18787,8 +18892,7 @@ mod tests {
 
         let mut app = AppState::new(Project::new(root.path()));
         press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('/'));
-        // `k` would move up; here it starts the file name.
+        // No `/` needed: the first letter opens the type-ahead.
         type_str(&mut app, "kern");
         assert_eq!(browser_rows(&app)[browser(&app).selected], "kernel.log");
 
@@ -18810,10 +18914,118 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut app = AppState::new(Project::new(root.path()));
         press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('p'));
+        press_mod(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
         assert!(
             matches!(app.mode, Mode::AddFile(_)),
-            "p opens the path input"
+            "Ctrl+p opens the path input"
+        );
+    }
+
+    /// Nothing typed at the browser may reach the app behind it: the popup owns every key,
+    /// and the ones it has no use for are simply consumed.
+    #[test]
+    fn the_browser_owns_every_key_and_lets_none_through() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("archive")).unwrap();
+        std::fs::write(root.path().join("a.log"), "one\n").unwrap();
+        let mut app = AppState::new(Project::new(root.path()));
+        let files = app.project.files.len();
+        let filters = app.project.filters.rules.len();
+        press(&mut app, KeyCode::Char('o'));
+
+        // Keys that mean something in the main view: split, save, quit, bookmark, ask AI.
+        for ch in "|smqwx?".chars() {
+            press(&mut app, KeyCode::Char(ch));
+            assert!(
+                matches!(app.mode, Mode::OpenFolder(_)),
+                "{ch} left the browser: {:?}",
+                app.mode
+            );
+        }
+        // They landed in the type-ahead rather than doing anything.
+        assert_eq!(browser(&app).search.as_ref().unwrap().query, "|smqwx?");
+
+        for (code, modifiers) in [
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::F(1), KeyModifiers::NONE),
+            (KeyCode::Char('s'), KeyModifiers::CONTROL),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+        ] {
+            press_mod(&mut app, code, modifiers);
+            assert!(
+                matches!(app.mode, Mode::OpenFolder(_)),
+                "{code:?}+{modifiers:?} left the browser: {:?}",
+                app.mode
+            );
+        }
+
+        // And the project behind the popup is untouched.
+        assert_eq!(app.project.files.len(), files);
+        assert_eq!(app.project.filters.rules.len(), filters);
+        assert!(!app.project.is_established(), "a key wrote the project out");
+    }
+
+    /// The browser reopens where it was left, whatever project is open.
+    #[test]
+    fn the_browser_reopens_where_it_was_left() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("archive")).unwrap();
+        let mut app = AppState::new(Project::new(root.path()));
+        let archive = app.project.root.join("archive");
+
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(browser(&app).current, app.project.root);
+        press(&mut app, KeyCode::Down); // ../
+        press(&mut app, KeyCode::Down); // archive/
+        press(&mut app, KeyCode::Right);
+        assert_eq!(browser(&app).current, archive);
+        press(&mut app, KeyCode::Esc);
+
+        // Remembered at user level, so `a` starts there too -- and it survives a restart.
+        assert_eq!(app.ui_config.last_browse_dir.as_deref(), Some(&*archive));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(browser(&app).current, archive);
+        press(&mut app, KeyCode::Esc);
+
+        let saved = UiConfig::load_from(app.ui_config_path.as_deref().unwrap()).unwrap();
+        assert_eq!(saved.last_browse_dir.as_deref(), Some(&*archive));
+
+        // A folder that has gone (an unmounted share) falls back to the project folder.
+        std::fs::remove_dir(&archive).unwrap();
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(browser(&app).current, app.project.root);
+    }
+
+    /// On Windows the other drives are beside `C:\`, not above it, so they are listed at a
+    /// root -- otherwise a project opened on C: could never reach a mapped `Z:`.
+    #[test]
+    #[cfg(windows)]
+    fn a_root_lists_the_other_drives() {
+        let browser = FolderBrowser::open(PathBuf::from("C:\\")).unwrap();
+        let drives: Vec<String> = browser
+            .rows
+            .iter()
+            .filter(|row| matches!(row, BrowserRow::Drive(_)))
+            .map(|row| browser.label(row))
+            .collect();
+        assert!(
+            drives.iter().all(|label| !label.starts_with("C:")),
+            "the drive being browsed is listed as a jump: {drives:?}"
+        );
+        assert_eq!(drive_roots().len(), drives.len() + 1);
+    }
+
+    /// A drive row reads as what it is, whatever platform the label is rendered on.
+    #[test]
+    fn a_drive_row_is_labelled_by_its_root() {
+        let root = tempfile::tempdir().unwrap();
+        let browser = FolderBrowser::open(root.path().to_path_buf()).unwrap();
+        let row = BrowserRow::Drive(PathBuf::from("Z:\\"));
+        assert_eq!(browser.label(&row), "Z:\\    drive");
+        assert_eq!(
+            FolderBrowser::search_name(&row),
+            Some("z:\\".to_string()),
+            "typing `z` has to find the drive"
         );
     }
 
@@ -18825,8 +19037,8 @@ mod tests {
         let before = app.project.root.clone();
 
         press(&mut app, KeyCode::Char('o'));
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Right);
         press(&mut app, KeyCode::Esc);
 
@@ -18849,8 +19061,8 @@ mod tests {
 
         // It goes away after the listing was taken, as a folder on a network share might.
         std::fs::remove_dir(&doomed).unwrap();
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
 
         assert!(app.status.starts_with("could not read"), "{}", app.status);

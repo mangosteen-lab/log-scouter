@@ -398,7 +398,7 @@ and AI skills (`skills/`).
 |---|---|
 | `Ctrl+P` / `:` | open the searchable, context-aware command palette |
 | `u` / `Ctrl+r` / `U` | undo / redo / show the action history |
-| `a` / `o` | browse for a file to add / browse for a folder |
+| `a` / `o` | browse for a file to add / browse for a folder (opens where you last browsed) |
 | `d` / `Delete` | delete the selected item: a log source, a filter, or a saved search |
 | `j k` or arrows | move selection |
 | `gg` / `G` / `[count]G` | top / bottom / go to visible row |
@@ -883,12 +883,13 @@ incident. `/skills` lists what you have written and marks the ones that are on.
 ## Adding Files and Folders
 
 Press `a` to browse for **one file** to add as a log source, or `o` to browse for a **whole
-folder** (which adds every text file in it). Both start from the folder the project is
-already in and share the same navigation.
+folder** (which adds every text file in it). Both start where you last left the browser
+(remembered in `~/.log-scouter/ui.json`, so it survives restarts and follows you between
+projects), falling back to the folder the project is in. They share the same navigation.
 
 The file picker (`a`) lists the text files in each folder alongside the subfolders; `Enter`
 on a file adds it, `Enter` on a folder descends into it. If you would rather type or paste a
-path — say an absolute one far from here — press `p`.
+path — say an absolute one far from here — press `Ctrl+p`.
 
 ```text
 ┌Add Log File─────────────────────────────────┐
@@ -900,7 +901,7 @@ path — say an absolute one far from here — press `p`.
 │> app.log                                    │
 │  server.log                                 │
 │                                             │
-│j/k move  Enter add/enter  Left up  p type path│
+│type to find  Enter add  Left up  Ctrl+p path│
 └─────────────────────────────────────────────┘
 ```
 
@@ -917,21 +918,31 @@ The folder picker (`o`) lists subfolders and how many files sit directly in each
 │  archive/                                   │
 │  nested/                                    │
 │                                             │
-│j/k move   Enter select   Right in   Left up │
+│type to find  Enter select  Right in  Left up │
 └─────────────────────────────────────────────┘
 ```
 
 | Key | Action |
 | --- | --- |
-| `j` / `k`, `↑` / `↓` | move the selection |
+| any letter | start searching for it by name — see below |
+| `↑` / `↓` | move the selection |
 | `PgUp` / `PgDn`, `Ctrl+u` / `Ctrl+d` | move by ten |
-| `g` / `G` | first / last row |
+| `Home` / `End` | first / last row |
 | `Enter` | do what the selected row says: open `./`, go up on `../`, otherwise enter the subfolder |
-| `→` / `l` | enter the selected subfolder |
-| `←` / `h` / `Backspace` | go up one folder |
-| `/` | search by name — see below |
+| `→` | enter the selected subfolder |
+| `←` / `Backspace` | go up one folder |
+| `/` | start searching explicitly |
 | `.` | show or hide dot-folders |
+| `Ctrl+p` | type a path instead (file picker) |
 | `Esc` | cancel without changing the project |
+
+Letters are never navigation keys here: typing goes to the name search, because reaching for
+a folder by name is what the listing is for. Every other key is swallowed by the popup, so
+nothing you type reaches the logs behind it.
+
+On **Windows** a root has no parent — there is no folder above `C:\` — so the other drives
+are listed there instead, mapped network drives included. Walk up to `C:\` and `Z:\` is a
+row you can enter like any folder (or just type `z`).
 
 ### Finding a folder or file by name
 
@@ -967,7 +978,7 @@ its folder. A query nothing matches turns red and leaves the cursor where it was
 | `Esc` | stop searching, keeping the browser open |
 
 The search also ends on its own after about a second and a half without a keystroke, so a
-forgotten query never swallows the next `j`.
+forgotten query never swallows the next name you type.
 
 `Enter` only ever does the one thing its row names, so the `./` row is where opening
 happens. Opening a folder adds every direct text file in it, exactly as `logscout <folder>`
